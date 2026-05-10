@@ -1,0 +1,9 @@
+/notifications
+*.test
+*.out
+coverage.out
+vendor/
+.DS_Store
+.idea/
+.vscode/
+*.swp
