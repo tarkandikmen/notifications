@@ -52,17 +52,17 @@ func TestLoad_DefaultsWhenOptionalsUnset(t *testing.T) {
 		"DATABASE_URL":  "postgres://x",
 		"REDIS_URL":     "redis://x",
 		"KAFKA_BROKERS": "k:9092",
+		"WEBHOOK_URL":   "https://webhook.site/abc",
 	})
 	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("LOG_LEVEL", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-	t.Setenv("WEBHOOK_URL", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
 	assert.Equal(t, ":8080", cfg.HTTPAddr)
 	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
-	assert.Empty(t, cfg.WebhookURL)
+	assert.Equal(t, "https://webhook.site/abc", cfg.WebhookURL)
 	assert.Empty(t, cfg.OTelEndpoint)
 }
 
@@ -78,6 +78,7 @@ func TestLoad_MissingRequired(t *testing.T) {
 				"DATABASE_URL":  "",
 				"REDIS_URL":     "redis://x",
 				"KAFKA_BROKERS": "k:9092",
+				"WEBHOOK_URL":   "https://webhook.site/abc",
 			},
 			wantMatch: "DATABASE_URL",
 		},
@@ -87,6 +88,7 @@ func TestLoad_MissingRequired(t *testing.T) {
 				"DATABASE_URL":  "postgres://x",
 				"REDIS_URL":     "",
 				"KAFKA_BROKERS": "k:9092",
+				"WEBHOOK_URL":   "https://webhook.site/abc",
 			},
 			wantMatch: "REDIS_URL",
 		},
@@ -96,8 +98,19 @@ func TestLoad_MissingRequired(t *testing.T) {
 				"DATABASE_URL":  "postgres://x",
 				"REDIS_URL":     "redis://x",
 				"KAFKA_BROKERS": "",
+				"WEBHOOK_URL":   "https://webhook.site/abc",
 			},
 			wantMatch: "KAFKA_BROKERS",
+		},
+		{
+			name: "missing WEBHOOK_URL",
+			env: map[string]string{
+				"DATABASE_URL":  "postgres://x",
+				"REDIS_URL":     "redis://x",
+				"KAFKA_BROKERS": "k:9092",
+				"WEBHOOK_URL":   "",
+			},
+			wantMatch: "WEBHOOK_URL",
 		},
 		{
 			name: "all required missing names every key",
@@ -105,6 +118,7 @@ func TestLoad_MissingRequired(t *testing.T) {
 				"DATABASE_URL":  "",
 				"REDIS_URL":     "",
 				"KAFKA_BROKERS": "",
+				"WEBHOOK_URL":   "",
 			},
 			wantMatch: "DATABASE_URL",
 		},
@@ -121,6 +135,21 @@ func TestLoad_MissingRequired(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantMatch)
 		})
 	}
+}
+
+// TestLoad_RejectsWebhookPlaceholder enforces docs/phases/02-walking-skeleton.md
+// §12: Load() must refuse the committed-placeholder URL so a deployer who
+// forgets to swap in a real webhook.site UUID fails at startup rather than
+// silently delivering nowhere.
+func TestLoad_RejectsWebhookPlaceholder(t *testing.T) {
+	setEnv(t, validEnv())
+	t.Setenv("WEBHOOK_URL", "https://webhook.site/REPLACE-WITH-YOUR-UUID")
+
+	cfg, err := Load()
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.True(t, errors.Is(err, ErrInvalidValue), "want ErrInvalidValue, got %v", err)
+	assert.Contains(t, err.Error(), "WEBHOOK_URL")
 }
 
 func TestLoad_InvalidLogLevel(t *testing.T) {

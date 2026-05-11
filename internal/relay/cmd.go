@@ -1,6 +1,9 @@
-// Package relay implements the `notifications relay` subcommand. Phase 1 is
-// a stub; Phase 2 fills in the outbox-to-Kafka loop documented in
-// ARCHITECTURE_v3.md §6.4.
+// Package relay implements the `notifications relay` subcommand. Phase 1
+// was a block-on-signal stub; phase 2 fills in the outbox-to-Kafka loop
+// documented in ARCHITECTURE_v3.md §6.4 and
+// docs/phases/02-walking-skeleton.md §8. The lifecycle skeleton (config,
+// logger, telemetry, signal handling, graceful shutdown) inherits from
+// phase 1.
 package relay
 
 import (
@@ -12,9 +15,12 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/tarkandikmen/notifications/internal/config"
+	"github.com/tarkandikmen/notifications/internal/db"
 	"github.com/tarkandikmen/notifications/internal/observability"
+	"github.com/tarkandikmen/notifications/internal/store"
 )
 
 const (
@@ -22,8 +28,12 @@ const (
 	shutdownTimeout = 15 * time.Second
 )
 
-// Run is the relay binary's entry point. Phase 1 only logs `started` and
-// waits for a signal (docs/phases/01-foundation.md §8).
+// Run is bound to the cobra `relay` subcommand's RunE. It owns the relay
+// binary's lifecycle: config -> logger -> telemetry -> pgxpool ->
+// franz-go client -> topic bootstrap -> Loop -> wait for signal ->
+// graceful shutdown.
+//
+// docs/phases/02-walking-skeleton.md §8 + §Repo layout.
 func Run(cmd *cobra.Command, _ []string) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -41,9 +51,29 @@ func Run(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("relay: init telemetry: %w", err)
 	}
 
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("relay: open db: %w", err)
+	}
+	defer pool.Close()
+
+	client, err := kgo.NewClient(producerOpts(cfg.KafkaBrokers)...)
+	if err != nil {
+		return fmt.Errorf("relay: build kafka client: %w", err)
+	}
+	defer client.Close()
+
+	if err := Bootstrap(ctx, cfg.KafkaBrokers, logger); err != nil {
+		return fmt.Errorf("relay: bootstrap topics: %w", err)
+	}
+
 	logger.Info("started", "mode", serviceName)
 
-	<-ctx.Done()
+	loopErr := Loop(ctx, Deps{
+		Store:    store.New(pool),
+		Producer: client,
+		Logger:   logger,
+	})
 
 	logger.Info("shutting down", "mode", serviceName)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -51,5 +81,23 @@ func Run(cmd *cobra.Command, _ []string) error {
 	if err := shutdownTelemetry(shutdownCtx); err != nil {
 		logger.Error("telemetry shutdown failed", "err", err)
 	}
-	return nil
+	return loopErr
+}
+
+// producerOpts returns the franz-go options locked by
+// docs/design/04-kafka.md §5: acks=all (waits for every in-sync
+// replica, required by the publish-then-mark ordering's at-least-once
+// guarantee), snappy compression for batched payloads. Idempotent
+// production is enabled by default in franz-go when acks=all, so no
+// explicit opt-in is required (verified against
+// docs/design/04-kafka.md §5 row "Idempotent producer | enabled").
+//
+// Linger / batch / max.in.flight are left at franz-go defaults per the
+// same doc.
+func producerOpts(brokers []string) []kgo.Opt {
+	return []kgo.Opt{
+		kgo.SeedBrokers(brokers...),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
+	}
 }

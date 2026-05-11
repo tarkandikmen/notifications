@@ -1,38 +1,27 @@
-// Package server builds the api binary's HTTP listener. Phase 1 exposes
-// GET /healthz and GET /metrics; Phase 2+ adds /v1/notifications endpoints.
+// Package server builds the api binary's HTTP listener. Phase 2 makes
+// New a thin builder: route registration moves to the api package
+// (api.RegisterRoutes), and the only behavior left here is binding the
+// configured address and wrapping the supplied handler with otelhttp.
+//
+// docs/phases/02-walking-skeleton.md §6.
 package server
 
 import (
 	"net/http"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/tarkandikmen/notifications/internal/config"
 )
 
-// New builds the api binary's *http.Server. The mux is wrapped in
-// otelhttp.NewHandler so every request becomes a span.
-//
-// docs/phases/01-foundation.md §6.
-func New(cfg *config.Config, reg *prometheus.Registry) *http.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", healthz)
-	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-
+// New wraps handler in otelhttp and returns an *http.Server bound to
+// cfg.HTTPAddr. The api package owns route registration via
+// api.RegisterRoutes; this function is intentionally trivial so the
+// chunked Phase-2 plan can keep the lifecycle skeleton from Phase 1
+// while the API surface grows.
+func New(cfg *config.Config, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:    cfg.HTTPAddr,
-		Handler: otelhttp.NewHandler(mux, "api"),
+		Handler: otelhttp.NewHandler(handler, "api"),
 	}
-}
-
-// healthz is the Phase 1 minimum per docs/design/03-api.md §`GET /healthz`:
-// process-up only, no dependency checks. The body is written as a raw byte
-// slice rather than via json.Encode to avoid the trailing newline that
-// breaks acceptance test 5's exact-byte match.
-func healthz(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }

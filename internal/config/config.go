@@ -34,14 +34,20 @@ var ErrMissingRequired = errors.New("config: missing required environment variab
 // (for example, an unrecognized LOG_LEVEL).
 var ErrInvalidValue = errors.New("config: invalid environment variable value")
 
+// webhookURLPlaceholder is the literal string baked into the committed
+// .env. docs/phases/02-walking-skeleton.md §12 requires Load() to reject
+// it so a deployer who forgets to substitute their own webhook.site URL
+// fails fast at every binary's startup (including the migrate job),
+// rather than silently posting deliveries into the void.
+const webhookURLPlaceholder = "https://webhook.site/REPLACE-WITH-YOUR-UUID"
+
 // Load reads the process environment and returns a populated *Config.
 //
-// Required variables: DATABASE_URL, REDIS_URL, KAFKA_BROKERS. Missing or
-// empty values produce an ErrMissingRequired-wrapped error. Optional
-// variables fall back to documented defaults.
-//
-// WEBHOOK_URL is treated as optional here (Phase 1); Phase 2 will tighten it
-// to required at the worker layer where the value is actually consumed.
+// Required variables: DATABASE_URL, REDIS_URL, KAFKA_BROKERS, WEBHOOK_URL.
+// Missing or empty values produce an ErrMissingRequired-wrapped error.
+// WEBHOOK_URL additionally rejects the committed-placeholder value
+// (docs/phases/02-walking-skeleton.md §12). Optional variables fall back
+// to documented defaults.
 func Load() (*Config, error) {
 	var missing []string
 	required := func(key string) string {
@@ -55,9 +61,14 @@ func Load() (*Config, error) {
 	databaseURL := required("DATABASE_URL")
 	redisURL := required("REDIS_URL")
 	kafkaCSV := required("KAFKA_BROKERS")
+	webhookURL := required("WEBHOOK_URL")
 
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("%w: %s", ErrMissingRequired, strings.Join(missing, ", "))
+	}
+
+	if webhookURL == webhookURLPlaceholder {
+		return nil, fmt.Errorf("%w: WEBHOOK_URL is still the committed placeholder; replace REPLACE-WITH-YOUR-UUID with a real https://webhook.site/<uuid>", ErrInvalidValue)
 	}
 
 	level, err := parseLogLevel(os.Getenv("LOG_LEVEL"))
@@ -72,7 +83,7 @@ func Load() (*Config, error) {
 		KafkaBrokers: splitCSV(kafkaCSV),
 		LogLevel:     level,
 		OTelEndpoint: strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
-		WebhookURL:   strings.TrimSpace(os.Getenv("WEBHOOK_URL")),
+		WebhookURL:   webhookURL,
 	}
 
 	if len(cfg.KafkaBrokers) == 0 {

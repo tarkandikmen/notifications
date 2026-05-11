@@ -1,5 +1,8 @@
-// Package api implements the `notifications api` subcommand. Phase 1 serves
-// /healthz and /metrics; Phase 2+ adds the /v1/notifications endpoints.
+// Package api implements the `notifications api` subcommand. Phase 2 wires
+// the pgxpool, the Store, the Prometheus registry, and the slog logger
+// into a Deps bundle, registers the four routes (/healthz, /metrics,
+// POST /v1/notifications, GET /v1/notifications/{id}), and serves them
+// through the lifecycle skeleton inherited from Phase 1.
 package api
 
 import (
@@ -15,8 +18,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/tarkandikmen/notifications/internal/config"
+	"github.com/tarkandikmen/notifications/internal/db"
 	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/server"
+	"github.com/tarkandikmen/notifications/internal/store"
 )
 
 const (
@@ -25,10 +30,10 @@ const (
 )
 
 // Run is bound to the cobra `api` subcommand's RunE. It owns the api
-// binary's lifecycle: config -> logger -> telemetry -> server -> wait for
-// signal -> graceful shutdown.
+// binary's lifecycle: config -> logger -> telemetry -> pgxpool -> Deps
+// -> mux -> server -> wait for signal -> graceful shutdown.
 //
-// docs/phases/01-foundation.md §8 calls this out as the one non-stub.
+// docs/phases/02-walking-skeleton.md §6 + §Repo layout.
 func Run(cmd *cobra.Command, _ []string) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -46,8 +51,23 @@ func Run(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("api: init telemetry: %w", err)
 	}
 
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("api: open db: %w", err)
+	}
+	defer pool.Close()
+
 	registry := observability.NewRegistry()
-	httpServer := server.New(cfg, registry)
+
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{
+		Store:    store.New(pool),
+		Registry: registry,
+		Logger:   logger,
+		Clock:    time.Now,
+	})
+
+	httpServer := server.New(cfg, mux)
 
 	logger.Info("started", "mode", serviceName, "addr", cfg.HTTPAddr)
 
