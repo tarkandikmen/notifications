@@ -9,6 +9,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -62,4 +63,50 @@ type IdempotencyConflictError struct {
 
 func (e *IdempotencyConflictError) Error() string {
 	return "store: idempotency_key conflict on " + e.IdempotencyKey
+}
+
+// IdempotencyConflictEntry is one row in a batch-create conflict. The api
+// layer iterates over BatchIdempotencyConflictError.Entries to populate
+// the 409 duplicate_idempotency_keys details[] body per
+// docs/design/03-api.md §Error model.
+//
+// docs/phases/04-api-completeness.md §1.1 + §1.5.
+type IdempotencyConflictEntry struct {
+	Key            string
+	ExistingID     uuid.UUID
+	ExistingStatus string
+}
+
+// BatchIdempotencyConflictError is returned by InsertBatch when one or
+// more items' idempotency_key collides with an existing notifications
+// row. The transaction has been rolled back, so no rows from the batch
+// are persisted (all-or-nothing per docs/design/03-api.md
+// §POST /v1/notifications/batch).
+//
+// Entries is ordered by the input slice so the api response surfaces
+// conflicts in request order. The api layer extracts the slice via
+// errors.As and renders one IdempotencyConflictDetail per entry.
+//
+// docs/phases/04-api-completeness.md §1.1 + §1.5.
+type BatchIdempotencyConflictError struct {
+	Entries []IdempotencyConflictEntry
+}
+
+func (e *BatchIdempotencyConflictError) Error() string {
+	return fmt.Sprintf("store: batch idempotency conflict on %d key(s)", len(e.Entries))
+}
+
+// TerminalStateError is returned by CancelNotification when the row's
+// current status is one of the hard-terminal values (DELIVERED or
+// FAILED) and a cancel transition is therefore impossible. The api layer
+// extracts CurrentStatus via errors.As and renders it into the 409
+// terminal_state details body per docs/design/03-api.md §Error model.
+//
+// docs/phases/04-api-completeness.md §1.5.
+type TerminalStateError struct {
+	CurrentStatus string
+}
+
+func (e *TerminalStateError) Error() string {
+	return "store: notification in terminal state: " + e.CurrentStatus
 }

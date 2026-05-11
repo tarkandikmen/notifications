@@ -1,0 +1,990 @@
+openapi: 3.0.3
+info:
+  title: Notifications API
+  version: 1.0.0
+  description: |
+    HTTP surface for the notifications service shipped through Phase 4 per
+    `ARCHITECTURE_v3.md` and the `Software Engineer Assessment - Golang.md`
+    brief. Accepts notifications (single or batch), returns notification
+    state, supports best-effort cancellation, and lists / filters
+    notifications. Notifications dispatch across SMS, email, and push
+    channels via a Postgres-backed outbox + per-channel Kafka topics +
+    per-channel worker pools.
+
+    All endpoints are unauthenticated by design (out of scope per
+    `docs/design/03-api.md` §Conventions). Idempotency is enforced via
+    the request-body `idempotency_key` (UUIDv4 canonical lowercase) on
+    every notification.
+  contact:
+    name: Notifications API maintainers
+    url: https://github.com/tarkandikmen/notifications
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development via docker-compose
+
+tags:
+  - name: Notifications
+    description: |
+      Single + batch creation, retrieval (single + by-batch), filtered list,
+      and best-effort cancellation. Every endpoint here belongs to the
+      `/v1/notifications` or `/v1/batches` family.
+  - name: Operations
+    description: |
+      Process-level endpoints (`/healthz`, `/metrics`) consumed by infra
+      tooling, not by API clients.
+
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      summary: Process liveness probe
+      description: |
+        Returns 200 with `{"status":"ok"}` while the api process is up
+        and serving HTTP. Phase 1 ships the minimum (process-up only);
+        Phase 5 / Phase 7 widen this to per-dependency liveness checks
+        (Postgres / Redis / Kafka pings) and adds the 503 response.
+      tags: [Operations]
+      responses:
+        '200':
+          description: Process is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus metrics scrape endpoint
+      description: |
+        Prometheus text exposition format. Scraped by the prometheus
+        container in the docker-compose stack. The metric set ships
+        skeleton in Phase 1 and is filled out by Phase 5.
+      tags: [Operations]
+      responses:
+        '200':
+          description: Prometheus text exposition (Content-Type version 0.0.4)
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+                description: |
+                  Prometheus text exposition format. One metric family
+                  per line (HELP + TYPE + sample lines).
+
+  /v1/notifications:
+    post:
+      operationId: createNotification
+      summary: Create a single notification
+      description: |
+        Inserts a single notification with `status=PENDING`. The api
+        layer mints a UUIDv7 `id` and writes the row in one transaction.
+
+        Idempotency is enforced via the `idempotency_key` field — the
+        first request with a given key wins; any later request with the
+        same key returns 409 `duplicate_idempotency_keys` with the
+        existing row's id and status in `details[]`.
+
+        Scheduled notifications: when `scheduled_at` is supplied, the
+        row's `eligible_at` is set to `scheduled_at` so the dispatcher's
+        `eligible_at <= now()` guard defers the claim until that time.
+        Past `scheduled_at` values are rejected.
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRequest'
+            examples:
+              sms:
+                summary: SMS notification (immediate)
+                value:
+                  channel: sms
+                  recipient: "+905551234567"
+                  content: hello
+                  priority: normal
+                  idempotency_key: 00000000-0000-4000-8000-000000000010
+              scheduled-email:
+                summary: Email notification scheduled in the future
+                value:
+                  channel: email
+                  recipient: user@example.com
+                  content: scheduled greeting
+                  scheduled_at: "2026-12-31T12:00:00Z"
+                  idempotency_key: 00000000-0000-4000-8000-000000000011
+      responses:
+        '201':
+          $ref: '#/components/responses/Created201'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '409':
+          $ref: '#/components/responses/Conflict409Duplicate'
+        '500':
+          $ref: '#/components/responses/InternalServerError500'
+
+    get:
+      operationId: listNotifications
+      summary: List notifications with filters and pagination
+      description: |
+        Returns a filtered, paginated list of notifications, ordered by
+        `created_at DESC, id DESC`. Filters AND-compose; absent filters
+        match every value.
+
+        Pagination is offset-based. `has_more` is computed via the
+        `LIMIT limit + 1` trick (no `COUNT(*)` is run); the response
+        does not include a `total` field at this scope per
+        `docs/design/03-api.md` §Pagination.
+
+        Each result item is the no-attempts notification representation;
+        clients that need delivery attempts must follow up with
+        `GET /v1/notifications/{id}`.
+      tags: [Notifications]
+      parameters:
+        - name: offset
+          in: query
+          required: false
+          description: Zero-based index of the first row to return. Default 0.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Maximum number of rows to return. Default
+            `list_default_limit=50`; capped at `list_max_limit=200`.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: status
+          in: query
+          required: false
+          description: Filter by notification status.
+          schema:
+            $ref: '#/components/schemas/Status'
+        - name: channel
+          in: query
+          required: false
+          description: Filter by delivery channel.
+          schema:
+            $ref: '#/components/schemas/Channel'
+        - name: priority
+          in: query
+          required: false
+          description: Filter by priority bucket.
+          schema:
+            $ref: '#/components/schemas/Priority'
+        - name: batch_id
+          in: query
+          required: false
+          description: Filter by batch identifier (UUIDv7).
+          schema:
+            type: string
+            format: uuid
+        - name: created_after
+          in: query
+          required: false
+          description: Inclusive lower bound on `created_at` (RFC 3339).
+          schema:
+            type: string
+            format: date-time
+        - name: created_before
+          in: query
+          required: false
+          description: Exclusive upper bound on `created_at` (RFC 3339).
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          $ref: '#/components/responses/OK200List'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '500':
+          $ref: '#/components/responses/InternalServerError500'
+
+  /v1/notifications/batch:
+    post:
+      operationId: createNotificationsBatch
+      summary: Create up to 1000 notifications in one request
+      description: |
+        Inserts up to `batch_max=1000` notifications atomically. All
+        rows share a server-minted `batch_id` (UUIDv7). Per-item ids
+        are minted server-side and returned in the response in
+        request order.
+
+        All-or-nothing semantics: any per-item validation failure,
+        intra-batch idempotency-key duplicate, or `idempotency_key`
+        collision against an existing row rejects the entire batch and
+        leaves zero rows persisted.
+
+        Validation paths in the 400 details body are prefixed by
+        `notifications[i].<field>`. Intra-batch duplicates surface as
+        a `duplicate of notifications[j].idempotency_key` issue against
+        the second occurrence.
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchCreateRequest'
+            examples:
+              mixed-channels:
+                summary: Three notifications across all three channels
+                value:
+                  notifications:
+                    - channel: sms
+                      recipient: "+905551234567"
+                      content: batch 1
+                      idempotency_key: 00000000-0000-4000-8000-000000000020
+                    - channel: email
+                      recipient: u1@example.com
+                      content: batch 2
+                      idempotency_key: 00000000-0000-4000-8000-000000000021
+                    - channel: push
+                      recipient: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+                      content: batch 3
+                      idempotency_key: 00000000-0000-4000-8000-000000000022
+      responses:
+        '201':
+          $ref: '#/components/responses/Created201Batch'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '409':
+          $ref: '#/components/responses/Conflict409Duplicate'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge413'
+        '500':
+          $ref: '#/components/responses/InternalServerError500'
+
+  /v1/notifications/{id}:
+    get:
+      operationId: getNotification
+      summary: Fetch a notification including its delivery attempts
+      description: |
+        Returns the notification's full representation including the
+        nested `attempts: [...]` array (rendered even when empty for
+        a brand-new row).
+
+        Returns 404 for unknown `id` and for malformed (non-UUID) `id`
+        values — both render the same `not_found` error envelope to
+        prevent enumerating valid id formats.
+      tags: [Notifications]
+      parameters:
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK200NotificationWithAttempts'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '500':
+          $ref: '#/components/responses/InternalServerError500'
+
+  /v1/notifications/{id}/cancel:
+    post:
+      operationId: cancelNotification
+      summary: Best-effort cancel of a notification
+      description: |
+        Runs the cancel transition `T3` (PENDING → CANCELLED, emits
+        `events.notification`) or `T11` (DISPATCHED → CANCELLED, no
+        emit) per `docs/design/02-state-machine.md` §Transitions.
+
+        Already-CANCELLED rows return 200 with the same body shape
+        (idempotent no-op). Hard-terminal rows (DELIVERED / FAILED)
+        return 409 `terminal_state` with the observed status in
+        `details[0].current_status`.
+
+        Best-effort semantics: a cancel applied to a DISPATCHED row may
+        be silently overwritten by a worker outcome (T4–T8) on the
+        row's current `attempt`. The realized state surfaces via a
+        subsequent GET; the cancel response itself reflects the row at
+        cancel-commit time. See `docs/design/02-state-machine.md`
+        §Cancellation race for the full contract.
+      tags: [Notifications]
+      parameters:
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK200Notification'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/Conflict409Terminal'
+        '500':
+          $ref: '#/components/responses/InternalServerError500'
+
+  /v1/batches/{id}:
+    get:
+      operationId: getBatch
+      summary: Fetch every notification in a batch
+      description: |
+        Returns every notification sharing the supplied `batch_id`,
+        ordered by `id ASC` (UUIDv7 ids are time-ordered, so this
+        matches the original request order). Capped at `batch_max=1000`
+        rows by construction; no pagination.
+
+        Returns 404 when no row matches the id (whether unknown or
+        malformed). Items use the no-attempts notification
+        representation; clients that need delivery attempts must
+        follow up per row.
+      tags: [Notifications]
+      parameters:
+        - $ref: '#/components/parameters/BatchId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OK200Batch'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '500':
+          $ref: '#/components/responses/InternalServerError500'
+
+components:
+  parameters:
+    NotificationId:
+      name: id
+      in: path
+      required: true
+      description: Notification UUIDv7.
+      schema:
+        type: string
+        format: uuid
+    BatchId:
+      name: id
+      in: path
+      required: true
+      description: Batch UUIDv7.
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          description: Constant `"ok"` while the process is up.
+      example:
+        status: ok
+
+    Channel:
+      type: string
+      enum: [sms, email, push]
+      description: Delivery channel. Drives per-channel topic + worker pool routing.
+
+    Status:
+      type: string
+      enum: [PENDING, DISPATCHED, DELIVERED, FAILED, CANCELLED]
+      description: |
+        Notification lifecycle status per
+        `docs/design/02-state-machine.md` §States. `DELIVERED` and
+        `FAILED` are hard-terminal; `CANCELLED` is soft-terminal (a
+        worker may overwrite a `DISPATCHED → CANCELLED` cancel during
+        the cancellation race).
+
+    Priority:
+      type: string
+      enum: [low, normal, high]
+      description: |
+        Priority bucket. Stored as int (`low=0`, `normal=1`, `high=2`)
+        per `docs/design/01-schema.md` §1; the API accepts and returns
+        the string form.
+
+    FailureReason:
+      type: string
+      enum: [max_attempts_exceeded, permanent_error, unprocessable_message]
+      description: |
+        Set when `status=FAILED`. `max_attempts_exceeded` covers T7
+        (worker exhausted retries) and T10 (reaper terminal-fail);
+        `permanent_error` covers T6; `unprocessable_message` covers T8.
+
+    Classification:
+      type: string
+      enum: [success, transient, permanent, unprocessable]
+      description: |
+        Worker outcome classification per
+        `docs/design/05-retry.md`.
+
+    CreateRequest:
+      type: object
+      required: [channel, recipient, idempotency_key]
+      properties:
+        channel:
+          $ref: '#/components/schemas/Channel'
+        recipient:
+          type: string
+          description: |
+            Per-channel format. `sms`: E.164 (`^\+[1-9]\d{1,14}$`).
+            `email`: `<local>@<domain>`, max
+            `recipient_email_max=254` chars. `push`: opaque token,
+            length `recipient_push_min=32`..`recipient_push_max=4096`
+            chars.
+          example: "+905551234567"
+        content:
+          type: string
+          description: |
+            Notification body. Required when `template` is absent
+            (exactly one of `content` or `template` must be set).
+            Length capped per channel: `sms` 1600, `email` 100000,
+            `push` 4000 chars.
+          example: hello
+        template:
+          type: string
+          nullable: true
+          description: |
+            Phase 6 (templates not yet supplied). When set, the
+            request returns 400 in Phase 4. The field is documented
+            here so the OpenAPI surface tracks the wire schema across
+            phases without breaking changes.
+        template_data:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: |
+            Phase 6. Free-form JSON object substituted into `template`
+            placeholders by the renderer. Rejected with 400 in Phase 4.
+        priority:
+          allOf:
+            - $ref: '#/components/schemas/Priority'
+          description: Optional. Defaults to `normal` when absent.
+        scheduled_at:
+          type: string
+          format: date-time
+          description: |
+            Optional RFC 3339 (with timezone) future timestamp. Past
+            values are rejected. When supplied, the row's
+            `eligible_at` is set to this value so the dispatcher
+            defers claim until then.
+          example: "2026-12-31T12:00:00Z"
+        idempotency_key:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+          description: |
+            Required canonical-lowercase UUIDv4 (RFC 4122 variant).
+            Compact (32-hex) and uppercase forms are rejected. Server
+            stores the value as-is (no normalization).
+          example: 00000000-0000-4000-8000-000000000010
+
+    CreateResponse:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Server-minted notification UUIDv7.
+      example:
+        id: 018f2d6f-7f15-7000-8000-000000000001
+
+    BatchItem:
+      type: object
+      required: [channel, recipient, idempotency_key]
+      properties:
+        channel:
+          $ref: '#/components/schemas/Channel'
+        recipient:
+          type: string
+          description: |
+            Per-channel format; same rules as
+            `CreateRequest.recipient`.
+          example: "+905551234567"
+        content:
+          type: string
+          description: |
+            Notification body; same rules as
+            `CreateRequest.content`.
+          example: batch 1
+        template:
+          type: string
+          nullable: true
+          description: Phase 6 (templates not yet supplied; rejected with 400 in Phase 4).
+        template_data:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Phase 6 (rejected with 400 in Phase 4).
+        priority:
+          allOf:
+            - $ref: '#/components/schemas/Priority'
+          description: Optional. Defaults to `normal` when absent.
+        scheduled_at:
+          type: string
+          format: date-time
+          description: Optional RFC 3339 (with timezone) future timestamp.
+          example: "2026-12-31T12:00:00Z"
+        idempotency_key:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+          description: Required canonical-lowercase UUIDv4.
+          example: 00000000-0000-4000-8000-000000000020
+
+    BatchCreateRequest:
+      type: object
+      required: [notifications]
+      properties:
+        notifications:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          description: |
+            Up to `batch_max=1000` items. Each item carries the same
+            field set as `CreateRequest`. All idempotency_key values
+            must be pairwise distinct within the batch.
+          items:
+            $ref: '#/components/schemas/BatchItem'
+
+    BatchCreateResponse:
+      type: object
+      required: [batch_id, ids]
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+          description: Server-minted batch UUIDv7. Shared by every row.
+        ids:
+          type: array
+          description: |
+            Per-item server-minted UUIDv7. Order matches the request
+            (the i-th id corresponds to
+            `BatchCreateRequest.notifications[i]`).
+          items:
+            type: string
+            format: uuid
+      example:
+        batch_id: 018f2d6f-7f15-7000-8000-000000000010
+        ids:
+          - 018f2d6f-7f15-7000-8000-000000000011
+          - 018f2d6f-7f15-7000-8000-000000000012
+          - 018f2d6f-7f15-7000-8000-000000000013
+
+    NotificationRepresentation:
+      type: object
+      description: |
+        The no-attempts notification shape returned by list, batch-get,
+        and cancel responses per `docs/design/03-api.md` §Notification
+        representation.
+      required:
+        - id
+        - channel
+        - recipient
+        - priority
+        - status
+        - attempt
+        - eligible_at
+        - idempotency_key
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Notification UUIDv7.
+        batch_id:
+          type: string
+          format: uuid
+          description: Omitted when null (single-create rows).
+        channel:
+          $ref: '#/components/schemas/Channel'
+        recipient:
+          type: string
+        priority:
+          $ref: '#/components/schemas/Priority'
+        content:
+          type: string
+          description: Omitted when null. Exactly one of `content` / `template` is non-null per row.
+        template:
+          type: string
+          description: Omitted when null. Phase 6.
+        template_data:
+          type: object
+          additionalProperties: true
+          description: Omitted when null. Phase 6.
+        status:
+          $ref: '#/components/schemas/Status'
+        attempt:
+          type: integer
+          minimum: 0
+          description: |
+            Number of dispatch claims so far. Incremented by the
+            dispatcher in T2 only; every other transition leaves it
+            unchanged per `docs/design/02-state-machine.md`
+            §Counter discipline.
+        eligible_at:
+          type: string
+          format: date-time
+          description: |
+            The dispatcher's claim-eligibility column. Equals
+            `scheduled_at` when the request was scheduled; otherwise
+            equals `created_at` initially.
+        scheduled_at:
+          type: string
+          format: date-time
+          description: Omitted when null. Forensic copy of the request's `scheduled_at`.
+        failure_reason:
+          allOf:
+            - $ref: '#/components/schemas/FailureReason'
+          description: Omitted when null. Set when `status=FAILED`.
+        idempotency_key:
+          type: string
+          format: uuid
+          description: Client-supplied UUIDv4 (canonical lowercase).
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+          description: |
+            Maintained by the `notifications_set_updated_at` trigger
+            on every UPDATE.
+
+    NotificationRepresentationWithAttempts:
+      description: |
+        The single-GET notification shape per
+        `docs/design/03-api.md` §Notification representation. Extends
+        `NotificationRepresentation` with the nested `attempts` array
+        (rendered even when empty for a brand-new row).
+      allOf:
+        - $ref: '#/components/schemas/NotificationRepresentation'
+        - type: object
+          required: [attempts]
+          properties:
+            attempts:
+              type: array
+              description: |
+                Per-attempt audit records ordered by `attempt ASC`. May
+                be empty (the row has not been dispatched yet).
+              items:
+                $ref: '#/components/schemas/AttemptRepresentation'
+
+    AttemptRepresentation:
+      type: object
+      required: [attempt, started_at]
+      properties:
+        attempt:
+          type: integer
+          minimum: 1
+          description: |
+            Matches `notifications.attempt` at the time the worker
+            began handling this attempt. Append-only per
+            `docs/design/02-state-machine.md` §Counter discipline.
+        started_at:
+          type: string
+          format: date-time
+          description: When the worker began handling this attempt.
+        finished_at:
+          type: string
+          format: date-time
+          description: |
+            Omitted when null. NULL means the attempt is in flight or
+            the worker crashed mid-attempt; the reaper recovers
+            stuck rows after `reaper_stuck_threshold=120s`.
+        classification:
+          allOf:
+            - $ref: '#/components/schemas/Classification'
+          description: |
+            Omitted when null (only set once `finished_at` is set).
+        error_message:
+          type: string
+          description: Omitted when null. Short error summary.
+        response:
+          type: object
+          additionalProperties: true
+          description: |
+            Omitted when null. Verbatim provider response body.
+            NULL for `unprocessable` (no provider call happened).
+
+    ListResponse:
+      type: object
+      required: [notifications, offset, limit, has_more]
+      properties:
+        notifications:
+          type: array
+          description: |
+            Result page in `created_at DESC, id DESC` order. Items
+            use the no-attempts representation.
+          items:
+            $ref: '#/components/schemas/NotificationRepresentation'
+        offset:
+          type: integer
+          minimum: 0
+          description: Echo of the request's `offset` (or default 0).
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          description: Echo of the request's `limit` (or default `list_default_limit=50`).
+        has_more:
+          type: boolean
+          description: |
+            True when at least one row exists past the returned page
+            (computed via the `LIMIT limit + 1` trick; no `COUNT(*)`
+            runs).
+
+    BatchGetResponse:
+      type: object
+      required: [batch_id, notifications]
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+          description: Echo of the path-supplied batch id.
+        notifications:
+          type: array
+          description: |
+            Every notification sharing this `batch_id`, ordered by
+            `id ASC`. Capped at `batch_max=1000` by construction.
+          items:
+            $ref: '#/components/schemas/NotificationRepresentation'
+
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      description: Canonical wrapper for every non-2xx response.
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorBody'
+
+    ErrorBody:
+      type: object
+      required: [code, message]
+      description: |
+        Inner payload of `ErrorEnvelope`. `details` is omitted (404,
+        413, 500) or carries a single concrete entry shape per code:
+        `validation_failed` → `FieldIssue[]`,
+        `duplicate_idempotency_keys` → `IdempotencyConflictDetail[]`,
+        `terminal_state` → `[TerminalStateDetail]`.
+      properties:
+        code:
+          type: string
+          enum:
+            - validation_failed
+            - duplicate_idempotency_keys
+            - terminal_state
+            - not_found
+            - payload_too_large
+            - internal_error
+        message:
+          type: string
+          description: Human-readable message; not stable across versions.
+        details:
+          type: array
+          description: |
+            Polymorphic per `code`. Encoded as a heterogeneous array
+            so each error code can supply its own entry shape.
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/FieldIssue'
+              - $ref: '#/components/schemas/IdempotencyConflictDetail'
+              - $ref: '#/components/schemas/TerminalStateDetail'
+
+    FieldIssue:
+      type: object
+      required: [path, issue]
+      description: |
+        One entry in the `validation_failed` `details[]` array. `path`
+        names the offending request field (e.g., `channel`,
+        `notifications[3].idempotency_key`); `issue` describes the
+        rule that failed.
+      properties:
+        path:
+          type: string
+          example: notifications[0].channel
+        issue:
+          type: string
+          example: required
+
+    IdempotencyConflictDetail:
+      type: object
+      required: [idempotency_key, existing_id, status]
+      description: |
+        One entry in the `duplicate_idempotency_keys` `details[]`
+        array. Carries the existing row's id and status so the client
+        can reconcile without an extra GET.
+      properties:
+        idempotency_key:
+          type: string
+          format: uuid
+          description: The conflicting key (canonical lowercase UUIDv4).
+        existing_id:
+          type: string
+          format: uuid
+          description: The existing row's UUIDv7.
+        status:
+          $ref: '#/components/schemas/Status'
+
+    TerminalStateDetail:
+      type: object
+      required: [current_status]
+      description: |
+        Single-element entry in the `terminal_state` `details[]`
+        array. Surfaced when a cancel hits a hard-terminal row.
+      properties:
+        current_status:
+          type: string
+          enum: [DELIVERED, FAILED]
+          description: |
+            The observed terminal status. `CANCELLED` does not appear
+            here — already-cancelled rows return 200 (idempotent
+            no-op) per `docs/design/03-api.md`
+            §POST /v1/notifications/{id}/cancel.
+
+  responses:
+    Created201:
+      description: Notification created successfully.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreateResponse'
+
+    Created201Batch:
+      description: |
+        Batch created successfully. All rows persisted in one
+        transaction; ids returned in request order.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BatchCreateResponse'
+
+    OK200Notification:
+      description: |
+        Notification representation without nested delivery attempts.
+        Used by cancel responses per
+        `docs/design/03-api.md` §Notification representation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationRepresentation'
+
+    OK200NotificationWithAttempts:
+      description: |
+        Notification representation including the nested `attempts`
+        array. Used only by `GET /v1/notifications/{id}`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotificationRepresentationWithAttempts'
+
+    OK200List:
+      description: Paginated list of notifications.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ListResponse'
+
+    OK200Batch:
+      description: All notifications belonging to the supplied batch id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BatchGetResponse'
+
+    BadRequest400:
+      description: |
+        Request validation failed. `error.code` is `validation_failed`;
+        `error.details[]` carries one `FieldIssue` per failing rule.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: validation_failed
+              message: request validation failed
+              details:
+                - path: channel
+                  issue: required
+                - path: idempotency_key
+                  issue: must be a canonical lowercase UUIDv4
+
+    NotFound404:
+      description: |
+        No matching resource. `error.code` is `not_found`; `details`
+        is omitted. Returned for unknown ids and for malformed
+        (non-UUID) ids.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: not_found
+              message: notification not found
+
+    Conflict409Duplicate:
+      description: |
+        One or more `idempotency_key` values already exist in the
+        notifications table. `error.code` is
+        `duplicate_idempotency_keys`; `error.details[]` carries one
+        `IdempotencyConflictDetail` per conflicting key, in request
+        order.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: duplicate_idempotency_keys
+              message: idempotency_key already used
+              details:
+                - idempotency_key: 00000000-0000-4000-8000-000000000020
+                  existing_id: 018f2d6f-7f15-7000-8000-000000000001
+                  status: PENDING
+
+    Conflict409Terminal:
+      description: |
+        Cancel target is in a hard-terminal state (`DELIVERED` or
+        `FAILED`). `error.code` is `terminal_state`;
+        `error.details[]` carries a single `TerminalStateDetail`
+        with the observed status.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: terminal_state
+              message: notification is in a terminal state and cannot be cancelled
+              details:
+                - current_status: DELIVERED
+
+    PayloadTooLarge413:
+      description: |
+        Batch exceeded `batch_max=1000` items. `error.code` is
+        `payload_too_large`; `details` is omitted. The client must
+        shrink the batch and resubmit.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: payload_too_large
+              message: batch exceeds maximum of 1000 items
+
+    InternalServerError500:
+      description: |
+        Unexpected server-side failure. `error.code` is
+        `internal_error`; `details` is omitted. The error is logged
+        with structured context for operator investigation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: internal_error
+              message: internal error

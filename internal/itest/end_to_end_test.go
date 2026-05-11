@@ -314,8 +314,14 @@ func consumerOpts(brokers []string) []kgo.Opt {
 // notificationGetResponse mirrors api.NotificationResponse. Defined
 // locally so the e2e test reads against a stable JSON shape without
 // importing internal types from the api package.
+//
+// Phase 4 Chunk 5 adds BatchID (*string with omitempty) so batch_test.go
+// can assert every row in a batch carries the same batch_id. Existing
+// single-create tests leave the field nil; the wire-level omitempty
+// keeps their JSON shape unchanged.
 type notificationGetResponse struct {
 	ID            string                       `json:"id"`
+	BatchID       *string                      `json:"batch_id,omitempty"`
 	Channel       string                       `json:"channel"`
 	Recipient     string                       `json:"recipient"`
 	Status        string                       `json:"status"`

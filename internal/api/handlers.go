@@ -21,9 +21,20 @@ import (
 // *store.Store or *pgxpool.Pool in Deps) so the test plan in
 // docs/phases/02-walking-skeleton.md §13 ("fake Store interface
 // satisfied in-memory") works without touching real infrastructure.
+//
+// Phase 4 Chunk 1 adds ListNotifications and GetBatch per
+// docs/phases/04-api-completeness.md §1.2 + §1.3.
+// Phase 4 Chunk 2 adds InsertBatch per
+// docs/phases/04-api-completeness.md §1.1.
+// Phase 4 Chunk 3 adds CancelNotification per
+// docs/phases/04-api-completeness.md §1.4.
 type Store interface {
 	InsertNotification(ctx context.Context, n store.Notification) error
+	InsertBatch(ctx context.Context, ns []store.Notification, batchID uuid.UUID) error
 	GetNotification(ctx context.Context, id uuid.UUID) (store.Notification, []store.DeliveryAttempt, error)
+	ListNotifications(ctx context.Context, filters store.ListFilters, offset, limit int) ([]store.Notification, bool, error)
+	GetBatch(ctx context.Context, batchID uuid.UUID) ([]store.Notification, error)
+	CancelNotification(ctx context.Context, id uuid.UUID) (store.Notification, error)
 }
 
 // Deps is the api package's per-process dependency bundle. cmd.go
@@ -40,10 +51,11 @@ type Deps struct {
 	Clock    func() time.Time
 }
 
-// RegisterRoutes wires the Phase 2 endpoint set onto mux.
+// RegisterRoutes wires every endpoint in the api package onto mux.
 //
-// docs/phases/02-walking-skeleton.md §6 lists the four routes; healthz
-// is the verbatim Phase 1 handler that moved out of internal/server.
+// docs/phases/02-walking-skeleton.md §6 locked the original four routes;
+// docs/phases/04-api-completeness.md adds the list (Chunk 1), batch-get
+// (Chunk 1), batch-create (Chunk 2), and cancel (Chunk 3) endpoints.
 func RegisterRoutes(mux *http.ServeMux, deps Deps) {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
@@ -55,7 +67,11 @@ func RegisterRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(deps.Registry, promhttp.HandlerOpts{}))
 	mux.Handle("POST /v1/notifications", handleCreate(deps))
+	mux.Handle("POST /v1/notifications/batch", handleBatchCreate(deps))
+	mux.Handle("GET /v1/notifications", handleList(deps))
 	mux.Handle("GET /v1/notifications/{id}", handleGet(deps))
+	mux.Handle("POST /v1/notifications/{id}/cancel", handleCancel(deps))
+	mux.Handle("GET /v1/batches/{id}", handleGetBatch(deps))
 }
 
 // handleHealthz is the Phase-1-locked exact-byte healthz handler from
@@ -174,11 +190,30 @@ func handleGet(deps Deps) http.HandlerFunc {
 	}
 }
 
-// renderNotification turns the store representation into the JSON shape
-// from docs/design/03-api.md §Notification representation. The six
-// nullable fields documented there map to *string / json.RawMessage so
-// `omitempty` drops them from the wire when null.
+// renderNotification returns the single-GET response shape: every
+// notification field plus the nested attempts: [...] array (rendered
+// even when empty). Used only by handleGet.
+//
+// The helper always builds a non-nil slice via renderAttempts and
+// stores &slice on the response so the wire format is always
+// "attempts": [...] per docs/design/03-api.md §Nested attempts.
 func renderNotification(n store.Notification, attempts []store.DeliveryAttempt) NotificationResponse {
+	out := renderNotificationWithoutAttempts(n)
+	rendered := renderAttempts(attempts)
+	out.Attempts = &rendered
+	return out
+}
+
+// renderNotificationWithoutAttempts returns the list / batch-get /
+// cancel response shape per docs/design/03-api.md §Notification
+// representation: every notification field, no nested attempts key.
+//
+// Leaves NotificationResponse.Attempts as nil so omitempty drops the
+// field entirely from the wire format. The split between this helper
+// and renderNotification keeps the field projection single-sourced;
+// docs/phases/04-api-completeness.md §2 requires both code paths to
+// agree on every projected field.
+func renderNotificationWithoutAttempts(n store.Notification) NotificationResponse {
 	out := NotificationResponse{
 		ID:             n.ID.String(),
 		Channel:        n.Channel,
@@ -190,7 +225,6 @@ func renderNotification(n store.Notification, attempts []store.DeliveryAttempt) 
 		IdempotencyKey: n.IdempotencyKey,
 		CreatedAt:      formatTime(n.CreatedAt),
 		UpdatedAt:      formatTime(n.UpdatedAt),
-		Attempts:       renderAttempts(attempts),
 	}
 
 	if n.BatchID.Valid {

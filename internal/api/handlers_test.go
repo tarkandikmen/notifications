@@ -23,14 +23,42 @@ import (
 // real *store.Store per docs/phases/02-walking-skeleton.md §13. Each test
 // wires its own per-call behavior via the function fields so the assertions
 // stay near the test that needs them.
+//
+// Phase 4 Chunk 1 adds the list / get-batch fields per
+// docs/phases/04-api-completeness.md §10 (handler unit-test rows).
+// Phase 4 Chunk 2 adds the batch-insert fields.
+// Phase 4 Chunk 3 adds the cancel fields.
 type fakeStore struct {
 	insertCalled int
 	insertArg    store.Notification
 	insertErr    error
 
+	insertBatchCalled  int
+	insertBatchArg     []store.Notification
+	insertBatchBatchID uuid.UUID
+	insertBatchErr     error
+
 	getRow      store.Notification
 	getAttempts []store.DeliveryAttempt
 	getErr      error
+
+	listCalled  int
+	listFilters store.ListFilters
+	listOffset  int
+	listLimit   int
+	listRows    []store.Notification
+	listHasMore bool
+	listErr     error
+
+	getBatchCalled int
+	getBatchArg    uuid.UUID
+	getBatchRows   []store.Notification
+	getBatchErr    error
+
+	cancelCalled int
+	cancelArg    uuid.UUID
+	cancelRow    store.Notification
+	cancelErr    error
 }
 
 func (f *fakeStore) InsertNotification(_ context.Context, n store.Notification) error {
@@ -39,11 +67,47 @@ func (f *fakeStore) InsertNotification(_ context.Context, n store.Notification) 
 	return f.insertErr
 }
 
+func (f *fakeStore) InsertBatch(_ context.Context, ns []store.Notification, batchID uuid.UUID) error {
+	f.insertBatchCalled++
+	f.insertBatchArg = ns
+	f.insertBatchBatchID = batchID
+	return f.insertBatchErr
+}
+
 func (f *fakeStore) GetNotification(_ context.Context, _ uuid.UUID) (store.Notification, []store.DeliveryAttempt, error) {
 	if f.getErr != nil {
 		return store.Notification{}, nil, f.getErr
 	}
 	return f.getRow, f.getAttempts, nil
+}
+
+func (f *fakeStore) ListNotifications(_ context.Context, filters store.ListFilters, offset, limit int) ([]store.Notification, bool, error) {
+	f.listCalled++
+	f.listFilters = filters
+	f.listOffset = offset
+	f.listLimit = limit
+	if f.listErr != nil {
+		return nil, false, f.listErr
+	}
+	return f.listRows, f.listHasMore, nil
+}
+
+func (f *fakeStore) GetBatch(_ context.Context, batchID uuid.UUID) ([]store.Notification, error) {
+	f.getBatchCalled++
+	f.getBatchArg = batchID
+	if f.getBatchErr != nil {
+		return nil, f.getBatchErr
+	}
+	return f.getBatchRows, nil
+}
+
+func (f *fakeStore) CancelNotification(_ context.Context, id uuid.UUID) (store.Notification, error) {
+	f.cancelCalled++
+	f.cancelArg = id
+	if f.cancelErr != nil {
+		return store.Notification{}, f.cancelErr
+	}
+	return f.cancelRow, nil
 }
 
 func newTestServer(t *testing.T, fs *fakeStore) *httptest.Server {

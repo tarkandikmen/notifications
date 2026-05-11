@@ -1,0 +1,11 @@
+# Spectral CLI v6 dropped the `--ruleset spectral:oas` shorthand
+# (https://github.com/stoplightio/spectral/issues/1893). The supported way
+# to apply the built-in OpenAPI ruleset from the CLI is to extend it from
+# a config file in the working directory; Spectral auto-discovers
+# `.spectral.yaml` at the repo root and applies it to every linted
+# document.
+#
+# This file is the Phase 4 §9 CI lint step's ruleset source; the step
+# invokes `spectral lint docs/openapi.yaml` and gets the full
+# OpenAPI 3.0.3 rule set from this `extends` line.
+extends: spectral:oas

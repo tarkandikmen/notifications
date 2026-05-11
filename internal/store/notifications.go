@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -82,6 +83,145 @@ func (s *Store) InsertNotification(ctx context.Context, n Notification) error {
 	return fmt.Errorf("store: insert notification: %w", err)
 }
 
+// InsertBatch inserts up to batch_max notifications in one transaction.
+// All rows share batchID. The api layer mints every n.ID (UUIDv7) and
+// every batchID (UUIDv7) before calling; this function does not
+// generate ids.
+//
+// On full success: returns nil. The caller knows the inserted ids from
+// the input slice's n.ID values; no RETURNING-driven mapping is needed.
+//
+// On any idempotency_key conflict against the existing notifications
+// table: returns *BatchIdempotencyConflictError carrying one
+// IdempotencyConflictEntry per conflicting key (key + existing id +
+// existing status). The transaction is rolled back, so no rows from the
+// batch are persisted per docs/design/03-api.md §POST /v1/notifications/batch
+// ("all-or-nothing").
+//
+// On any other error: returns the wrapped error; the transaction is
+// rolled back.
+//
+// Intra-batch duplicate keys are *not* this function's concern — the
+// api layer rejects them as validation_failed (400) before calling per
+// docs/design/06-idempotency.md §Intra-batch duplicates.
+//
+// docs/phases/04-api-completeness.md §1.1.
+func (s *Store) InsertBatch(ctx context.Context, ns []Notification, batchID uuid.UUID) error {
+	if len(ns) == 0 {
+		return nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: insert batch: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Build one multi-row INSERT with 14 columns × N rows. The batch_id
+	// column is written verbatim from the caller-supplied batchID for
+	// every row; the api layer mints batchID before calling. The
+	// ON CONFLICT (idempotency_key) DO NOTHING + RETURNING shape lets
+	// the success branch finish in one round trip and the conflict
+	// branch identify which keys collided with one follow-up SELECT.
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO notifications (
+		id, batch_id, channel, recipient, priority,
+		content, template, template_data,
+		status, attempt, eligible_at, scheduled_at,
+		failure_reason, idempotency_key
+	) VALUES `)
+
+	args := make([]any, 0, len(ns)*14)
+	for i, n := range ns {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		base := i * 14
+		fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7,
+			base+8, base+9, base+10, base+11, base+12, base+13, base+14,
+		)
+		args = append(args,
+			n.ID,
+			uuid.NullUUID{UUID: batchID, Valid: true},
+			n.Channel, n.Recipient, n.Priority,
+			n.Content, n.Template, jsonOrNil(n.TemplateData),
+			n.Status, n.Attempt, n.EligibleAt, n.ScheduledAt,
+			n.FailureReason, n.IdempotencyKey,
+		)
+	}
+	sb.WriteString(` ON CONFLICT (idempotency_key) DO NOTHING RETURNING idempotency_key`)
+
+	rows, err := tx.Query(ctx, sb.String(), args...)
+	if err != nil {
+		return fmt.Errorf("store: insert batch: %w", err)
+	}
+	returned := make(map[string]struct{}, len(ns))
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: insert batch: scan returning: %w", err)
+		}
+		returned[k] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("store: insert batch: rows: %w", err)
+	}
+	rows.Close()
+
+	if len(returned) == len(ns) {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("store: insert batch: commit: %w", err)
+		}
+		return nil
+	}
+
+	// Conflict path: identify missing keys (preserving input order so
+	// the api layer's 409 details[] surfaces them in request order),
+	// then look up each existing row's id + status with a single
+	// SELECT ... = ANY($1) round trip against the same tx (still
+	// readable inside the uncommitted batch; the conflicting rows
+	// pre-date this transaction).
+	missing := make([]string, 0, len(ns)-len(returned))
+	for _, n := range ns {
+		if _, ok := returned[n.IdempotencyKey]; !ok {
+			missing = append(missing, n.IdempotencyKey)
+		}
+	}
+
+	conflictRows, err := tx.Query(ctx,
+		`SELECT idempotency_key, id, status FROM notifications WHERE idempotency_key = ANY($1)`,
+		missing,
+	)
+	if err != nil {
+		return fmt.Errorf("store: insert batch: follow-up select: %w", err)
+	}
+	existing := make(map[string]IdempotencyConflictEntry, len(missing))
+	for conflictRows.Next() {
+		var e IdempotencyConflictEntry
+		if err := conflictRows.Scan(&e.Key, &e.ExistingID, &e.ExistingStatus); err != nil {
+			conflictRows.Close()
+			return fmt.Errorf("store: insert batch: scan follow-up: %w", err)
+		}
+		existing[e.Key] = e
+	}
+	if err := conflictRows.Err(); err != nil {
+		conflictRows.Close()
+		return fmt.Errorf("store: insert batch: follow-up rows: %w", err)
+	}
+	conflictRows.Close()
+
+	entries := make([]IdempotencyConflictEntry, 0, len(missing))
+	for _, k := range missing {
+		if e, ok := existing[k]; ok {
+			entries = append(entries, e)
+		}
+	}
+	return &BatchIdempotencyConflictError{Entries: entries}
+}
+
 // ReadStateForGuard returns the (status, attempt) pair the worker's
 // Layer 1 idempotency guard inspects per docs/design/06-idempotency.md
 // §Layer 1. The read is a single-row SELECT against the pool — no
@@ -124,6 +264,271 @@ func (s *Store) GetNotification(ctx context.Context, id uuid.UUID) (Notification
 		return Notification{}, nil, fmt.Errorf("store: get notification: list attempts: %w", err)
 	}
 	return n, attempts, nil
+}
+
+// ListFilters carries the optional AND-composed filters from
+// docs/design/03-api.md §List filter set. Every field is a pointer so absent
+// and zero-valued collapse to the same wire shape; the api layer parses query
+// params into this struct via parseListRequest.
+type ListFilters struct {
+	Status        *string
+	Channel       *string
+	Priority      *int16     // translated from "low"/"normal"/"high" by the api layer
+	BatchID       *uuid.UUID // canonical-form UUID parsed by the api layer
+	CreatedAfter  *time.Time // inclusive (created_at >= $x)
+	CreatedBefore *time.Time // exclusive (created_at <  $x)
+}
+
+// ListNotifications returns up to limit rows matching every supplied filter,
+// ordered by created_at DESC, id DESC per docs/design/03-api.md §Pagination.
+//
+// hasMore is computed via the LIMIT limit+1 trick: the function fetches
+// limit+1 rows; if the extra row is present, hasMore is true and the extra
+// row is dropped from the returned slice. No COUNT(*) query runs.
+//
+// offset and limit are caller-validated (api layer rejects offset < 0 or
+// limit outside [1, list_max_limit]); this function trusts them.
+//
+// docs/phases/04-api-completeness.md §1.2.
+func (s *Store) ListNotifications(ctx context.Context, filters ListFilters, offset, limit int) (rows []Notification, hasMore bool, err error) {
+	var sb strings.Builder
+	sb.WriteString(`SELECT `)
+	sb.WriteString(notificationColumns)
+	sb.WriteString(` FROM notifications WHERE TRUE`)
+
+	args := make([]any, 0, 8)
+	if filters.Status != nil {
+		args = append(args, *filters.Status)
+		fmt.Fprintf(&sb, ` AND status = $%d`, len(args))
+	}
+	if filters.Channel != nil {
+		args = append(args, *filters.Channel)
+		fmt.Fprintf(&sb, ` AND channel = $%d`, len(args))
+	}
+	if filters.Priority != nil {
+		args = append(args, *filters.Priority)
+		fmt.Fprintf(&sb, ` AND priority = $%d`, len(args))
+	}
+	if filters.BatchID != nil {
+		args = append(args, *filters.BatchID)
+		fmt.Fprintf(&sb, ` AND batch_id = $%d`, len(args))
+	}
+	if filters.CreatedAfter != nil {
+		args = append(args, *filters.CreatedAfter)
+		fmt.Fprintf(&sb, ` AND created_at >= $%d`, len(args))
+	}
+	if filters.CreatedBefore != nil {
+		args = append(args, *filters.CreatedBefore)
+		fmt.Fprintf(&sb, ` AND created_at < $%d`, len(args))
+	}
+
+	sb.WriteString(` ORDER BY created_at DESC, id DESC`)
+	args = append(args, limit+1)
+	fmt.Fprintf(&sb, ` LIMIT $%d`, len(args))
+	args = append(args, offset)
+	fmt.Fprintf(&sb, ` OFFSET $%d`, len(args))
+
+	pgRows, err := s.pool.Query(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: list notifications: %w", err)
+	}
+	defer pgRows.Close()
+
+	out := make([]Notification, 0, limit)
+	for pgRows.Next() {
+		var n Notification
+		if err := scanNotification(pgRows, &n); err != nil {
+			return nil, false, fmt.Errorf("store: list notifications: scan: %w", err)
+		}
+		out = append(out, n)
+	}
+	if err := pgRows.Err(); err != nil {
+		return nil, false, fmt.Errorf("store: list notifications: rows: %w", err)
+	}
+
+	if len(out) > limit {
+		return out[:limit], true, nil
+	}
+	return out, false, nil
+}
+
+// GetBatch returns every notification sharing batchID, ordered by id ASC
+// (UUIDv7 ids are time-ordered, so id ASC gives the natural request order
+// — created_at is effectively constant across a batch since all rows are
+// inserted in one transaction).
+//
+// Returns (nil, ErrNotFound) when no row matches; the api layer renders
+// 404 per docs/design/03-api.md §GET /v1/batches/{id}.
+//
+// Returns at most batch_max rows by construction (batch create caps at
+// batch_max per docs/design/03-api.md §POST /v1/notifications/batch).
+//
+// docs/phases/04-api-completeness.md §1.3.
+func (s *Store) GetBatch(ctx context.Context, batchID uuid.UUID) ([]Notification, error) {
+	const sql = `SELECT ` + notificationColumns + ` FROM notifications WHERE batch_id = $1 ORDER BY id ASC`
+	rows, err := s.pool.Query(ctx, sql, batchID)
+	if err != nil {
+		return nil, fmt.Errorf("store: get batch: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]Notification, 0)
+	for rows.Next() {
+		var n Notification
+		if err := scanNotification(rows, &n); err != nil {
+			return nil, fmt.Errorf("store: get batch: scan: %w", err)
+		}
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: get batch: rows: %w", err)
+	}
+	if len(out) == 0 {
+		return nil, ErrNotFound
+	}
+	return out, nil
+}
+
+// CancelNotification runs the cancel transition T3 (PENDING → CANCELLED
+// with events.notification outbox emit) or T11 (DISPATCHED → CANCELLED
+// without emit) per docs/design/02-state-machine.md §Transitions.
+//
+// Behavior by current status:
+//
+//	PENDING    → T3: UPDATE status='CANCELLED'; INSERT outbox row to
+//	             events.notification with previous_status='PENDING'
+//	             per docs/design/04-kafka.md §2 (emission policy row T3).
+//	             Returns the post-trigger row (updated_at refreshed by
+//	             notifications_set_updated_at).
+//
+//	DISPATCHED → T11: UPDATE status='CANCELLED'. No events.notification
+//	             emit per docs/design/04-kafka.md §2 (the cancel may be
+//	             silently overwritten by T4–T8; emitting CANCELLED would
+//	             publish a possibly-false claim about the realized
+//	             outcome). Returns the post-trigger row.
+//
+//	CANCELLED  → idempotent no-op. No UPDATE, no outbox emit. Returns
+//	             the current row unchanged. The api layer surfaces this
+//	             as 200 per docs/design/03-api.md §POST /v1/notifications/{id}/cancel.
+//
+//	DELIVERED  → returns *TerminalStateError{CurrentStatus: "DELIVERED"}.
+//	FAILED     → returns *TerminalStateError{CurrentStatus: "FAILED"}.
+//
+//	missing    → returns ErrNotFound.
+//
+// Single transaction. Begins with SELECT ... FOR UPDATE (no SKIP LOCKED,
+// no NOWAIT) so a concurrent dispatcher claim on the same row blocks
+// the cancel briefly rather than failing it — either order resolves to
+// a documented end state per docs/phases/04-api-completeness.md §7
+// Concurrency note.
+//
+// docs/phases/04-api-completeness.md §1.4.
+func (s *Store) CancelNotification(ctx context.Context, id uuid.UUID) (Notification, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Notification{}, fmt.Errorf("store: cancel: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var n Notification
+	row := tx.QueryRow(ctx, notificationSelectSQL+` WHERE id = $1 FOR UPDATE`, id)
+	if err := scanNotification(row, &n); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Notification{}, ErrNotFound
+		}
+		return Notification{}, fmt.Errorf("store: cancel: select: %w", err)
+	}
+
+	switch n.Status {
+	case "DELIVERED", "FAILED":
+		return Notification{}, &TerminalStateError{CurrentStatus: n.Status}
+	case "CANCELLED":
+		if err := tx.Commit(ctx); err != nil {
+			return Notification{}, fmt.Errorf("store: cancel: commit idempotent: %w", err)
+		}
+		return n, nil
+	case "PENDING":
+		return s.applyCancelPending(ctx, tx, id)
+	case "DISPATCHED":
+		return s.applyCancelDispatched(ctx, tx, id)
+	default:
+		return Notification{}, fmt.Errorf("store: cancel: unexpected status %q", n.Status)
+	}
+}
+
+// applyCancelPending runs T3 in one CTE round trip: UPDATE notifications
+// SET status='CANCELLED', INSERT the events.notification outbox row, and
+// SELECT the post-trigger notification (so the caller sees the updated_at
+// stamped by the notifications_set_updated_at BEFORE-UPDATE trigger).
+//
+// Postgres always executes data-modifying CTEs to completion even when
+// their RETURNING is unreferenced (https://www.postgresql.org/docs/current/queries-with.html)
+// — the `emitted` CTE's outbox INSERT fires regardless of the outer
+// SELECT only reading from `updated`.
+//
+// Payload shape mirrors docs/design/04-kafka.md §2 with
+// previous_status='PENDING' and classification / failure_reason both null
+// (cancel is a clean transition, not a worker outcome).
+//
+// docs/phases/04-api-completeness.md §1.4.
+func (s *Store) applyCancelPending(ctx context.Context, tx pgx.Tx, id uuid.UUID) (Notification, error) {
+	const sql = `
+		WITH updated AS (
+			UPDATE notifications
+			   SET status = 'CANCELLED'
+			 WHERE id = $1
+			RETURNING ` + notificationColumns + `
+		), emitted AS (
+			INSERT INTO outbox (topic, partition_key, payload)
+			SELECT 'events.notification', id::text, jsonb_build_object(
+				'version',         1,
+				'id',              id,
+				'batch_id',        batch_id,
+				'channel',         channel,
+				'attempt',         attempt,
+				'previous_status', 'PENDING',
+				'current_status',  'CANCELLED',
+				'classification',  NULL,
+				'failure_reason',  NULL,
+				'occurred_at',     now()
+			)
+			FROM updated
+			RETURNING 1
+		)
+		SELECT ` + notificationColumns + ` FROM updated
+	`
+	var n Notification
+	if err := scanNotification(tx.QueryRow(ctx, sql, id), &n); err != nil {
+		return Notification{}, fmt.Errorf("store: cancel pending: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Notification{}, fmt.Errorf("store: cancel pending: commit: %w", err)
+	}
+	return n, nil
+}
+
+// applyCancelDispatched runs T11: UPDATE notifications SET
+// status='CANCELLED' and RETURN the post-trigger row. No
+// events.notification emit per docs/design/04-kafka.md §2 (the
+// realized state, if any, is communicated by T4–T8 when the worker
+// resolves the in-flight attempt).
+//
+// docs/phases/04-api-completeness.md §1.4.
+func (s *Store) applyCancelDispatched(ctx context.Context, tx pgx.Tx, id uuid.UUID) (Notification, error) {
+	const sql = `
+		UPDATE notifications
+		   SET status = 'CANCELLED'
+		 WHERE id = $1
+		RETURNING ` + notificationColumns + `
+	`
+	var n Notification
+	if err := scanNotification(tx.QueryRow(ctx, sql, id), &n); err != nil {
+		return Notification{}, fmt.Errorf("store: cancel dispatched: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Notification{}, fmt.Errorf("store: cancel dispatched: commit: %w", err)
+	}
+	return n, nil
 }
 
 // ClaimDispatchable runs the CTE-based claim from ARCHITECTURE_v3.md §6.2

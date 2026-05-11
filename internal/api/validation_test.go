@@ -1,10 +1,13 @@
 package api
 
 import (
+	"fmt"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -435,4 +438,476 @@ func issuesPaths(issues []FieldIssue) []string {
 		out = append(out, issue.Path)
 	}
 	return out
+}
+
+// TestParseListRequest_Defaults pins the empty-query disposition:
+// offset=0, limit=listDefaultLimit, every filter pointer nil.
+func TestParseListRequest_Defaults(t *testing.T) {
+	req := httptest.NewRequest("GET", "/v1/notifications", nil)
+	got, issues := parseListRequest(req)
+
+	assert.Empty(t, issues)
+	assert.Equal(t, 0, got.Offset)
+	assert.Equal(t, listDefaultLimit, got.Limit)
+	assert.Nil(t, got.Filters.Status)
+	assert.Nil(t, got.Filters.Channel)
+	assert.Nil(t, got.Filters.Priority)
+	assert.Nil(t, got.Filters.BatchID)
+	assert.Nil(t, got.Filters.CreatedAfter)
+	assert.Nil(t, got.Filters.CreatedBefore)
+}
+
+func TestParseListRequest_OffsetLimit(t *testing.T) {
+	cases := []struct {
+		name       string
+		query      string
+		wantOffset int
+		wantLimit  int
+		wantPath   string
+		wantWord   string
+	}{
+		{"valid offset and limit", "offset=10&limit=25", 10, 25, "", ""},
+		{"limit at lower bound", "limit=1", 0, 1, "", ""},
+		{"limit at upper bound", "limit=200", 0, 200, "", ""},
+		{"limit zero rejected", "limit=0", 0, listDefaultLimit, "limit", "between"},
+		{"limit over max rejected", "limit=201", 0, listDefaultLimit, "limit", "between"},
+		{"limit non-integer rejected", "limit=abc", 0, listDefaultLimit, "limit", "integer"},
+		{"offset negative rejected", "offset=-1", 0, listDefaultLimit, "offset", ">= 0"},
+		{"offset non-integer rejected", "offset=xyz", 0, listDefaultLimit, "offset", "integer"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/v1/notifications?"+tc.query, nil)
+			got, issues := parseListRequest(req)
+
+			if tc.wantPath == "" {
+				assert.Empty(t, issues)
+				assert.Equal(t, tc.wantOffset, got.Offset)
+				assert.Equal(t, tc.wantLimit, got.Limit)
+			} else {
+				require.Len(t, issues, 1)
+				assert.Equal(t, tc.wantPath, issues[0].Path)
+				assert.Contains(t, issues[0].Issue, tc.wantWord)
+			}
+		})
+	}
+}
+
+func TestParseListRequest_StatusFilter(t *testing.T) {
+	cases := []struct {
+		name   string
+		value  string
+		wantOK bool
+	}{
+		{"PENDING accepted", "PENDING", true},
+		{"DISPATCHED accepted", "DISPATCHED", true},
+		{"DELIVERED accepted", "DELIVERED", true},
+		{"FAILED accepted", "FAILED", true},
+		{"CANCELLED accepted", "CANCELLED", true},
+		{"lowercase rejected", "pending", false},
+		{"unknown rejected", "QUEUED", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/v1/notifications?status="+tc.value, nil)
+			got, issues := parseListRequest(req)
+
+			if tc.wantOK {
+				require.Empty(t, issues)
+				require.NotNil(t, got.Filters.Status)
+				assert.Equal(t, tc.value, *got.Filters.Status)
+			} else {
+				assert.Contains(t, issuesPaths(issues), "status")
+				assert.Nil(t, got.Filters.Status)
+			}
+		})
+	}
+}
+
+func TestParseListRequest_ChannelFilter(t *testing.T) {
+	cases := []struct {
+		name   string
+		value  string
+		wantOK bool
+	}{
+		{"sms accepted", "sms", true},
+		{"email accepted", "email", true},
+		{"push accepted", "push", true},
+		{"uppercase rejected", "SMS", false},
+		{"unknown rejected", "fax", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/v1/notifications?channel="+tc.value, nil)
+			got, issues := parseListRequest(req)
+
+			if tc.wantOK {
+				require.Empty(t, issues)
+				require.NotNil(t, got.Filters.Channel)
+				assert.Equal(t, tc.value, *got.Filters.Channel)
+			} else {
+				assert.Contains(t, issuesPaths(issues), "channel")
+				assert.Nil(t, got.Filters.Channel)
+			}
+		})
+	}
+}
+
+func TestParseListRequest_PriorityFilter(t *testing.T) {
+	cases := []struct {
+		name      string
+		value     string
+		wantOK    bool
+		wantValue int16
+	}{
+		{"low → 0", "low", true, 0},
+		{"normal → 1", "normal", true, 1},
+		{"high → 2", "high", true, 2},
+		{"uppercase rejected", "HIGH", false, 0},
+		{"numeric rejected", "1", false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/v1/notifications?priority="+tc.value, nil)
+			got, issues := parseListRequest(req)
+
+			if tc.wantOK {
+				require.Empty(t, issues)
+				require.NotNil(t, got.Filters.Priority)
+				assert.Equal(t, tc.wantValue, *got.Filters.Priority)
+			} else {
+				assert.Contains(t, issuesPaths(issues), "priority")
+				assert.Nil(t, got.Filters.Priority)
+			}
+		})
+	}
+}
+
+func TestParseListRequest_BatchIDFilter(t *testing.T) {
+	t.Run("valid uuid accepted", func(t *testing.T) {
+		id := "11110000-0000-7000-8000-000000000020"
+		req := httptest.NewRequest("GET", "/v1/notifications?batch_id="+id, nil)
+		got, issues := parseListRequest(req)
+
+		require.Empty(t, issues)
+		require.NotNil(t, got.Filters.BatchID)
+		assert.Equal(t, uuid.MustParse(id), *got.Filters.BatchID)
+	})
+
+	t.Run("malformed rejected", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/v1/notifications?batch_id=not-a-uuid", nil)
+		_, issues := parseListRequest(req)
+		assert.Contains(t, issuesPaths(issues), "batch_id")
+	})
+}
+
+func TestParseListRequest_CreatedFilters(t *testing.T) {
+	t.Run("valid created_after accepted", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/v1/notifications?created_after=2026-05-11T00:00:00Z", nil)
+		got, issues := parseListRequest(req)
+
+		require.Empty(t, issues)
+		require.NotNil(t, got.Filters.CreatedAfter)
+	})
+
+	t.Run("valid created_before accepted", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/v1/notifications?created_before=2026-05-12T00:00:00Z", nil)
+		got, issues := parseListRequest(req)
+
+		require.Empty(t, issues)
+		require.NotNil(t, got.Filters.CreatedBefore)
+	})
+
+	t.Run("malformed rejected", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/v1/notifications?created_after=tomorrow", nil)
+		_, issues := parseListRequest(req)
+		assert.Contains(t, issuesPaths(issues), "created_after")
+	})
+
+	t.Run("missing tz rejected", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/v1/notifications?created_before=2026-05-11T00:00:00", nil)
+		_, issues := parseListRequest(req)
+		assert.Contains(t, issuesPaths(issues), "created_before")
+	})
+
+	t.Run("does NOT enforce after <= before", func(t *testing.T) {
+		// created_after > created_before is a valid query that matches
+		// nothing — the parser must not surface a cross-field issue.
+		req := httptest.NewRequest("GET",
+			"/v1/notifications?created_after=2026-06-01T00:00:00Z&created_before=2026-05-01T00:00:00Z", nil)
+		_, issues := parseListRequest(req)
+		assert.Empty(t, issues)
+	})
+}
+
+func TestParseListRequest_AllFiltersAtOnce(t *testing.T) {
+	q := "offset=5&limit=20" +
+		"&status=DELIVERED" +
+		"&channel=sms" +
+		"&priority=high" +
+		"&batch_id=11110000-0000-7000-8000-000000000030" +
+		"&created_after=2026-05-01T00:00:00Z" +
+		"&created_before=2026-05-12T00:00:00Z"
+
+	req := httptest.NewRequest("GET", "/v1/notifications?"+q, nil)
+	got, issues := parseListRequest(req)
+
+	require.Empty(t, issues)
+	assert.Equal(t, 5, got.Offset)
+	assert.Equal(t, 20, got.Limit)
+	require.NotNil(t, got.Filters.Status)
+	assert.Equal(t, "DELIVERED", *got.Filters.Status)
+	require.NotNil(t, got.Filters.Channel)
+	assert.Equal(t, "sms", *got.Filters.Channel)
+	require.NotNil(t, got.Filters.Priority)
+	assert.Equal(t, int16(2), *got.Filters.Priority)
+	require.NotNil(t, got.Filters.BatchID)
+	assert.Equal(t, "11110000-0000-7000-8000-000000000030", got.Filters.BatchID.String())
+	require.NotNil(t, got.Filters.CreatedAfter)
+	require.NotNil(t, got.Filters.CreatedBefore)
+}
+
+// TestParseListRequest_AllInvalidParamsAtOnce verifies issues do NOT
+// short-circuit: a single parse pass surfaces every bad param at once,
+// matching the rest-of-validator posture from
+// docs/design/03-api.md §Error model.
+func TestParseListRequest_AllInvalidParamsAtOnce(t *testing.T) {
+	q := "offset=-1&limit=0&status=garbage&channel=fax&priority=urgent&batch_id=nope&created_after=tomorrow&created_before=yesterday"
+	req := httptest.NewRequest("GET", "/v1/notifications?"+q, nil)
+	_, issues := parseListRequest(req)
+
+	paths := issuesPaths(issues)
+	for _, want := range []string{"offset", "limit", "status", "channel", "priority", "batch_id", "created_after", "created_before"} {
+		assert.Contains(t, paths, want, "expected issue for path %q", want)
+	}
+}
+
+// TestParseListRequest_UnknownParamsIgnored locks the behavior from
+// docs/design/03-api.md §Conventions ("Unknown request body fields are
+// ignored") applied symmetrically to the query string. A future
+// query-param widening (e.g., template_id) doesn't break older clients.
+func TestParseListRequest_UnknownParamsIgnored(t *testing.T) {
+	req := httptest.NewRequest("GET", "/v1/notifications?garbage=ignored&also_garbage=42", nil)
+	got, issues := parseListRequest(req)
+
+	assert.Empty(t, issues)
+	assert.Equal(t, 0, got.Offset)
+	assert.Equal(t, listDefaultLimit, got.Limit)
+}
+
+// validBatchItem returns a fresh BatchItem that passes every
+// validateCreateItem rule (mirrors validRequest at the BatchItem level).
+// Tests can mutate one field at a time so the failure points are
+// isolated.
+func validBatchItem(key string) BatchItem {
+	return BatchItem{
+		Channel:        "sms",
+		Recipient:      "+905551234567",
+		Content:        "batch happy path",
+		IdempotencyKey: key,
+	}
+}
+
+// TestValidateBatchCreate_HappyPath asserts a fully valid batch
+// surfaces zero issues.
+func TestValidateBatchCreate_HappyPath(t *testing.T) {
+	req := BatchCreateRequest{
+		Notifications: []BatchItem{
+			validBatchItem("00000000-0000-4000-8000-000000000a01"),
+			validBatchItem("00000000-0000-4000-8000-000000000a02"),
+			validBatchItem("00000000-0000-4000-8000-000000000a03"),
+		},
+	}
+	issues := ValidateBatchCreate(req, fixedNow)
+	assert.Empty(t, issues)
+}
+
+// TestValidateBatchCreate_EmptyBatch insists the empty-batch case
+// surfaces exactly one issue against the "notifications" path. No
+// per-item rules apply.
+func TestValidateBatchCreate_EmptyBatch(t *testing.T) {
+	issues := ValidateBatchCreate(BatchCreateRequest{Notifications: nil}, fixedNow)
+	require.Len(t, issues, 1)
+	assert.Equal(t, "notifications", issues[0].Path)
+	assert.Contains(t, issues[0].Issue, "at least one")
+
+	issues = ValidateBatchCreate(BatchCreateRequest{Notifications: []BatchItem{}}, fixedNow)
+	require.Len(t, issues, 1)
+	assert.Equal(t, "notifications", issues[0].Path)
+}
+
+// TestValidateBatchCreate_OversizedBatch_ShortCircuits asserts an
+// oversize batch produces ONLY the "batch size exceeded" issue. The
+// per-item walk is skipped — the handler routes the single short-
+// circuit issue to 413 payload_too_large directly per
+// docs/phases/04-api-completeness.md §3.1.
+func TestValidateBatchCreate_OversizedBatch_ShortCircuits(t *testing.T) {
+	items := make([]BatchItem, batchMax+1)
+	for i := range items {
+		items[i] = validBatchItem(fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1))
+	}
+	// Break one item so we can prove the per-item walk did NOT run.
+	items[0].Content = ""
+	items[0].Channel = ""
+
+	issues := ValidateBatchCreate(BatchCreateRequest{Notifications: items}, fixedNow)
+	require.Len(t, issues, 1, "oversize batch must short-circuit to one issue")
+	assert.Equal(t, "notifications", issues[0].Path)
+	assert.Contains(t, issues[0].Issue, "batch size")
+	assert.Contains(t, issues[0].Issue, fmt.Sprintf("%d", batchMax))
+}
+
+// TestValidateBatchCreate_AtBoundary asserts a batch of exactly
+// batchMax items passes the size check (the cap is exclusive of the
+// +1th item).
+func TestValidateBatchCreate_AtBoundary(t *testing.T) {
+	items := make([]BatchItem, batchMax)
+	for i := range items {
+		items[i] = validBatchItem(fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1))
+	}
+	issues := ValidateBatchCreate(BatchCreateRequest{Notifications: items}, fixedNow)
+	assert.Empty(t, issues, "exactly batchMax items must pass size check")
+}
+
+// TestValidateBatchCreate_PerItemPathsPrefixed asserts every per-item
+// FieldIssue gets the "notifications[i]." prefix on its path. Verifies
+// the validator surfaces non-zero, non-first item failures correctly.
+func TestValidateBatchCreate_PerItemPathsPrefixed(t *testing.T) {
+	good := validBatchItem("00000000-0000-4000-8000-000000000b01")
+
+	// Item 2 has an empty channel + empty recipient + bad idempotency.
+	bad := BatchItem{
+		Channel:        "fax",
+		Recipient:      "",
+		Content:        "x",
+		IdempotencyKey: "garbage",
+	}
+
+	// Item 3 has a non-RFC-3339 scheduled_at.
+	scheduled := validBatchItem("00000000-0000-4000-8000-000000000b03")
+	scheduled.ScheduledAt = "tomorrow"
+
+	req := BatchCreateRequest{Notifications: []BatchItem{good, bad, scheduled}}
+	issues := ValidateBatchCreate(req, fixedNow)
+
+	paths := issuesPaths(issues)
+	for _, path := range paths {
+		assert.False(t, strings.HasPrefix(path, "notifications[0]."),
+			"item 0 was valid; no notifications[0].* path expected, got %q", path)
+	}
+	assert.Contains(t, paths, "notifications[1].channel")
+	assert.Contains(t, paths, "notifications[1].recipient")
+	assert.Contains(t, paths, "notifications[1].idempotency_key")
+	assert.Contains(t, paths, "notifications[2].scheduled_at")
+}
+
+// TestValidateBatchCreate_IntraBatchDuplicate asserts two items sharing
+// one idempotency_key surface ONE duplicate issue against the second
+// item's path. The first item's path is not flagged (its key, on its
+// own, is acceptable).
+func TestValidateBatchCreate_IntraBatchDuplicate(t *testing.T) {
+	a := validBatchItem("00000000-0000-4000-8000-000000000c01")
+	b := validBatchItem("00000000-0000-4000-8000-000000000c01")
+	b.Recipient = "+905551234568"
+
+	req := BatchCreateRequest{Notifications: []BatchItem{a, b}}
+	issues := ValidateBatchCreate(req, fixedNow)
+
+	duplicates := 0
+	for _, issue := range issues {
+		if strings.Contains(issue.Issue, "duplicate of notifications[") {
+			duplicates++
+			assert.Equal(t, "notifications[1].idempotency_key", issue.Path)
+			assert.Contains(t, issue.Issue, "notifications[0].idempotency_key")
+		}
+	}
+	assert.Equal(t, 1, duplicates, "exactly one duplicate issue surfaces")
+}
+
+// TestValidateBatchCreate_TripleDuplicate asserts three items sharing
+// one key produce TWO duplicate issues (one per duplicate occurrence,
+// not one per pair): notifications[1] and notifications[2] each get
+// one issue pointing back at notifications[0].
+func TestValidateBatchCreate_TripleDuplicate(t *testing.T) {
+	key := "00000000-0000-4000-8000-000000000c10"
+	a := validBatchItem(key)
+	b := validBatchItem(key)
+	b.Recipient = "+905551234568"
+	c := validBatchItem(key)
+	c.Recipient = "+905551234569"
+
+	req := BatchCreateRequest{Notifications: []BatchItem{a, b, c}}
+	issues := ValidateBatchCreate(req, fixedNow)
+
+	dupPaths := map[string]bool{}
+	for _, issue := range issues {
+		if strings.Contains(issue.Issue, "duplicate of notifications[") {
+			dupPaths[issue.Path] = true
+		}
+	}
+	assert.True(t, dupPaths["notifications[1].idempotency_key"])
+	assert.True(t, dupPaths["notifications[2].idempotency_key"])
+	assert.Equal(t, 2, len(dupPaths), "exactly two duplicate issues")
+}
+
+// TestValidateBatchCreate_EmptyKeysNotDeduped asserts the duplicate
+// check skips empty idempotency_key values: the per-item walk's
+// "required" rule already flagged them, and treating empty keys as
+// "duplicate of each other" would surface confusing extra issues.
+func TestValidateBatchCreate_EmptyKeysNotDeduped(t *testing.T) {
+	a := validBatchItem("")
+	b := validBatchItem("")
+
+	req := BatchCreateRequest{Notifications: []BatchItem{a, b}}
+	issues := ValidateBatchCreate(req, fixedNow)
+
+	for _, issue := range issues {
+		assert.NotContains(t, issue.Issue, "duplicate of notifications[",
+			"empty keys must not trigger duplicate-of- issues, got %v", issue)
+	}
+
+	// Sanity check: both items have an idempotency_key required issue.
+	paths := issuesPaths(issues)
+	assert.Contains(t, paths, "notifications[0].idempotency_key")
+	assert.Contains(t, paths, "notifications[1].idempotency_key")
+}
+
+// TestValidateBatchCreate_MixedScenario combines per-item failures,
+// a valid item, and an intra-batch duplicate. The response must
+// include every relevant issue at once (no short-circuiting).
+func TestValidateBatchCreate_MixedScenario(t *testing.T) {
+	// Item 0: valid.
+	valid := validBatchItem("00000000-0000-4000-8000-000000000d01")
+	// Item 1: per-item failure (empty content).
+	bad := validBatchItem("00000000-0000-4000-8000-000000000d02")
+	bad.Content = ""
+	// Item 2: duplicate of item 0's key.
+	dup := validBatchItem("00000000-0000-4000-8000-000000000d01")
+	dup.Recipient = "+905551234569"
+
+	req := BatchCreateRequest{Notifications: []BatchItem{valid, bad, dup}}
+	issues := ValidateBatchCreate(req, fixedNow)
+
+	paths := issuesPaths(issues)
+	assert.Contains(t, paths, "notifications[1].content", "per-item failure surfaces")
+	assert.Contains(t, paths, "notifications[2].idempotency_key", "intra-batch duplicate surfaces")
+	for _, path := range paths {
+		assert.False(t, strings.HasPrefix(path, "notifications[0]."),
+			"valid item's path must not appear, got %q", path)
+	}
+}
+
+// TestValidateBatchCreate_NoShortCircuitOnFirstItemFail asserts the
+// per-item walk continues past a failing item — item 0's failure does
+// not suppress item 1's.
+func TestValidateBatchCreate_NoShortCircuitOnFirstItemFail(t *testing.T) {
+	a := BatchItem{Channel: "fax", Recipient: "x", Content: "x", IdempotencyKey: "00000000-0000-4000-8000-000000000e01"}
+	b := BatchItem{Channel: "fax", Recipient: "y", Content: "y", IdempotencyKey: "00000000-0000-4000-8000-000000000e02"}
+
+	req := BatchCreateRequest{Notifications: []BatchItem{a, b}}
+	issues := ValidateBatchCreate(req, fixedNow)
+	paths := issuesPaths(issues)
+	assert.Contains(t, paths, "notifications[0].channel")
+	assert.Contains(t, paths, "notifications[1].channel",
+		"per-item walk must run for every item, not just the first")
 }
