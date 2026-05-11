@@ -53,23 +53,105 @@ func TestValidateCreate_AllRulesRunNoShortCircuit(t *testing.T) {
 
 func TestValidateCreate_Channel(t *testing.T) {
 	cases := []struct {
-		name    string
-		channel string
-		want    string
+		name      string
+		channel   string
+		recipient string
+		content   string
+		wantOK    bool
+		wantWord  string
 	}{
-		{"empty channel", "", "required"},
-		{"email rejected in phase 2", "email", "phase 2"},
-		{"push rejected in phase 2", "push", "phase 2"},
-		{"unknown rejected", "fax", "phase 2"},
+		{"empty channel", "", "+905551234567", "ok", false, "required"},
+		{"sms accepted", "sms", "+905551234567", "ok", true, ""},
+		{"email accepted in phase 3", "email", "u@example.com", "ok", true, ""},
+		{"push accepted in phase 3", "push", strings.Repeat("a", recipientPushMin), "ok", true, ""},
+		{"unknown rejected", "fax", "anything", "ok", false, "must be"},
+		{"uppercase channel rejected", "SMS", "+905551234567", "ok", false, "must be"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := validRequest()
 			req.Channel = tc.channel
+			req.Recipient = tc.recipient
+			req.Content = tc.content
 			issues := ValidateCreate(req, fixedNow)
-			require.NotEmpty(t, issues)
-			assert.Equal(t, "channel", issues[0].Path)
-			assert.Contains(t, issues[0].Issue, tc.want)
+			if tc.wantOK {
+				assert.NotContains(t, issuesPaths(issues), "channel")
+			} else {
+				require.NotEmpty(t, issues)
+				assert.Equal(t, "channel", issues[0].Path)
+				assert.Contains(t, issues[0].Issue, tc.wantWord)
+			}
+		})
+	}
+}
+
+// TestValidateCreate_Recipient_Email exercises the per-channel email
+// recipient validator added in Phase 3 Chunk 7. The regex is
+// intentionally permissive (no full RFC 5322 enforcement) per
+// docs/design/03-api.md §Validation rules row `email`.
+func TestValidateCreate_Recipient_Email(t *testing.T) {
+	cases := []struct {
+		name      string
+		recipient string
+		wantOK    bool
+	}{
+		{"plain happy path", "u@example.com", true},
+		{"subdomain", "alice@mail.example.co.uk", true},
+		{"plus tag", "alice+tag@example.com", true},
+		{"missing @", "no-at-sign", false},
+		{"missing dot in domain", "u@example", false},
+		{"missing local", "@example.com", false},
+		{"missing domain", "u@", false},
+		{"contains space", "u name@example.com", false},
+		{"empty rejected via required check", "", false},
+		{"too long over 254 chars", strings.Repeat("a", recipientEmailMax) + "@example.com", false},
+		{"at limit (254 chars)", strings.Repeat("a", recipientEmailMax-len("@example.com")) + "@example.com", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := validRequest()
+			req.Channel = "email"
+			req.Recipient = tc.recipient
+			req.Content = "hello"
+			issues := ValidateCreate(req, fixedNow)
+			if tc.wantOK {
+				assert.NotContains(t, issuesPaths(issues), "recipient")
+			} else {
+				assert.Contains(t, issuesPaths(issues), "recipient")
+			}
+		})
+	}
+}
+
+// TestValidateCreate_Recipient_Push exercises the per-channel push
+// token validator. Push tokens are opaque per provider; the rule is
+// length-only with the bounds from docs/design/07-constants.md §G.
+func TestValidateCreate_Recipient_Push(t *testing.T) {
+	cases := []struct {
+		name      string
+		recipient string
+		wantOK    bool
+	}{
+		{"at min boundary (32 chars)", strings.Repeat("a", recipientPushMin), true},
+		{"below min (31 chars)", strings.Repeat("a", recipientPushMin-1), false},
+		{"typical APNs token (64 hex)", strings.Repeat("0123456789abcdef", 4), true},
+		{"typical FCM token (~152 chars)", strings.Repeat("a", 152), true},
+		{"at max boundary (4096 chars)", strings.Repeat("a", recipientPushMax), true},
+		{"above max (4097 chars)", strings.Repeat("a", recipientPushMax+1), false},
+		{"empty rejected via required check", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := validRequest()
+			req.Channel = "push"
+			req.Recipient = tc.recipient
+			req.Content = "hello"
+			issues := ValidateCreate(req, fixedNow)
+			if tc.wantOK {
+				assert.NotContains(t, issuesPaths(issues), "recipient")
+			} else {
+				assert.Contains(t, issuesPaths(issues), "recipient")
+			}
 		})
 	}
 }
@@ -138,12 +220,48 @@ func TestValidateCreate_Content(t *testing.T) {
 	})
 
 	t.Run("multibyte runes counted by rune not byte", func(t *testing.T) {
-		// Each emoji is one rune but ~4 bytes. Limit is in chars (runes).
 		req := validRequest()
 		req.Content = strings.Repeat("😀", contentSMSMax)
 		issues := ValidateCreate(req, fixedNow)
 		assert.NotContains(t, issuesPaths(issues), "content")
 	})
+}
+
+// TestValidateCreate_Content_PerChannelCaps locks the per-channel
+// content cap boundaries from docs/design/07-constants.md §G:
+// SMS = 1600, email = 100000, push = 4000. The boundary cases prove
+// the cap is exclusive of the +1th rune.
+func TestValidateCreate_Content_PerChannelCaps(t *testing.T) {
+	cases := []struct {
+		name      string
+		channel   string
+		recipient string
+		length    int
+		wantOK    bool
+	}{
+		{"sms at limit", "sms", "+905551234567", contentSMSMax, true},
+		{"sms over limit", "sms", "+905551234567", contentSMSMax + 1, false},
+		{"email at limit", "email", "u@example.com", contentEmailMax, true},
+		{"email over limit", "email", "u@example.com", contentEmailMax + 1, false},
+		{"push at limit", "push", strings.Repeat("a", recipientPushMin), contentPushMax, true},
+		{"push over limit", "push", strings.Repeat("a", recipientPushMin), contentPushMax + 1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := validRequest()
+			req.Channel = tc.channel
+			req.Recipient = tc.recipient
+			req.Content = strings.Repeat("a", tc.length)
+			issues := ValidateCreate(req, fixedNow)
+			if tc.wantOK {
+				assert.NotContains(t, issuesPaths(issues), "content",
+					"%s @ %d chars must pass", tc.channel, tc.length)
+			} else {
+				assert.Contains(t, issuesPaths(issues), "content",
+					"%s @ %d chars must fail", tc.channel, tc.length)
+			}
+		})
+	}
 }
 
 func TestValidateCreate_TemplateFieldsRejected(t *testing.T) {

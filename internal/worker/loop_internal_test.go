@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"testing"
@@ -129,22 +130,221 @@ func TestValidResponseJSON_KeepsValidDropsInvalid(t *testing.T) {
 // TestApplyDefaults exercises the zero-value field substitution.
 // Same shape as internal/dispatcher and internal/relay's equivalent
 // tests so the three loops' default machinery stays consistent.
+//
+// Phase 3 Chunk 2: applyDefaults panics when Deps.Limiter is nil.
+// Phase 3 Chunk 7: applyDefaults panics when Deps.Channel is empty —
+// production wiring (cmd.go runForChannel) always sets it explicitly,
+// and silently defaulting to "sms" would route an email or push
+// worker through the wrong rate-limit key + log labels. Both panic
+// branches are covered by TestApplyDefaults_PanicsWhen*.
 func TestApplyDefaults(t *testing.T) {
-	d := applyDefaults(Deps{})
+	d := applyDefaults(Deps{Limiter: stubLimiter{}, Channel: "sms"})
 	assert.NotNil(t, d.Logger)
 	assert.NotNil(t, d.Clock)
 	assert.Equal(t, "sms", d.Channel)
+	assert.NotNil(t, d.Limiter)
 
-	custom := applyDefaults(Deps{
-		Channel: "email",
-		Logger:  slog.Default(),
-	})
-	assert.Equal(t, "email", custom.Channel)
+	for _, ch := range []string{"sms", "email", "push"} {
+		custom := applyDefaults(Deps{
+			Limiter: stubLimiter{},
+			Channel: ch,
+			Logger:  slog.Default(),
+		})
+		assert.Equal(t, ch, custom.Channel,
+			"applyDefaults preserves the explicit channel value %q", ch)
+	}
 }
+
+// TestApplyDefaults_PanicsWhenLimiterMissing pins the Phase 3 Chunk 2
+// invariant: production wiring (cmd.go) always provides a
+// *ratelimit.Bucket via Deps.Limiter, and Loop's applyDefaults treats
+// a nil Limiter as a programmer bug rather than a recoverable
+// misconfiguration. The panic surfaces immediately so tests + CI
+// catch the bug at the first call rather than silently nil-defaulting
+// to a different limiter.
+func TestApplyDefaults_PanicsWhenLimiterMissing(t *testing.T) {
+	assert.Panics(t, func() {
+		applyDefaults(Deps{Channel: "sms"})
+	})
+}
+
+// TestApplyDefaults_PanicsWhenChannelMissing pins the Phase 3 Chunk 7
+// invariant: production wiring (cmd.go runForChannel) always sets
+// Deps.Channel from the --channel flag, and silently defaulting to
+// "sms" would route an email or push worker through the wrong
+// rate-limit key + log labels.
+func TestApplyDefaults_PanicsWhenChannelMissing(t *testing.T) {
+	assert.Panics(t, func() {
+		applyDefaults(Deps{Limiter: stubLimiter{}})
+	})
+}
+
+// stubLimiter is the unit-test fixture for applyDefaults. Cannot reuse
+// noOpBucket from loop_test.go because that file uses external
+// dependencies (ratelimit, testsupport) that don't compile against
+// the unit test package's lighter import set; defining a tiny local
+// fake keeps the loop_internal_test.go file self-contained.
+type stubLimiter struct{}
+
+func (stubLimiter) Acquire(_ context.Context, _ string) error { return nil }
 
 // ptrOf is a tiny generic helper used by the table cases above so
 // each row can declare an inline string pointer without taking
 // addresses of locals.
 func ptrOf[T any](v T) *T {
 	return &v
+}
+
+// TestDecodeAndValidate exercises every branch of the Phase 3 §2.4
+// step 1–2 helper that handleRecord calls before any state mutation.
+// Each case asserts the (msg, errCode, errDetails, panicked) tuple
+// matches the locked spec in docs/phases/03-resilience.md §4
+// (BuildUnprocessable notes) + §13's loop_internal_test.go row.
+//
+// The msg-vs-nil contract: msg is nil ONLY when JSON failed to
+// unmarshal (decode_failed) or a panic interrupted decoding. Schema +
+// missing-field validation failures always return the parsed payload
+// so the targeted T8 path (BuildUnprocessable + RecordUnprocessable)
+// can fire when msg.ID is a valid UUID and msg.Attempt > 0.
+func TestDecodeAndValidate(t *testing.T) {
+	validJSON := []byte(`{
+		"version":1,
+		"id":"01927000-0000-7000-8000-000000000001",
+		"attempt":3,
+		"channel":"sms",
+		"recipient":"+905551234567",
+		"content":"hello"
+	}`)
+
+	cases := []struct {
+		name           string
+		input          []byte
+		wantMsgNil     bool
+		wantErrCode    string
+		wantErrDetails string // substring match (full text varies by Go version for json errors)
+	}{
+		{
+			name:        "happy path: every field present and valid",
+			input:       validJSON,
+			wantMsgNil:  false,
+			wantErrCode: "",
+		},
+		{
+			name:           "decode_failed: bytes are not JSON",
+			input:          []byte(`not-valid-json{`),
+			wantMsgNil:     true,
+			wantErrCode:    "decode_failed",
+			wantErrDetails: "invalid character",
+		},
+		{
+			name:           "schema_mismatch: version != 1",
+			input:          []byte(`{"version":2,"id":"01927000-0000-7000-8000-000000000001","attempt":1,"channel":"sms","recipient":"+1","content":"x"}`),
+			wantMsgNil:     false,
+			wantErrCode:    "schema_mismatch",
+			wantErrDetails: "unsupported version 2",
+		},
+		{
+			name:           "missing_field: id is empty string",
+			input:          []byte(`{"version":1,"id":"","attempt":1,"channel":"sms","recipient":"+1","content":"x"}`),
+			wantMsgNil:     false,
+			wantErrCode:    "missing_field",
+			wantErrDetails: "id is required",
+		},
+		{
+			name:           "schema_mismatch: id is not a UUID",
+			input:          []byte(`{"version":1,"id":"not-a-uuid","attempt":1,"channel":"sms","recipient":"+1","content":"x"}`),
+			wantMsgNil:     false,
+			wantErrCode:    "schema_mismatch",
+			wantErrDetails: "invalid id",
+		},
+		{
+			name:           "missing_field: attempt is zero",
+			input:          []byte(`{"version":1,"id":"01927000-0000-7000-8000-000000000001","attempt":0,"channel":"sms","recipient":"+1","content":"x"}`),
+			wantMsgNil:     false,
+			wantErrCode:    "missing_field",
+			wantErrDetails: "attempt must be > 0",
+		},
+		{
+			name:           "missing_field: attempt is negative",
+			input:          []byte(`{"version":1,"id":"01927000-0000-7000-8000-000000000001","attempt":-3,"channel":"sms","recipient":"+1","content":"x"}`),
+			wantMsgNil:     false,
+			wantErrCode:    "missing_field",
+			wantErrDetails: "attempt must be > 0",
+		},
+		{
+			name:           "missing_field: recipient is empty string",
+			input:          []byte(`{"version":1,"id":"01927000-0000-7000-8000-000000000001","attempt":1,"channel":"sms","recipient":"","content":"x"}`),
+			wantMsgNil:     false,
+			wantErrCode:    "missing_field",
+			wantErrDetails: "recipient is required",
+		},
+		{
+			name:           "missing_field: content absent (null)",
+			input:          []byte(`{"version":1,"id":"01927000-0000-7000-8000-000000000001","attempt":1,"channel":"sms","recipient":"+1","content":null}`),
+			wantMsgNil:     false,
+			wantErrCode:    "missing_field",
+			wantErrDetails: "content is required",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, errCode, errDetails, panicked := decodeAndValidate(tc.input)
+			assert.False(t, panicked, "no test case here triggers the panic path")
+
+			if tc.wantMsgNil {
+				assert.Nil(t, msg,
+					"msg=nil only on decode_failed / panic — JSON did not produce a struct")
+			} else {
+				assert.NotNil(t, msg,
+					"validation failures preserve the parsed msg so the targeted T8 branch can fire when id+attempt are intact")
+			}
+
+			assert.Equal(t, tc.wantErrCode, errCode)
+			if tc.wantErrDetails != "" {
+				assert.Contains(t, errDetails, tc.wantErrDetails,
+					"errDetails should describe the validation failure")
+			}
+			if tc.wantErrCode == "" {
+				assert.Empty(t, errDetails, "happy path has no error details")
+			}
+		})
+	}
+}
+
+// TestDecodeAndValidate_PanicRecovery pins the locked
+// docs/phases/03-resilience.md §2.4 "Panic recovery" branch: a panic
+// fired during decode (injected via the package-level
+// SetDecodeAndValidatePanicHook seam) surfaces as
+// (nil, "panic", "<%v of recovered>", true) without unwinding the
+// goroutine. Without this protection the worker's franz-go partition
+// handler would crash and head-of-line block the whole partition.
+func TestDecodeAndValidate_PanicRecovery(t *testing.T) {
+	prev := SetDecodeAndValidatePanicHook(func() {
+		panic("deliberate test panic")
+	})
+	t.Cleanup(func() {
+		SetDecodeAndValidatePanicHook(prev)
+	})
+
+	msg, errCode, errDetails, panicked := decodeAndValidate([]byte(`{"version":1}`))
+
+	assert.True(t, panicked, "panic must surface as panicked=true")
+	assert.Nil(t, msg, "panic must surface as msg=nil")
+	assert.Equal(t, errCodePanic, errCode)
+	assert.Contains(t, errDetails, "deliberate test panic",
+		"errDetails must carry the recovered value's %%v rendering")
+}
+
+// TestSetDecodeAndValidatePanicHook_Restores pins the convention that
+// SetDecodeAndValidatePanicHook returns the previous hook so callers
+// can restore it via t.Cleanup. The package-level hook leaks across
+// test functions otherwise, breaking test isolation.
+func TestSetDecodeAndValidatePanicHook_Restores(t *testing.T) {
+	prev := SetDecodeAndValidatePanicHook(func() { panic("first") })
+	t.Cleanup(func() { SetDecodeAndValidatePanicHook(prev) })
+
+	previous := SetDecodeAndValidatePanicHook(func() { panic("second") })
+	assert.NotNil(t, previous,
+		"SetDecodeAndValidatePanicHook must return the previous hook")
 }

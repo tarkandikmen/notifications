@@ -178,15 +178,87 @@ func TestHandleCreate_MalformedJSON(t *testing.T) {
 	assert.Zero(t, fs.insertCalled, "store must not be called for malformed JSON")
 }
 
-func TestHandleCreate_ChannelEmail_PhaseRestricted(t *testing.T) {
+// TestHandleCreate_EmailChannel_201Lands is the Phase 3 Chunk 7
+// counterpart of Phase 2's channel-restriction test. Per
+// docs/phases/03-resilience.md §10 the channel restriction widens to
+// {sms, email, push}; an email POST that satisfies the email
+// recipient + content rules from docs/design/03-api.md §Validation
+// rules now lands a 201 with a freshly minted UUIDv7.
+func TestHandleCreate_EmailChannel_201Lands(t *testing.T) {
 	fs := &fakeStore{}
 	srv := newTestServer(t, fs)
 
 	body := `{
 		"channel": "email",
 		"recipient": "u@example.com",
+		"content": "phase 3 email",
+		"idempotency_key": "00000000-0000-4000-8000-000000000010"
+	}`
+
+	resp := postJSON(t, srv, "/v1/notifications", body)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	var got CreateResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	parsed, err := uuid.Parse(got.ID)
+	require.NoError(t, err)
+	assert.Equal(t, uuid.Version(7), parsed.Version(), "api mints UUIDv7")
+
+	require.Equal(t, 1, fs.insertCalled)
+	stored := fs.insertArg
+	assert.Equal(t, "email", stored.Channel)
+	assert.Equal(t, "u@example.com", stored.Recipient)
+	require.NotNil(t, stored.Content)
+	assert.Equal(t, "phase 3 email", *stored.Content)
+}
+
+// TestHandleCreate_PushChannel_201Lands mirrors the email test for
+// the push channel: an opaque token of length recipientPushMin..max
+// + content within content_push_max passes validation and lands a
+// 201 per docs/design/03-api.md §Validation rules row `push`.
+func TestHandleCreate_PushChannel_201Lands(t *testing.T) {
+	fs := &fakeStore{}
+	srv := newTestServer(t, fs)
+
+	body := `{
+		"channel": "push",
+		"recipient": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"content": "phase 3 push",
+		"idempotency_key": "00000000-0000-4000-8000-000000000011"
+	}`
+
+	resp := postJSON(t, srv, "/v1/notifications", body)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	var got CreateResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	parsed, err := uuid.Parse(got.ID)
+	require.NoError(t, err)
+	assert.Equal(t, uuid.Version(7), parsed.Version())
+
+	require.Equal(t, 1, fs.insertCalled)
+	stored := fs.insertArg
+	assert.Equal(t, "push", stored.Channel)
+	assert.Equal(t, 64, len(stored.Recipient), "push token preserved as-is")
+}
+
+// TestHandleCreate_UnknownChannel_400 keeps the negative coverage
+// for an unknown channel value: only sms / email / push are accepted
+// in Phase 3 per docs/design/01-schema.md §Domain values for
+// notifications.channel.
+func TestHandleCreate_UnknownChannel_400(t *testing.T) {
+	fs := &fakeStore{}
+	srv := newTestServer(t, fs)
+
+	body := `{
+		"channel": "fax",
+		"recipient": "+905551234567",
 		"content": "hello",
-		"idempotency_key": "00000000-0000-4000-8000-000000000004"
+		"idempotency_key": "00000000-0000-4000-8000-000000000012"
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications", body)
@@ -197,7 +269,8 @@ func TestHandleCreate_ChannelEmail_PhaseRestricted(t *testing.T) {
 	assert.Equal(t, "validation_failed", env.Error.Code)
 	require.NotEmpty(t, env.Error.Details)
 	first := asFieldIssue(t, env.Error.Details[0])
-	assert.Equal(t, "channel", first.Path, "channel restriction is the first issue")
+	assert.Equal(t, "channel", first.Path)
+	assert.Contains(t, first.Issue, "must be")
 	assert.Zero(t, fs.insertCalled)
 }
 

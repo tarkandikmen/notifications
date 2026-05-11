@@ -15,5 +15,13 @@ jobs:
       # Phase 2 §13 / §Chunk 7: gate the testcontainer-backed tests behind
       # TEST_INTEGRATION=1 so `go test ./...` stays fast for unit-only
       # contributors. ubuntu-latest ships Docker preinstalled, so
-      # testcontainers-go boots Postgres and Kafka without extra setup.
-      - run: TEST_INTEGRATION=1 go test -timeout 5m ./internal/itest/... ./internal/store/... ./internal/dispatcher/... ./internal/relay/... ./internal/worker/... ./internal/reaper/...
+      # testcontainers-go boots Postgres + Kafka + Redis without extra
+      # setup.
+      #
+      # Phase 3 §13 / §Chunk 8: package list extends to ./internal/ratelimit/...
+      # (Redis testcontainer + Lua-script integration tests) and
+      # ./internal/kafkaadmin/... (Kafka testcontainer + lag-query
+      # integration tests). Timeout doubled from Phase 2's 5 m to 10 m
+      # to absorb the multichannel + rate-limit + lag-aware itest
+      # tests' ~2 min wall time on a clean checkout.
+      - run: TEST_INTEGRATION=1 go test -timeout 10m ./internal/itest/... ./internal/store/... ./internal/dispatcher/... ./internal/relay/... ./internal/worker/... ./internal/reaper/... ./internal/ratelimit/... ./internal/kafkaadmin/...

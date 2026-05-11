@@ -37,6 +37,7 @@ import (
 
 	"github.com/tarkandikmen/notifications/internal/api"
 	"github.com/tarkandikmen/notifications/internal/dispatcher"
+	"github.com/tarkandikmen/notifications/internal/kafkaadmin"
 	"github.com/tarkandikmen/notifications/internal/reaper"
 	"github.com/tarkandikmen/notifications/internal/relay"
 	"github.com/tarkandikmen/notifications/internal/store"
@@ -101,6 +102,14 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 
 	provider := worker.NewProvider(webhook.URL)
 
+	// Phase 3 Chunk 5: the dispatcher reads consumer-group lag via a
+	// kafkaadmin.LagClient before each tick. Build it against the same
+	// broker the producer / consumer use; injected into the dispatcher
+	// Deps below.
+	lagClient, err := kafkaadmin.New(brokers)
+	require.NoError(t, err, "build kafkaadmin lag client")
+	t.Cleanup(lagClient.Close)
+
 	// API mux behind an httptest.Server. Phase 2 §6 has the api
 	// package own route registration; we hand it the same Deps shape
 	// the api.Run binary builds in cmd.go (real *store.Store, fresh
@@ -149,6 +158,7 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 			PollInterval: 25 * time.Millisecond,
 			BatchSize:    200,
 			Channels:     []string{"sms"},
+			Lag:          lagClient,
 		})
 	})
 	startLoop("relay", func() error {
@@ -165,9 +175,17 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 			Store:    st,
 			Consumer: workerConsumer,
 			Provider: provider,
-			Logger:   logger,
-			Channel:  "sms",
-			Clock:    time.Now,
+			// Phase 3 Chunk 2 made worker.Loop require a Limiter.
+			// This e2e test does not exercise the rate-limit
+			// branch — Phase 3 Chunk 8 owns the rate-limit
+			// integration test in internal/itest/rate_limit_test.go
+			// where a real *ratelimit.Bucket runs against a Redis
+			// testcontainer. Here we inject a no-op so Acquire is
+			// a pass-through.
+			Limiter: noOpLimiter{},
+			Logger:  logger,
+			Channel: "sms",
+			Clock:   time.Now,
 		})
 	})
 	startLoop("reaper", func() error {
@@ -177,6 +195,13 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 			Interval:       60 * time.Second,
 			StuckThreshold: 120 * time.Second,
 			MaxAttempts:    7,
+			// Phase 3 Chunk 6: the reaper reads consumer-group lag via
+			// a kafkaadmin.LagClient before each cycle and skips on
+			// fail-closed disposition. Channels narrowed to {"sms"} to
+			// match Phase 2's single-channel test scope; the lag
+			// client itself is shared with the dispatcher.
+			Channels: []string{"sms"},
+			Lag:      lagClient,
 		})
 	})
 
@@ -438,6 +463,18 @@ func drainEventsNotification(t *testing.T, brokers []string, firstTimeout, tailT
 
 	return records
 }
+
+// noOpLimiter satisfies worker.Limiter for tests that do not exercise
+// rate-limit semantics. Acquire is a pass-through so the locked
+// pipeline order in handleRecord (Layer 1 → Layer 2 → rate-limit
+// wait → provider call) reaches the provider call unconditionally.
+//
+// Phase 3 Chunk 8's internal/itest/rate_limit_test.go wires the real
+// *ratelimit.Bucket against a Redis testcontainer for tests that do
+// exercise rate limiting end-to-end.
+type noOpLimiter struct{}
+
+func (noOpLimiter) Acquire(_ context.Context, _ string) error { return nil }
 
 // waitWithTimeout returns nil if wg's WaitGroup reaches zero before
 // timeout fires; otherwise returns a non-nil error. Pulled out so

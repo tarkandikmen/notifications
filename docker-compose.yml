@@ -62,6 +62,23 @@ services:
       db:
         condition: service_healthy
 
+  # kafka-bootstrap is the one-shot topic creation step. Mirrors the
+  # `migrate` pattern: every service that talks to Kafka waits for this
+  # to complete before starting, so the dispatcher's lag-aware ticks
+  # don't fire against topics that don't exist yet (which would surface
+  # as fail-open UNKNOWN_TOPIC_OR_PARTITION warnings on every tick
+  # until franz-go's metadata refresh catches up). Phase 3 resilience
+  # cold-start fix.
+  kafka-bootstrap:
+    build: .
+    restart: "no"
+    command: ["kafka-bootstrap"]
+    volumes:
+      - ./.env:/app/.env:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+
   api:
     build: .
     command: ["api"]
@@ -87,6 +104,8 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
+      kafka-bootstrap:
+        condition: service_completed_successfully
 
   worker-sms:
     build: .
@@ -100,6 +119,8 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
+      kafka-bootstrap:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 
@@ -115,6 +136,8 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
+      kafka-bootstrap:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 
@@ -130,6 +153,8 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
+      kafka-bootstrap:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 
@@ -145,6 +170,8 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
+      kafka-bootstrap:
+        condition: service_completed_successfully
 
   reaper:
     build: .
@@ -158,3 +185,5 @@ services:
         condition: service_completed_successfully
       kafka:
         condition: service_healthy
+      kafka-bootstrap:
+        condition: service_completed_successfully

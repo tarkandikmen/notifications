@@ -84,6 +84,40 @@ func Run(cmd *cobra.Command, _ []string) error {
 	return loopErr
 }
 
+// RunBootstrap is the one-shot entry point bound to the
+// `kafka-bootstrap` cobra subcommand in cmd/notifications/main.go. It
+// loads config, runs Bootstrap, and exits — no DB, no producer, no
+// long-running loop. The docker-compose.yml uses it as a
+// service_completed_successfully gate so dispatcher / worker /
+// reaper containers don't start querying Kafka admin for topics that
+// haven't been created yet (which would surface as
+// UNKNOWN_TOPIC_OR_PARTITION on every dispatcher tick until
+// franz-go's metadata refresh catches up).
+//
+// Bootstrap is idempotent (it treats TOPIC_ALREADY_EXISTS as
+// success), so re-running this command on a fully-topiced cluster is
+// a no-op. The relay's own Run also calls Bootstrap for standalone
+// (non-compose) deploys; the two call sites compose cleanly.
+func RunBootstrap(cmd *cobra.Command, _ []string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("kafka-bootstrap: load config: %w", err)
+	}
+
+	logger := observability.NewLogger(cfg.LogLevel)
+	slog.SetDefault(logger)
+
+	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	if err := Bootstrap(ctx, cfg.KafkaBrokers, logger); err != nil {
+		return fmt.Errorf("kafka-bootstrap: %w", err)
+	}
+
+	logger.Info("kafka-bootstrap: topics ready")
+	return nil
+}
+
 // producerOpts returns the franz-go options locked by
 // docs/design/04-kafka.md §5: acks=all (waits for every in-sync
 // replica, required by the publish-then-mark ordering's at-least-once

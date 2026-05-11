@@ -1,7 +1,9 @@
 // Package reaper implements the `notifications reaper` subcommand.
 // Phase 1 was a block-on-signal stub; Phase 2 fills in the stuck-row
 // recovery cycle documented in ARCHITECTURE_v3.md §6.5 and
-// docs/phases/02-walking-skeleton.md §11. The lifecycle skeleton
+// docs/phases/02-walking-skeleton.md §11; Phase 3 Chunk 6 layers the
+// lag-aware cycle skip and the post-pass equal-jitter UPDATE per
+// docs/phases/03-resilience.md §6 + §8. The lifecycle skeleton
 // (config, logger, telemetry, signal handling, graceful shutdown)
 // inherits from Phase 1.
 package reaper
@@ -18,6 +20,7 @@ import (
 
 	"github.com/tarkandikmen/notifications/internal/config"
 	"github.com/tarkandikmen/notifications/internal/db"
+	"github.com/tarkandikmen/notifications/internal/kafkaadmin"
 	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/store"
 )
@@ -55,11 +58,25 @@ func Run(cmd *cobra.Command, _ []string) error {
 	}
 	defer pool.Close()
 
+	// Phase 3 Chunk 6: the lag client owns its own *kgo.Client (admin
+	// only — no producer / consumer options) and queries consumer-group
+	// lag against the broker on every tick per
+	// docs/phases/03-resilience.md §8. Constructed before Loop so a
+	// misconfigured KAFKA_BROKERS surfaces at startup (loud) rather
+	// than as a per-tick log-info spam (quiet under monitoring).
+	lagClient, err := kafkaadmin.New(cfg.KafkaBrokers)
+	if err != nil {
+		return fmt.Errorf("reaper: build lag client: %w", err)
+	}
+	defer lagClient.Close()
+
 	logger.Info("started", "mode", serviceName)
 
 	loopErr := Loop(ctx, Deps{
-		Store:  store.New(pool),
-		Logger: logger,
+		Store:      store.New(pool),
+		Logger:     logger,
+		Lag:        lagClient,
+		LagTimeout: lagClient.Timeout(),
 	})
 
 	logger.Info("shutting down", "mode", serviceName)

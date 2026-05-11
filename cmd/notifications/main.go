@@ -54,6 +54,7 @@ func newRootCmd() *cobra.Command {
 		newRelayCmd(),
 		newReaperCmd(),
 		newMigrateCmd(),
+		newKafkaBootstrapCmd(),
 	)
 	return root
 }
@@ -98,6 +99,21 @@ func newReaperCmd() *cobra.Command {
 		Use:   "reaper",
 		Short: "Recover stuck DISPATCHED rows",
 		RunE:  reaper.Run,
+	}
+}
+
+// newKafkaBootstrapCmd is the one-shot topic-creation subcommand used
+// by docker-compose's kafka-bootstrap service. It runs
+// relay.Bootstrap (idempotent) and exits; downstream services
+// (dispatcher, workers, reaper, relay) gate on
+// service_completed_successfully so they never query Kafka admin for
+// topics that haven't been created yet. docs/phases/03-resilience.md
+// §9 + Path A startup-ordering fix from this conversation.
+func newKafkaBootstrapCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "kafka-bootstrap",
+		Short: "Create the Kafka topic set and exit (one-shot)",
+		RunE:  relay.RunBootstrap,
 	}
 }
 
