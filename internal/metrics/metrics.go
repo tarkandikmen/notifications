@@ -3,14 +3,14 @@
 // endpoint.
 //
 // Single-shared-registry-per-process keeps the api binary's two
-// /metrics endpoints (port 8080 from Phase 1; port 9090 from Phase 5)
-// and every other binary's /metrics endpoint serving identical bodies:
-// a metric registered anywhere is visible everywhere on the same
-// process. A future regression where two registries coexist (and
-// metrics on one don't surface on the other's /metrics) becomes a
-// compile error rather than a silent operational gap.
+// /metrics endpoints (the in-mux endpoint on the api port and the
+// dedicated metricsserver port) and every other binary's /metrics
+// endpoint serving identical bodies: a metric registered anywhere is
+// visible everywhere on the same process. A future regression where
+// two registries coexist (and metrics on one don't surface on the
+// other's /metrics) becomes a compile error rather than a silent
+// operational gap.
 //
-// The metric set is locked by docs/phases/05-observability.md §1.1.
 // Names follow Prometheus best-practice: snake_case; _total suffix on
 // counters; _seconds / _items / _rows / _bytes suffixes on size
 // histograms; no suffix on gauges; one label per orthogonal dimension.
@@ -50,8 +50,7 @@ func Registry() *prometheus.Registry {
 	return registry
 }
 
-// API metrics. Read by internal/api/. Locked by
-// docs/phases/05-observability.md §1.1 (API metrics row).
+// API metrics. Read by internal/api/.
 var (
 	// APIRequests counts every HTTP request reaching a registered
 	// api route. status_class ∈ {2xx, 3xx, 4xx, 5xx}. endpoint
@@ -78,8 +77,7 @@ var (
 
 	// APIBatchSize is the input size of a successful batch-create
 	// request, observed after validation. Linear buckets 0..1000
-	// in 100-step increments match batch_max from
-	// docs/design/07-constants.md.
+	// in 100-step increments span the configured batch_max.
 	APIBatchSize = promauto.With(Registry()).NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "api_batch_size_items",
@@ -115,8 +113,7 @@ var (
 	)
 )
 
-// Dispatcher metrics. Read by internal/dispatcher/. Locked by
-// docs/phases/05-observability.md §1.1 (Dispatcher metrics row).
+// Dispatcher metrics. Read by internal/dispatcher/.
 var (
 	// DispatcherTicks counts every dispatcher.runOnce return.
 	// outcome ∈ {claimed, empty, lag_skip, lag_query_error, error}
@@ -152,8 +149,7 @@ var (
 	)
 )
 
-// Relay metrics. Read by internal/relay/. Locked by
-// docs/phases/05-observability.md §1.1 (Relay metrics row).
+// Relay metrics. Read by internal/relay/.
 var (
 	// RelayTicks counts relay.runOnce returns. outcome ∈
 	// {published, empty, error}.
@@ -216,8 +212,7 @@ var (
 	)
 )
 
-// Worker metrics. Read by internal/worker/. Locked by
-// docs/phases/05-observability.md §1.1 (Worker metrics row).
+// Worker metrics. Read by internal/worker/.
 var (
 	// WorkerRecordsConsumed counts every Kafka record returned by
 	// PollFetches, before any guard.
@@ -230,8 +225,7 @@ var (
 	)
 
 	// WorkerRecordsProcessed counts each record at terminal
-	// disposition. outcome enumerates every branch of handleRecord
-	// per docs/phases/05-observability.md §1.1.
+	// disposition. outcome enumerates every branch of handleRecord.
 	WorkerRecordsProcessed = promauto.With(Registry()).NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "worker_records_processed_total",
@@ -241,8 +235,7 @@ var (
 	)
 
 	// WorkerProviderRequests counts provider.Send invocations by
-	// status_class. Values: 2xx, 4xx, 5xx, 408_429, no_response
-	// matching docs/design/05-retry.md §1.
+	// status_class. Values: 2xx, 4xx, 5xx, 408_429, no_response.
 	WorkerProviderRequests = promauto.With(Registry()).NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "worker_provider_requests_total",
@@ -275,8 +268,8 @@ var (
 	)
 
 	// WorkerAttemptsAtOutcome is the attempt number at a terminal
-	// classification (T4 / T6 / T7 / T8). Linear 1..7 matches
-	// max_attempts from docs/design/07-constants.md.
+	// classification (T4 / T6 / T7 / T8). Linear 1..7 covers the
+	// configured max_attempts ceiling.
 	WorkerAttemptsAtOutcome = promauto.With(Registry()).NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "worker_attempts_at_outcome",
@@ -288,8 +281,10 @@ var (
 
 	// WorkerDLQRoutes counts T8 dispositions. error_code ∈
 	// {decode_failed, schema_mismatch, missing_field, panic}.
-	// target ∈ {targeted, no_target} per
-	// docs/design/06-idempotency.md §T8 edge case.
+	// target ∈ {targeted, no_target}: targeted means the DLQ
+	// record carries the originating notification_id; no_target
+	// covers the edge case where the inbound payload could not
+	// even be parsed enough to recover the id.
 	WorkerDLQRoutes = promauto.With(Registry()).NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "worker_dlq_routes_total",
@@ -298,8 +293,8 @@ var (
 		[]string{"channel", "error_code", "target"},
 	)
 
-	// WorkerPanicRecovered counts panics caught by recover().
-	// Phase 5 wires only the decodeAndValidate site; future
+	// WorkerPanicRecovered counts panics caught by recover(). The
+	// only recovery site today is decodeAndValidate; future
 	// recovery sites add new location values.
 	WorkerPanicRecovered = promauto.With(Registry()).NewCounterVec(
 		prometheus.CounterOpts{
@@ -323,8 +318,7 @@ var (
 	)
 )
 
-// Reaper metrics. Read by internal/reaper/. Locked by
-// docs/phases/05-observability.md §1.1 (Reaper metrics row).
+// Reaper metrics. Read by internal/reaper/.
 var (
 	// ReaperCycles counts reaper.runOnce returns. outcome ∈
 	// {ran, lag_skip, lag_query_error}.
@@ -362,9 +356,8 @@ var (
 		},
 	)
 
-	// ReaperPostPassJitterFailures counts the existing log-warn
-	// branch in the reaper's post-pass equal-jitter UPDATE per
-	// docs/phases/03-resilience.md §6.
+	// ReaperPostPassJitterFailures counts the log-warn branch in
+	// the reaper's post-pass equal-jitter UPDATE.
 	ReaperPostPassJitterFailures = promauto.With(Registry()).NewCounter(
 		prometheus.CounterOpts{
 			Name: "reaper_post_pass_jitter_failures_total",
@@ -374,8 +367,7 @@ var (
 )
 
 // Lag metrics. Read by both internal/dispatcher/ and
-// internal/reaper/. Locked by
-// docs/phases/05-observability.md §1.1 (Lag metrics row).
+// internal/reaper/.
 var (
 	// KafkaConsumerLag is the last-observed MaxLag value. -1 sentinel
 	// never published; on lag-query error the gauge stays at its
@@ -390,8 +382,7 @@ var (
 )
 
 // Rate limiter metrics. Read by internal/ratelimit/ and
-// internal/worker/. Locked by
-// docs/phases/05-observability.md §1.1 (Rate limiter metrics row).
+// internal/worker/.
 var (
 	// RateLimitAcquires counts ratelimit.Bucket.Acquire outcomes.
 	// outcome ∈ {granted, throttled_then_granted, redis_error,

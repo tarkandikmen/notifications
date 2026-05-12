@@ -9,12 +9,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestTransientBackoff_InRange asserts the equal-jitter contract from
-// docs/design/05-retry.md §3 — for every attempt, the result lies in
-// [deterministic/2, deterministic]. 100 iterations per attempt build
-// confidence the lower edge is reachable; the bound itself proves the
-// upper edge holds. Attempt set is the {1, 2, 5, 7} sample called out
-// in docs/phases/03-resilience.md §13.
+// TestTransientBackoff_InRange asserts the equal-jitter contract: for
+// every attempt, the result lies in [deterministic/2, deterministic].
+// 100 iterations per attempt build confidence the lower edge is
+// reachable; the bound itself proves the upper edge holds.
 func TestTransientBackoff_InRange(t *testing.T) {
 	for _, attempt := range []int{1, 2, 5, 7} {
 		det := time.Duration(math.Pow(2, float64(attempt))) * time.Second

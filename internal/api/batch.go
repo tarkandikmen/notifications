@@ -16,9 +16,7 @@ import (
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
-// handleBatchCreate implements POST /v1/notifications/batch per
-// docs/design/03-api.md §POST /v1/notifications/batch and
-// docs/phases/04-api-completeness.md §4.
+// handleBatchCreate implements POST /v1/notifications/batch.
 //
 // Behavior:
 //
@@ -26,9 +24,8 @@ import (
 //     single details[] entry pointing at "body" (mirrors handleCreate).
 //  2. ValidateBatchCreate. The oversize case surfaces as a single
 //     "batch size N exceeded" issue against the "notifications" path,
-//     which the handler maps to 413 payload_too_large (no details[],
-//     per docs/design/03-api.md §Error model). Every other issue maps
-//     to 400 validation_failed.
+//     which the handler maps to 413 payload_too_large (no details[]).
+//     Every other issue maps to 400 validation_failed.
 //  3. Mint one batch_id (UUIDv7) and one id per item; build the
 //     store.Notification slice in request order.
 //  4. Store.InsertBatch. On *store.BatchIdempotencyConflictError →
@@ -52,12 +49,11 @@ func handleBatchCreate(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		// docs/phases/05-observability.md §1.1 (api_batch_size_items
-		// row): observe only after ValidateBatchCreate returns clean
-		// so oversized / malformed batches don't pollute the
-		// histogram. r.Pattern is populated by the api mux (Go 1.22+
-		// ServeMux) — see metrics.Middleware comment for the wrapping
-		// order rationale.
+		// Observe the api_batch_size_items histogram only after
+		// ValidateBatchCreate returns clean so oversized / malformed
+		// batches don't pollute the histogram. r.Pattern is populated
+		// by the api mux (Go 1.22+ ServeMux) — see metrics.Middleware
+		// comment for the wrapping order rationale.
 		metrics.APIBatchSize.WithLabelValues(r.Pattern).Observe(float64(len(req.Notifications)))
 
 		batchID, err := store.NewID()
@@ -158,9 +154,8 @@ func handleBatchCreate(deps Deps) http.HandlerFunc {
 }
 
 // isBatchOversize returns true when ValidateBatchCreate surfaced only
-// the "batch size N exceeded" issue. Per
-// docs/phases/04-api-completeness.md §3.1 the validator short-circuits
-// to a single issue on oversize, so checking len(issues) == 1 with the
+// the "batch size N exceeded" issue. The validator short-circuits to a
+// single issue on oversize, so checking len(issues) == 1 with the
 // matching path + prefix is sufficient and not brittle.
 func isBatchOversize(issues []FieldIssue) bool {
 	return len(issues) == 1 &&
@@ -168,8 +163,8 @@ func isBatchOversize(issues []FieldIssue) bool {
 		strings.HasPrefix(issues[0].Issue, "batch size ")
 }
 
-// writePayloadTooLarge writes the canonical 413 envelope per
-// docs/design/03-api.md §Error model (no details[]).
+// writePayloadTooLarge writes the canonical 413 envelope (no
+// details[]).
 func writePayloadTooLarge(w http.ResponseWriter) {
 	writeJSON(w, http.StatusRequestEntityTooLarge, ErrorEnvelope{
 		Error: ErrorBody{

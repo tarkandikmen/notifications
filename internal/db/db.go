@@ -1,6 +1,6 @@
 // Package db owns the *pgxpool.Pool the binary uses for every Postgres
-// operation. Phase 1 only opens the pool and verifies the connection; later
-// phases use it directly.
+// operation. Open creates the pool and verifies the connection; callers
+// use the returned pool directly.
 package db
 
 import (
@@ -13,8 +13,6 @@ import (
 
 // Open parses the connection URL, attaches the otelpgx tracer, creates a
 // pool, and pings the database to fail fast on misconfiguration.
-//
-// docs/phases/01-foundation.md §5 locks this signature.
 func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {

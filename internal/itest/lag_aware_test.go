@@ -1,6 +1,6 @@
 package itest
 
-// Phase 3 Chunk 8 full-stack lag-aware dispatcher + reaper test.
+// Full-stack lag-aware dispatcher + reaper test.
 //
 // Boots Postgres + Kafka testcontainers and wires the api +
 // dispatcher + relay + worker + reaper using the real package
@@ -16,17 +16,13 @@ package itest
 //     stay PENDING for ≥1 s, no DISPATCHED transition) AND the
 //     reaper skips its cycle (a pre-inserted stuck DISPATCHED row
 //     at attempt=max_attempts is NOT terminal-failed during the
-//     window). docs/design/02-state-machine.md §Lag-query failure
-//     semantics rows T2 / T9 / T10 + docs/phases/03-resilience.md
-//     §7 / §8.
+//     window).
 //
 //  2. lag returns 0 → normal claim + delivery: the 5 paused rows
 //     from scenario (a) plus 5 fresh rows all reach DELIVERED, and
 //     the previously-pinned stuck DISPATCHED row is terminal-failed
 //     by the reaper (proving the reaper's cycle skip in scenario
 //     (a) was the lag check at work, not a structural failure).
-//
-// docs/phases/03-resilience.md §13 + §Chunk 8.
 
 import (
 	"context"
@@ -64,9 +60,9 @@ import (
 // one struct here can satisfy both LagQuery interfaces (each package
 // declares its own, but the method signature is identical), and the
 // test mid-flight retunes the response by calling SetLag — exercising
-// the same lag-aware branch the production *kafkaadmin.LagClient would
-// drive when consumer-group lag crosses the 1000-message threshold
-// from docs/design/07-constants.md §C.
+// the same lag-aware branch the production *kafkaadmin.LagClient
+// would drive when consumer-group lag crosses the 1000-message
+// threshold.
 type itestLagFake struct {
 	mu    sync.Mutex
 	lag   int64
@@ -148,8 +144,9 @@ func startLagAwareStack(t *testing.T, fake *itestLagFake) *lagAwareTestEnv {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	hits := &atomic.Int32{}
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -287,13 +284,13 @@ func startLagAwareStack(t *testing.T, fake *itestLagFake) *lagAwareTestEnv {
 }
 
 // TestLagAware_DispatcherAndReaperRespectLag runs the two scenarios
-// from docs/phases/03-resilience.md §13 against one testcontainer
-// stack. The two scenarios run sequentially within one test function
-// (rather than as t.Run subtests) because scenario (b)'s "normal
-// path" assertion includes the rows posted under scenario (a)'s
-// lag-above branch — they share state, so the sequential structure
-// makes that data flow explicit. The test logs each scenario's
-// boundary so failure output still makes the phase clear.
+// against one testcontainer stack. The two scenarios run sequentially
+// within one test function (rather than as t.Run subtests) because
+// scenario (b)'s "normal path" assertion includes the rows posted
+// under scenario (a)'s lag-above branch — they share state, so the
+// sequential structure makes that data flow explicit. The test logs
+// each scenario's boundary so failure output still makes the active
+// scenario clear.
 func TestLagAware_DispatcherAndReaperRespectLag(t *testing.T) {
 	fake := &itestLagFake{}
 	// A zero-valued fake reports lag 0. If the stacks start before we

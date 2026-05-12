@@ -1,5 +1,6 @@
 -- 0001_init.up.sql
--- Ships every artifact from docs/design/01-schema.md §1, §2, §3, and §Cross-table.
+-- Ships every schema artifact: the notifications, delivery_attempts, and
+-- outbox tables, their indexes, and the notifications updated_at trigger.
 
 CREATE TABLE notifications (
   id              UUID        PRIMARY KEY,

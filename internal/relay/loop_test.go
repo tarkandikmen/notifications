@@ -25,18 +25,19 @@ import (
 )
 
 // newTestEnv boots the Postgres + Kafka testcontainers, creates the
-// phase 2 topics via Bootstrap, builds a real franz-go producer with
-// the locked phase 2 producer settings, and returns Deps shaped for
-// deterministic single-tick tests. The producer's lifecycle is
-// registered as a t.Cleanup so callers don't have to remember to close.
+// topic set via Bootstrap, builds a real franz-go producer with the
+// locked producer settings, and returns Deps shaped for deterministic
+// single-tick tests. The producer's lifecycle is registered as a
+// t.Cleanup so callers don't have to remember to close.
 func newTestEnv(t *testing.T) (Deps, *store.Store, []string) {
 	t.Helper()
 	pool, _ := testsupport.StartPostgres(t)
 	brokers := testsupport.StartKafka(t)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	require.NoError(t, Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return Bootstrap(context.Background(), brokers, logger)
+	})
 
 	client, err := kgo.NewClient(producerOpts(brokers)...)
 	require.NoError(t, err, "build producer")
@@ -49,10 +50,10 @@ func newTestEnv(t *testing.T) (Deps, *store.Store, []string) {
 		Logger:       logger,
 		PollInterval: 25 * time.Millisecond,
 		BatchSize:    500,
-		// Phase 5: a noop tracer satisfies Deps.Tracer for unit tests
-		// so the per-tick relay.tick span is opened (and ended)
-		// without any exporter wiring. Tests that need to assert on
-		// span shape build an in-memory tracetest provider in-line.
+		// A noop tracer satisfies Deps.Tracer for unit tests so the
+		// per-tick relay.tick span is opened (and ended) without any
+		// exporter wiring. Tests that need to assert on span shape
+		// build an in-memory tracetest provider in-line.
 		Tracer: noop.NewTracerProvider().Tracer("test"),
 	}
 	return deps, st, brokers
@@ -86,10 +87,9 @@ func fetchOnePublishedAt(t *testing.T, st *store.Store) (id int64, publishedAt *
 // consumer is closed before the function returns so the test isn't
 // holding broker resources after the assertion runs.
 //
-// AtStart on ConsumeResetOffset matches the worker's phase 2 consumer
-// config from docs/design/04-kafka.md §6 (`auto.offset.reset = earliest`),
-// so this assertion exercises the same code path the SMS worker will
-// use in chunk 5.
+// AtStart on ConsumeResetOffset matches the worker's
+// `auto.offset.reset = earliest` consumer config, so this assertion
+// exercises the same code path the SMS worker uses in production.
 func drainOneRecord(t *testing.T, brokers []string, topic string, timeout time.Duration) *kgo.Record {
 	t.Helper()
 
@@ -119,11 +119,11 @@ func drainOneRecord(t *testing.T, brokers []string, topic string, timeout time.D
 	}
 }
 
-// TestRunOnce_PublishesAndMarksPublished is the primary test required
-// by docs/phases/02-walking-skeleton.md §Chunk 4: one unpublished
-// outbox row → one tick → message on Kafka, outbox row marked
-// published_at. Asserts the wire shape (topic, key, value bytes) so a
-// regression in payload encoding doesn't slip through.
+// TestRunOnce_PublishesAndMarksPublished is the primary relay tick
+// test: one unpublished outbox row → one tick → message on Kafka,
+// outbox row marked published_at. Asserts the wire shape (topic, key,
+// value bytes) so a regression in payload encoding doesn't slip
+// through.
 func TestRunOnce_PublishesAndMarksPublished(t *testing.T) {
 	deps, st, brokers := newTestEnv(t)
 
@@ -147,11 +147,11 @@ func TestRunOnce_PublishesAndMarksPublished(t *testing.T) {
 	assert.JSONEq(t, string(payload), string(rec.Value),
 		"published value must equal the outbox payload")
 	assert.Empty(t, rec.Headers,
-		"phase 2 leaves outbox headers null; published record carries no Kafka headers")
+		"null outbox headers → published record carries no Kafka headers")
 }
 
-// TestRunOnce_ForwardsHeadersToKafka locks Chunk 6: non-null outbox
-// headers become Kafka record headers verbatim.
+// TestRunOnce_ForwardsHeadersToKafka verifies non-null outbox headers
+// become Kafka record headers verbatim.
 func TestRunOnce_ForwardsHeadersToKafka(t *testing.T) {
 	deps, st, brokers := newTestEnv(t)
 	payload := []byte(`{"version":1}`)
@@ -236,10 +236,10 @@ func TestRunOnce_BatchPublishesEveryRow(t *testing.T) {
 	assert.Equal(t, 0, unpublished)
 }
 
-// TestRunOnce_ProduceErrorRollsBack covers the failure branch from
-// docs/phases/02-walking-skeleton.md §8: a producer-side error must
-// abort the loop body so the deferred rollback fires, leaving rows
-// published_at IS NULL for the next tick to retry.
+// TestRunOnce_ProduceErrorRollsBack verifies the publish-failure
+// branch: a producer-side error aborts the loop body so the deferred
+// rollback fires, leaving rows published_at IS NULL for the next tick
+// to retry.
 //
 // Drives the loop with a stub Producer that returns an error from
 // ProduceSync — no Kafka container needed for this branch.
@@ -345,10 +345,11 @@ func TestApplyDefaults_PanicsOnNilTracer(t *testing.T) {
 	)
 }
 
-// TestKafkaHeadersFromOutboxHeaders_NullAndPopulated locks the headers JSONB → []kgo.RecordHeader
-// translation. Phase 2 always passes nil; Phase 5 populates W3C
-// Trace Context headers, and this test catches a regression in the
-// decoder that would silently drop them.
+// TestKafkaHeadersFromOutboxHeaders_NullAndPopulated locks the headers
+// JSONB → []kgo.RecordHeader translation. The dispatcher / worker /
+// reaper populate W3C Trace Context headers, and this test catches a
+// regression in the decoder that would silently drop them; the null
+// case covers older outbox rows from before the headers field landed.
 func TestKafkaHeadersFromOutboxHeaders_NullAndPopulated(t *testing.T) {
 	assert.Nil(t, observability.KafkaHeadersFromOutboxHeaders(nil), "null headers → empty slice")
 	assert.Nil(t, observability.KafkaHeadersFromOutboxHeaders(json.RawMessage(`{}`)), "empty object → empty slice")
@@ -399,11 +400,10 @@ func counterValue(t *testing.T, c interface {
 	return *m.Counter.Value
 }
 
-// TestRunOnce_StampsTickCounter_PerOutcome locks Phase 5 §1.1's
-// relay_ticks_total counter shape: every runOnce branch must stamp
-// exactly one outcome on the counter. Three outcomes
-// {published, empty, error} together exhaust the runOnce return
-// paths.
+// TestRunOnce_StampsTickCounter_PerOutcome locks the relay_ticks_total
+// counter shape: every runOnce branch must stamp exactly one outcome
+// on the counter. Three outcomes {published, empty, error} together
+// exhaust the runOnce return paths.
 //
 // The "published" sub-test reuses the Kafka testcontainer fixture;
 // "empty" and "error" use only Postgres so they're cheaper.
@@ -477,9 +477,8 @@ func TestRunOnce_PublishedRecordsCounter_PerTopic(t *testing.T) {
 }
 
 // TestRunOnce_OpensTickSpan asserts the relay.tick span name +
-// outcome attribute per docs/phases/05-observability.md §7. Uses a
-// tracetest in-memory exporter so the span shape is inspectable
-// without a real OTLP pipeline.
+// outcome attribute. Uses a tracetest in-memory exporter so the span
+// shape is inspectable without a real OTLP pipeline.
 func TestRunOnce_OpensTickSpan(t *testing.T) {
 	deps, st, _ := newTestEnv(t)
 

@@ -19,19 +19,18 @@ import (
 var fixedNow = time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
 
 // transientBackoffRange returns the closed [floor, ceiling] interval
-// that TransientBackoff(attempt) must lie within per
-// docs/design/05-retry.md §3. Used by the per-case range assertions
-// below — the worker classification tests can no longer pin exact
-// eligible_at values because Phase 3 swaps in equal-jitter backoff.
+// that TransientBackoff(attempt) must lie within. Used by the per-case
+// range assertions below — equal-jitter backoff means the tests cannot
+// pin an exact eligible_at value, only the bounds of the jitter draw.
 func transientBackoffRange(attempt int) (floor, ceiling time.Duration) {
 	det := time.Duration(math.Pow(2, float64(attempt))) * time.Second
 	return det / 2, det
 }
 
-// TestClassify_HTTP2xx_Success exercises docs/design/05-retry.md §1
-// row 1: any HTTP 2xx is success / T4 (DELIVERED). NewEligibleAt is
-// the passed-in now per the Outcome doc ("eligible_at unchanged"
-// semantics).
+// TestClassify_HTTP2xx_Success exercises the success row of the
+// classification table: any HTTP 2xx is success / T4 (DELIVERED).
+// NewEligibleAt is the passed-in now per the Outcome doc
+// ("eligible_at unchanged" semantics).
 func TestClassify_HTTP2xx_Success(t *testing.T) {
 	cases := []struct {
 		name string
@@ -66,12 +65,12 @@ func TestClassify_HTTP2xx_EmptyBody(t *testing.T) {
 	assert.Empty(t, out.ResponseBody)
 }
 
-// TestClassify_HTTPTransient_BelowMaxAttempts exercises
-// docs/design/05-retry.md §1 rows for HTTP 408 / 425 / 429 / 5xx with
-// attempt < max_attempts: classification is transient (T5) and
-// NewStatus is PENDING with NewEligibleAt advanced by a jittered
-// TransientBackoff(attempt) — asserted as a range per §3 since the
-// equal-jitter draw replaces Phase 2's deterministic backoff.
+// TestClassify_HTTPTransient_BelowMaxAttempts exercises the transient
+// rows for HTTP 408 / 425 / 429 / 5xx with attempt < max_attempts:
+// classification is transient (T5) and NewStatus is PENDING with
+// NewEligibleAt advanced by a jittered TransientBackoff(attempt) —
+// asserted as a range since the equal-jitter draw makes any single
+// observed value non-deterministic.
 func TestClassify_HTTPTransient_BelowMaxAttempts(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -108,10 +107,9 @@ func TestClassify_HTTPTransient_BelowMaxAttempts(t *testing.T) {
 	}
 }
 
-// TestClassify_HTTPTransient_AtMaxAttempts exercises
-// docs/design/05-retry.md §1 + §4: a transient outcome on
-// attempt == max_attempts terminal-fails the row (T7). The
-// classification stays "transient" per the table — the row's
+// TestClassify_HTTPTransient_AtMaxAttempts pins the terminal branch:
+// a transient outcome on attempt == max_attempts terminal-fails the
+// row (T7). The classification stays "transient" — the row's
 // failure_reason is "max_attempts_exceeded", not the (T6-only)
 // "permanent_error".
 func TestClassify_HTTPTransient_AtMaxAttempts(t *testing.T) {
@@ -137,12 +135,12 @@ func TestClassify_HTTPTransient_BeyondMaxAttempts(t *testing.T) {
 	assert.Equal(t, failureReasonMaxAttempts, *out.FailureReason)
 }
 
-// TestClassify_HTTPPermanent_AnyAttempt exercises docs/design/05-retry.md
-// §1 row "HTTP 4xx other": the per-row T6 path. The notification
-// terminal-fails immediately regardless of attempt count, classification
-// is "permanent", and failure_reason is "permanent_error" (not
-// "max_attempts_exceeded" — that's T7's reason). The provider response
-// body is preserved on the delivery_attempts row.
+// TestClassify_HTTPPermanent_AnyAttempt exercises the "HTTP 4xx other"
+// row: the T6 path. The notification terminal-fails immediately
+// regardless of attempt count, classification is "permanent", and
+// failure_reason is "permanent_error" (not "max_attempts_exceeded" —
+// that's T7's reason). The provider response body is preserved on the
+// delivery_attempts row.
 func TestClassify_HTTPPermanent_AnyAttempt(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -223,12 +221,11 @@ func TestClassify_DefaultUnknownStatusTreatedAsTransient(t *testing.T) {
 	}
 }
 
-// TestClassify_RequestErr_BelowMaxAttempts exercises
-// docs/design/05-retry.md §1's "no HTTP response" row — connection
-// refused, DNS failure, timeout before the server responds, TLS
-// handshake failure all classify transient with NewEligibleAt
-// jittered into the [now+det/2, now+det] range when the retry chain
-// still has slots.
+// TestClassify_RequestErr_BelowMaxAttempts exercises the "no HTTP
+// response" row — connection refused, DNS failure, timeout before the
+// server responds, TLS handshake failure all classify transient with
+// NewEligibleAt jittered into the [now+det/2, now+det] range when the
+// retry chain still has slots.
 func TestClassify_RequestErr_BelowMaxAttempts(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -261,11 +258,11 @@ func TestClassify_RequestErr_BelowMaxAttempts(t *testing.T) {
 	}
 }
 
-// TestClassify_RequestErr_AtMaxAttempts is the no-response half of
-// docs/design/05-retry.md §1 + §4: a network error on the final
-// attempt terminal-fails the row (T7) with
-// failure_reason=max_attempts_exceeded. The error string is preserved
-// on the delivery_attempts row for forensic review.
+// TestClassify_RequestErr_AtMaxAttempts is the no-response half of the
+// terminal branch: a network error on the final attempt terminal-fails
+// the row (T7) with failure_reason=max_attempts_exceeded. The error
+// string is preserved on the delivery_attempts row for forensic
+// review.
 func TestClassify_RequestErr_AtMaxAttempts(t *testing.T) {
 	out := Classify(ProviderResult{RequestErr: errors.New("connect timeout")}, maxAttempts, fixedNow)
 	assert.Equal(t, classificationTransient, out.Classification)

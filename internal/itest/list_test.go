@@ -1,6 +1,6 @@
 package itest
 
-// Phase 4 Chunk 5 full-stack list end-to-end test.
+// Full-stack list end-to-end test.
 //
 // Boots Postgres + Kafka testcontainers, stands up the api + dispatcher
 // + relay + reaper plus one worker goroutine per channel (sms, email,
@@ -10,9 +10,8 @@ package itest
 //     list endpoint must work against rows that have null batch_id).
 //  2. Polls each row to DELIVERED so the status= filter exercise has
 //     a stable post-condition.
-//  3. Exercises GET /v1/notifications across the locked filter set
-//     and pagination boundary cases per docs/phases/04-api-completeness.md
-//     §10 (Tests, internal/itest/list_test.go row):
+//  3. Exercises GET /v1/notifications across the filter set and
+//     pagination boundary cases:
 //
 //       - channel=sms&limit=3&offset=0 → 3 SMS rows, has_more=true.
 //       - channel=email                → 3 email rows, has_more=false.
@@ -20,8 +19,6 @@ package itest
 //         explicit priority, so all default to priority=normal).
 //       - created_after=<too-early>    → all 10 rows.
 //       - created_after=<future>       → empty list.
-//
-// docs/phases/04-api-completeness.md §10 + §Chunk 5.
 
 import (
 	"context"
@@ -54,19 +51,20 @@ import (
 	"github.com/tarkandikmen/notifications/internal/worker"
 )
 
-// TestList_FiltersAndPagination is the Phase 4 Chunk 5 list acceptance
-// test. The 5+3+2 channel split lets the per-channel + pagination
-// assertions all land against the same dataset without re-posting per
-// scenario; the pre-poll-to-DELIVERED step makes the status= filter
-// exercise deterministic regardless of how fast the pipelines run.
+// TestList_FiltersAndPagination is the list acceptance test. The
+// 5+3+2 channel split lets the per-channel + pagination assertions
+// all land against the same dataset without re-posting per scenario;
+// the pre-poll-to-DELIVERED step makes the status= filter exercise
+// deterministic regardless of how fast the pipelines run.
 func TestList_FiltersAndPagination(t *testing.T) {
 	pool, _ := testsupport.StartPostgres(t)
 	brokers := testsupport.StartKafka(t)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	hits := make(map[string]*atomic.Int32, 3)
 	for _, ch := range []string{"sms", "email", "push"} {
@@ -283,7 +281,7 @@ func TestList_FiltersAndPagination(t *testing.T) {
 			assert.Equal(t, "DELIVERED", n.Status,
 				"every SMS row in the test dataset is DELIVERED by this point")
 			assert.Nil(t, n.Attempts,
-				"list responses use the no-attempts representation per docs/design/03-api.md §Notification representation")
+				"list responses use the no-attempts representation")
 		}
 	})
 
@@ -305,8 +303,7 @@ func TestList_FiltersAndPagination(t *testing.T) {
 
 	// Scenario 3: status=DELIVERED&priority=normal → all 10 rows.
 	// None of the test posts set an explicit priority, so every row
-	// defaults to priority=normal per docs/design/03-api.md
-	// §Validation rules + docs/design/01-schema.md §1.
+	// defaults to priority=normal.
 	t.Run("status_delivered_priority_normal_matches_all_10", func(t *testing.T) {
 		got := getList(t, apiServer.URL, url.Values{
 			"status":   {"DELIVERED"},
@@ -339,7 +336,7 @@ func TestList_FiltersAndPagination(t *testing.T) {
 	// Scenario 5: created_after=<allPostedAt + 1h> → empty list (no
 	// rows posted after that timestamp). The list endpoint is a
 	// query, not a lookup; empty matches return 200 with
-	// `notifications: []` per docs/design/03-api.md §GET /v1/notifications.
+	// `notifications: []`.
 	t.Run("created_after_future_empty_200", func(t *testing.T) {
 		future := allPostedAt.Add(1 * time.Hour)
 		got := getList(t, apiServer.URL, url.Values{

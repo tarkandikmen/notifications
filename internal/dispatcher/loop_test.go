@@ -32,8 +32,8 @@ import (
 // fakeLag is the LagQuery fake the dispatcher tests inject in place of
 // the real *kafkaadmin.LagClient. Tests that don't care about the
 // lag-aware branching use the zero-valued fakeLag (returns lag = 0,
-// err = nil), which keeps every Phase 2 test's runOnce call below the
-// threshold and exercises the normal claim path.
+// err = nil), which keeps every test's runOnce call below the threshold
+// and exercises the normal claim path.
 //
 // Tests that drive the lag-aware branches set Lag / Err explicitly per
 // case; the recorded calls slice lets the lag-aware tests assert that
@@ -73,8 +73,8 @@ func (f *fakeLag) Calls() []fakeLagCall {
 // value only matters for tests that exercise Loop itself.
 //
 // Lag is wired to a zero-valued fakeLag (always reports lag = 0, err =
-// nil) so Phase 2 tests exercise the normal claim path without paying
-// any attention to Phase 3's lag-aware branching. Lag-aware tests
+// nil) so non-lag-aware tests exercise the normal claim path without
+// paying any attention to the lag-aware branching. Lag-aware tests
 // build their own fakeLag and replace deps.Lag before calling runOnce.
 // The fake is returned alongside Deps + Store so the lag-aware tests
 // can both replace it and inspect its recorded calls.
@@ -92,10 +92,10 @@ func newTestDeps(t *testing.T) (Deps, *store.Store, *fakeLag) {
 		Lag:          lag,
 		LagTimeout:   defaultLagTimeout,
 		LagThreshold: defaultLagThreshold,
-		// Phase 5: a noop tracer satisfies Deps.Tracer for unit tests
-		// so the per-tick dispatcher.tick span is opened (and ended)
-		// without any exporter wiring. Tests that need to assert on
-		// span shape build an in-memory tracetest provider in-line.
+		// A noop tracer satisfies Deps.Tracer for unit tests so the
+		// per-tick dispatcher.tick span is opened (and ended) without
+		// any exporter wiring. Tests that need to assert on span shape
+		// build an in-memory tracetest provider in-line.
 		Tracer: noop.NewTracerProvider().Tracer("test"),
 	}, st, lag
 }
@@ -114,10 +114,9 @@ func insertPendingSMS(t *testing.T, st *store.Store, key, content string) store.
 }
 
 // insertPendingForChannel is the channel-parameterized variant of
-// insertPendingSMS. Phase 3 Chunk 7 added per-channel claim coverage
-// (see TestRunOnce_MultiChannel_FansOutToCorrectTopics) so the helper
-// surfaced here rather than inlining the per-channel rows in each
-// test.
+// insertPendingSMS. Multi-channel claim tests (see
+// TestRunOnce_MultiChannel_FansOutToCorrectTopics) reuse the helper so
+// the per-channel rows aren't inlined in each test.
 func insertPendingForChannel(t *testing.T, st *store.Store, channel, recipient, key, content string) store.Notification {
 	t.Helper()
 	id, err := store.NewID()
@@ -167,13 +166,12 @@ func selectOutboxRows(t *testing.T, st *store.Store) []outboxRow {
 	return out
 }
 
-// TestRunOnce_ClaimsAndPublishes is the primary test required by
-// docs/phases/02-walking-skeleton.md §Chunk 3: one PENDING SMS row → one
-// tick → row is DISPATCHED with attempt=1, one outbox row with topic
-// send.sms and the docs/design/04-kafka.md §1 payload.
+// TestRunOnce_ClaimsAndPublishes is the primary dispatcher claim test:
+// one PENDING SMS row → one tick → row is DISPATCHED with attempt=1,
+// one outbox row with topic send.sms and the send-payload schema.
 func TestRunOnce_ClaimsAndPublishes(t *testing.T) {
 	deps, st, _ := newTestDeps(t)
-	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000100", "phase 2 dispatcher tick")
+	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000100", "dispatcher tick")
 
 	require.NoError(t, runOnce(context.Background(), deps, "sms"))
 
@@ -190,16 +188,16 @@ func TestRunOnce_ClaimsAndPublishes(t *testing.T) {
 	require.NotNil(t, ob.partitionKey, "partition_key must be set to the notification id")
 	assert.Equal(t, row.ID.String(), *ob.partitionKey)
 
-	// Payload matches docs/design/04-kafka.md §1 verbatim. JSONEq tolerates
-	// JSONB key reordering / whitespace normalization that Postgres applies
-	// on read.
+	// Payload matches the send.<channel> wire schema verbatim. JSONEq
+	// tolerates JSONB key reordering / whitespace normalization that
+	// Postgres applies on read.
 	wantPayload := fmt.Sprintf(`{
 		"version":       1,
 		"id":            %q,
 		"attempt":       1,
 		"channel":       "sms",
 		"recipient":     "+905551234567",
-		"content":       "phase 2 dispatcher tick",
+		"content":       "dispatcher tick",
 		"template":      null,
 		"template_data": null,
 		"priority":      1
@@ -207,7 +205,7 @@ func TestRunOnce_ClaimsAndPublishes(t *testing.T) {
 	assert.JSONEq(t, wantPayload, string(ob.payload))
 }
 
-// TestRunOnce_PopulatesOutboxHeaders documents Chunk 6: the per-row
+// TestRunOnce_PopulatesOutboxHeaders verifies the per-row
 // dispatcher.row span serializes into outbox.headers for the relay
 // to forward to Kafka.
 func TestRunOnce_PopulatesOutboxHeaders(t *testing.T) {
@@ -290,9 +288,8 @@ func TestRunOnce_NoEligibleRows_NoOutboxWrites(t *testing.T) {
 }
 
 // TestRunOnce_FutureScheduledRow_NotClaimed crosses the runOnce + claim
-// boundary: a row with eligible_at in the future must not be picked up,
-// matching docs/design/02-state-machine.md §Scheduled notifications and
-// the dispatcher's `eligible_at <= now()` guard from §7.
+// boundary: a row with eligible_at in the future must not be picked up
+// by the dispatcher's `eligible_at <= now()` guard.
 func TestRunOnce_FutureScheduledRow_NotClaimed(t *testing.T) {
 	deps, st, _ := newTestDeps(t)
 
@@ -322,16 +319,15 @@ func TestRunOnce_FutureScheduledRow_NotClaimed(t *testing.T) {
 	assert.Empty(t, selectOutboxRows(t, st))
 }
 
-// TestRunOnce_LagAboveThreshold_SkipsClaim covers Phase 3 Chunk 5 §13's
-// dispatcher row "with Deps.Lag returning 1500 → runOnce skips the
-// claim, no rows are dispatched." The fake returns lag = 1500 (above
-// the default 1000 threshold); runOnce must early-return without
-// claiming, and the PENDING row stays PENDING.
+// TestRunOnce_LagAboveThreshold_SkipsClaim verifies the lag-skip
+// branch: the fake returns lag = 1500 (above the default 1000
+// threshold); runOnce must early-return without claiming, and the
+// PENDING row stays PENDING.
 func TestRunOnce_LagAboveThreshold_SkipsClaim(t *testing.T) {
 	deps, st, lag := newTestDeps(t)
 	lag.Lag = 1500
 
-	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000140", "phase 3 lag pause")
+	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000140", "lag pause")
 
 	require.NoError(t, runOnce(context.Background(), deps, "sms"))
 
@@ -348,14 +344,13 @@ func TestRunOnce_LagAboveThreshold_SkipsClaim(t *testing.T) {
 }
 
 // TestRunOnce_LagAtThreshold_StillClaims locks the predicate edge
-// (`> threshold`, not `>= threshold`) per docs/phases/03-resilience.md §7
-// pseudo-code. With the default threshold of 1000 and lag = 1000, the
-// tick proceeds.
+// (`> threshold`, not `>= threshold`). With the default threshold of
+// 1000 and lag = 1000, the tick proceeds.
 func TestRunOnce_LagAtThreshold_StillClaims(t *testing.T) {
 	deps, st, lag := newTestDeps(t)
 	lag.Lag = defaultLagThreshold
 
-	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000141", "phase 3 lag edge")
+	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000141", "lag edge")
 
 	require.NoError(t, runOnce(context.Background(), deps, "sms"))
 
@@ -366,17 +361,15 @@ func TestRunOnce_LagAtThreshold_StillClaims(t *testing.T) {
 	assert.Len(t, selectOutboxRows(t, st), 1)
 }
 
-// TestRunOnce_LagQueryError_FailsOpen covers Phase 3 Chunk 5 §13's
-// dispatcher row "with Deps.Lag returning an error → runOnce continues
-// (fail-open) and dispatches normally." Per
-// docs/design/02-state-machine.md §Lag-query failure semantics row T2,
-// the dispatcher fail-opens on a lag-query error.
+// TestRunOnce_LagQueryError_FailsOpen verifies the dispatcher's
+// fail-open semantic on T2: a lag-query error logs at warn and the
+// claim still proceeds.
 func TestRunOnce_LagQueryError_FailsOpen(t *testing.T) {
 	deps, st, lag := newTestDeps(t)
 	lag.Err = errors.New("kafka admin unreachable")
 	lag.Lag = -1 // sentinel from kafkaadmin.MaxLag's error path
 
-	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000142", "phase 3 lag fail-open")
+	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000142", "lag fail-open")
 
 	require.NoError(t, runOnce(context.Background(), deps, "sms"))
 
@@ -387,16 +380,15 @@ func TestRunOnce_LagQueryError_FailsOpen(t *testing.T) {
 	assert.Len(t, selectOutboxRows(t, st), 1, "outbox row emitted under fail-open")
 }
 
-// TestRunOnce_LagBelowThreshold_NormalPath covers the third dispatcher
-// row from §13: lag = 0 → normal claim path. Verifies that the lag
-// query is invoked exactly once with the expected (group, topic) pair
-// even on the happy path, locking the call site against accidental
-// removal.
+// TestRunOnce_LagBelowThreshold_NormalPath covers the happy path with
+// lag = 0. Verifies that the lag query is invoked exactly once with
+// the expected (group, topic) pair even on the happy path, locking
+// the call site against accidental removal.
 func TestRunOnce_LagBelowThreshold_NormalPath(t *testing.T) {
 	deps, st, lag := newTestDeps(t)
 	lag.Lag = 0
 
-	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000143", "phase 3 lag low")
+	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000143", "lag low")
 
 	require.NoError(t, runOnce(context.Background(), deps, "sms"))
 
@@ -412,11 +404,10 @@ func TestRunOnce_LagBelowThreshold_NormalPath(t *testing.T) {
 	assert.Equal(t, "send.sms", calls[0].Topic, "topic name is send.<channel>")
 }
 
-// TestRunOnce_MultiChannel_FansOutToCorrectTopics is the Phase 3
-// Chunk 7 dispatcher test per docs/phases/03-resilience.md §Chunk 7
-// + §13: with one PENDING row per channel, three runOnce ticks (one
-// per channel) produce three outbox rows — each on the correct
-// send.<channel> topic, keyed on the matching notification id.
+// TestRunOnce_MultiChannel_FansOutToCorrectTopics verifies the
+// per-channel fan-out: with one PENDING row per channel, three runOnce
+// ticks (one per channel) produce three outbox rows — each on the
+// correct send.<channel> topic, keyed on the matching notification id.
 //
 // runOnce is invoked once per channel rather than driving Loop's
 // per-tick channel iteration so the test is deterministic and does
@@ -428,12 +419,12 @@ func TestRunOnce_MultiChannel_FansOutToCorrectTopics(t *testing.T) {
 	deps.Channels = []string{"sms", "email", "push"}
 
 	rowSMS := insertPendingForChannel(t, st, "sms", "+905551234567",
-		"00000000-0000-4000-8000-000000000150", "phase 3 sms")
+		"00000000-0000-4000-8000-000000000150", "sms")
 	rowEmail := insertPendingForChannel(t, st, "email", "u@example.com",
-		"00000000-0000-4000-8000-000000000151", "phase 3 email")
+		"00000000-0000-4000-8000-000000000151", "email")
 	rowPush := insertPendingForChannel(t, st, "push",
 		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		"00000000-0000-4000-8000-000000000152", "phase 3 push")
+		"00000000-0000-4000-8000-000000000152", "push")
 
 	for _, ch := range deps.Channels {
 		require.NoError(t, runOnce(context.Background(), deps, ch),
@@ -515,8 +506,7 @@ func TestLoop_StopsOnContextCancel(t *testing.T) {
 // unit test (no testcontainer) — runs on every `go test ./...` so the
 // defaults are pinned even when integration tests are disabled.
 //
-// Phase 3 Chunk 7 widens defaultChannels to the full {sms, email,
-// push} set per docs/phases/03-resilience.md §Chunk 7.
+// defaultChannels covers the full {sms, email, push} set.
 func TestApplyDefaults(t *testing.T) {
 	tr := noop.NewTracerProvider().Tracer("test")
 	d := applyDefaults(Deps{Lag: &fakeLag{}, Tracer: tr})
@@ -559,10 +549,9 @@ func TestApplyDefaults_PanicsOnNilLag(t *testing.T) {
 }
 
 // TestApplyDefaults_PanicsOnNilTracer mirrors the nil-lag panic for
-// the Phase 5 Tracer field per docs/phases/05-observability.md §7.
-// The interface keeps the loop testable; the panic ensures a future
-// cmd.go that forgets to wire otel.Tracer fails loudly at startup
-// rather than silently dropping every per-tick span.
+// the Tracer field. The interface keeps the loop testable; the panic
+// ensures a future cmd.go that forgets to wire otel.Tracer fails
+// loudly at startup rather than silently dropping every per-tick span.
 func TestApplyDefaults_PanicsOnNilTracer(t *testing.T) {
 	assert.PanicsWithValue(t,
 		"dispatcher: Deps.Tracer is required (otel.Tracer or noop)",
@@ -587,9 +576,9 @@ func counterValue(t *testing.T, c interface {
 	return *m.Counter.Value
 }
 
-// gaugeValue mirrors counterValue for Prometheus gauges (Chunk 5 §8.2:
+// gaugeValue mirrors counterValue for Prometheus gauges:
 // kafka_consumer_lag must publish on lag_skip ticks too, not only on
-// successful claims).
+// successful claims.
 func gaugeValue(t *testing.T, g interface {
 	Write(*dto.Metric) error
 }) float64 {
@@ -601,7 +590,7 @@ func gaugeValue(t *testing.T, g interface {
 	return *m.Gauge.Value
 }
 
-// TestRunOnce_StampsTickCounter_PerOutcome locks Phase 5 §1.1's
+// TestRunOnce_StampsTickCounter_PerOutcome locks the
 // dispatcher_ticks_total counter shape: every runOnce branch must
 // stamp exactly one outcome on the counter. The five outcomes
 // {claimed, empty, lag_skip, lag_query_error, error} together
@@ -671,8 +660,7 @@ func TestRunOnce_StampsTickCounter_PerOutcome(t *testing.T) {
 		// Pre-stage a row so the dispatcher fail-opens into a successful
 		// claim. The outcome stamped on the tick counter must still be
 		// "lag_query_error" (the outage takes precedence over the
-		// downstream "claimed" outcome) per the locked semantic in
-		// docs/phases/05-observability.md §1.1.
+		// downstream "claimed" outcome).
 		insertPendingForChannel(t, st, channel, "+905551234567",
 			"00000000-0000-4000-8000-000000000901", "lag query error")
 
@@ -706,10 +694,9 @@ func TestRunOnce_StampsTickCounter_PerOutcome(t *testing.T) {
 }
 
 // TestRunOnce_OpensTickSpan_WithChannelAttribute asserts the span
-// name and attributes locked by docs/phases/05-observability.md §7.
-// Uses a tracetest in-memory exporter via the SDK tracer provider
-// so the span shape can be inspected without booting a real OTLP
-// pipeline.
+// name and attributes for the per-tick dispatcher.tick span. Uses a
+// tracetest in-memory exporter via the SDK tracer provider so the
+// span shape can be inspected without booting a real OTLP pipeline.
 func TestRunOnce_OpensTickSpan_WithChannelAttribute(t *testing.T) {
 	deps, st, _ := newTestDeps(t)
 
@@ -742,8 +729,8 @@ func TestRunOnce_OpensTickSpan_WithChannelAttribute(t *testing.T) {
 }
 
 // TestBuildSendPayload_MatchesKafkaSchema is a unit-style test (no
-// testcontainer) that locks the JSON shape against docs/design/04-kafka.md
-// §1. Catches regressions to the wire format without spinning a Postgres
+// testcontainer) that locks the send.<channel> JSON shape. Catches
+// regressions to the wire format without spinning a Postgres
 // container.
 func TestBuildSendPayload_MatchesKafkaSchema(t *testing.T) {
 	id := uuid.MustParse("01927000-0000-7000-8000-000000000001")

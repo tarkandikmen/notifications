@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/tarkandikmen/notifications/internal/health"
 	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/store"
@@ -20,16 +21,8 @@ import (
 // Store is the storage surface the api package depends on. *store.Store
 // satisfies it for production; handler tests substitute an in-memory
 // fake. Defined as an interface here (rather than holding a concrete
-// *store.Store or *pgxpool.Pool in Deps) so the test plan in
-// docs/phases/02-walking-skeleton.md §13 ("fake Store interface
-// satisfied in-memory") works without touching real infrastructure.
-//
-// Phase 4 Chunk 1 adds ListNotifications and GetBatch per
-// docs/phases/04-api-completeness.md §1.2 + §1.3.
-// Phase 4 Chunk 2 adds InsertBatch per
-// docs/phases/04-api-completeness.md §1.1.
-// Phase 4 Chunk 3 adds CancelNotification per
-// docs/phases/04-api-completeness.md §1.4.
+// *store.Store or *pgxpool.Pool in Deps) so handler tests can wire a
+// fake Store without touching real infrastructure.
 type Store interface {
 	InsertNotification(ctx context.Context, n store.Notification) error
 	InsertBatch(ctx context.Context, ns []store.Notification, batchID uuid.UUID) error
@@ -39,42 +32,20 @@ type Store interface {
 	CancelNotification(ctx context.Context, id uuid.UUID, traceHeaders json.RawMessage) (store.Notification, store.CancelTransition, error)
 }
 
-// PingerFunc is the signature of a per-request liveness probe. The
-// supplied pinger is called inside a 2 s context timeout in
-// handleHealthz; any non-nil err produces a 503 with the failing
-// component's name in the body per docs/design/03-api.md
-// §`GET /healthz`.
-//
-// The 200 path returns the exact-byte body Phase 1's acceptance test 5
-// asserts (`{"status":"ok"}` with no trailing newline); the 503 path
-// returns the rich body locked in docs/design/03-api.md §`GET
-// /healthz` (`{"status":"unhealthy","components":{"<name>":"<error>"}}`).
-//
-// Wired by api/cmd.go to pgxpool.Pool.Ping in production. Tests
-// substitute a closure that returns a deterministic error to exercise
-// the 503 path.
-//
-// docs/phases/05-observability.md §3 locks the surface; only Postgres
-// is probed in Phase 5 (the api binary doesn't open Redis or Kafka
-// clients — Phase 7 polish if k8s readiness probes need them).
-type PingerFunc func(ctx context.Context) error
-
 // Deps is the api package's per-process dependency bundle. cmd.go
 // assembles it at startup and hands it to RegisterRoutes; tests build
 // it manually with fakes.
 //
-// docs/phases/02-walking-skeleton.md §6 locks the original field set;
-// docs/phases/05-observability.md §3 adds Pinger so handleHealthz can
-// run the per-request Postgres ping that distinguishes "process up"
-// (Phase 1 minimum) from "deps responding" (Phase 5 contract). A nil
-// Pinger preserves the Phase 1 behavior for tests that don't care
-// about the dep probe.
+// Healthz is an http.HandlerFunc owned by cmd.go and built from a
+// multi-component health.Handler. A nil Healthz falls back to a
+// byte-exact 200 handler so test fixtures that don't care about the
+// probe (every fakeStore-only test) stay green.
 type Deps struct {
 	Store    Store
 	Registry *prometheus.Registry
 	Logger   *slog.Logger
 	Clock    func() time.Time
-	Pinger   PingerFunc
+	Healthz  http.HandlerFunc
 }
 
 // RegisterRoutes wires every endpoint in the api package onto mux.
@@ -86,12 +57,6 @@ type Deps struct {
 // middleware reads it — wrapping the mux from the outside would land
 // before the mux populates Pattern and surface every request with
 // endpoint="".
-//
-// docs/phases/02-walking-skeleton.md §6 locked the original four routes;
-// docs/phases/04-api-completeness.md adds the list (Chunk 1), batch-get
-// (Chunk 1), batch-create (Chunk 2), and cancel (Chunk 3) endpoints;
-// docs/phases/05-observability.md §1.3 wires the metrics middleware
-// and §3 wires the rich healthz dep probe.
 func RegisterRoutes(mux *http.ServeMux, deps Deps) {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
@@ -99,8 +64,16 @@ func RegisterRoutes(mux *http.ServeMux, deps Deps) {
 	if deps.Clock == nil {
 		deps.Clock = time.Now
 	}
+	if deps.Healthz == nil {
+		// Fallback to a byte-exact 200 handler so test fixtures
+		// that don't care about the probe (every fakeStore-only
+		// test in handlers_test.go) stay green. Production cmd.go
+		// always supplies a real handler built via
+		// internal/health.Handler.
+		deps.Healthz = health.Handler(nil)
+	}
 
-	mux.Handle("GET /healthz", metrics.Middleware(handleHealthz(deps)))
+	mux.Handle("GET /healthz", metrics.Middleware(deps.Healthz))
 	mux.Handle("GET /metrics", metrics.Middleware(promhttp.HandlerFor(deps.Registry, promhttp.HandlerOpts{})))
 	mux.Handle("POST /v1/notifications", metrics.Middleware(handleCreate(deps)))
 	mux.Handle("POST /v1/notifications/batch", metrics.Middleware(handleBatchCreate(deps)))
@@ -110,56 +83,7 @@ func RegisterRoutes(mux *http.ServeMux, deps Deps) {
 	mux.Handle("GET /v1/batches/{id}", metrics.Middleware(handleGetBatch(deps)))
 }
 
-// handleHealthz implements the per-request dep-probe contract from
-// docs/design/03-api.md §`GET /healthz`. When deps.Pinger is nil
-// (default for unit tests not exercising the probe) the handler
-// returns the Phase 1 byte-exact 200 body unconditionally, preserving
-// the Phase 1 acceptance contract. When deps.Pinger is set (the
-// production wiring is pgxpool.Pool.Ping) the handler runs it inside
-// a 2 s context timeout per request:
-//
-//   - nil err: 200 with the byte-exact `{"status":"ok"}` body (no
-//     trailing newline) so the Phase 1 acceptance test 5 stays green.
-//   - non-nil err: 503 with the rich body
-//     `{"status":"unhealthy","components":{"postgres":"<error>"}}`
-//     (json.Encode is fine here — no exact-byte contract on 503).
-//
-// Phase 5 wires only the Postgres probe; deeper probes (Redis, Kafka)
-// are Phase 7 polish per docs/phases/05-observability.md §Out of scope.
-func handleHealthz(deps Deps) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if deps.Pinger != nil {
-			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-			defer cancel()
-			if err := deps.Pinger(ctx); err != nil {
-				writeUnhealthy(w, "postgres", err)
-				return
-			}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	}
-}
-
-// writeUnhealthy writes the 503 body shape locked by
-// docs/design/03-api.md §`GET /healthz`. The component map carries
-// one entry per failing dep; Phase 5 only probes Postgres so the map
-// is always single-entry, but the shape generalizes for the
-// Phase 7 polish that adds Redis / Kafka probes.
-func writeUnhealthy(w http.ResponseWriter, component string, err error) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusServiceUnavailable)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status": "unhealthy",
-		"components": map[string]string{
-			component: err.Error(),
-		},
-	})
-}
-
-// handleCreate implements POST /v1/notifications. The six steps below
-// match docs/phases/02-walking-skeleton.md §3 1:1.
+// handleCreate implements POST /v1/notifications.
 func handleCreate(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req CreateRequest
@@ -180,9 +104,9 @@ func handleCreate(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		// Phase 2 §3 step 4: priority defaults to "normal" when absent;
-		// validation already ensured a non-empty value is one of the
-		// three accepted strings, so the ok=false branch below is
+		// Priority defaults to "normal" when absent; validation
+		// already ensured a non-empty value is one of the three
+		// accepted strings, so the ok=false branch below is
 		// unreachable for validated input.
 		priorityStr := req.Priority
 		if priorityStr == "" {
@@ -196,9 +120,9 @@ func handleCreate(deps Deps) http.HandlerFunc {
 			eligibleAt = *scheduledAt
 		}
 
-		// Phase 2 always populates Content (validation rejects the
-		// empty-string case); the *string field exists in store for
-		// Phase 6's template path.
+		// Content is always populated here (validation rejects the
+		// empty-string case); the *string field exists in store
+		// to leave room for a future template-only path.
 		content := req.Content
 		n := store.Notification{
 			ID:             id,
@@ -240,9 +164,8 @@ func handleCreate(deps Deps) http.HandlerFunc {
 	}
 }
 
-// handleGet implements GET /v1/notifications/{id} per
-// docs/phases/02-walking-skeleton.md §4. Malformed UUIDs and missing
-// rows both surface as 404 not_found per step 1 / step 2.
+// handleGet implements GET /v1/notifications/{id}. Malformed UUIDs and
+// missing rows both surface as 404 not_found.
 func handleGet(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		idStr := r.PathValue("id")
@@ -274,7 +197,7 @@ func handleGet(deps Deps) http.HandlerFunc {
 //
 // The helper always builds a non-nil slice via renderAttempts and
 // stores &slice on the response so the wire format is always
-// "attempts": [...] per docs/design/03-api.md §Nested attempts.
+// "attempts": [...].
 func renderNotification(n store.Notification, attempts []store.DeliveryAttempt) NotificationResponse {
 	out := renderNotificationWithoutAttempts(n)
 	rendered := renderAttempts(attempts)
@@ -283,14 +206,13 @@ func renderNotification(n store.Notification, attempts []store.DeliveryAttempt) 
 }
 
 // renderNotificationWithoutAttempts returns the list / batch-get /
-// cancel response shape per docs/design/03-api.md §Notification
-// representation: every notification field, no nested attempts key.
+// cancel response shape: every notification field, no nested attempts
+// key.
 //
 // Leaves NotificationResponse.Attempts as nil so omitempty drops the
 // field entirely from the wire format. The split between this helper
-// and renderNotification keeps the field projection single-sourced;
-// docs/phases/04-api-completeness.md §2 requires both code paths to
-// agree on every projected field.
+// and renderNotification keeps the field projection single-sourced so
+// both code paths agree on every projected field.
 func renderNotificationWithoutAttempts(n store.Notification) NotificationResponse {
 	out := NotificationResponse{
 		ID:             n.ID.String(),

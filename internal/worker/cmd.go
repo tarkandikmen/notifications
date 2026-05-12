@@ -1,8 +1,9 @@
 // Package worker implements the `notifications worker --channel=<sms|email|push>`
-// subcommand. Phase 3 Chunk 7 generalized Phase 2's SMS-only loop into
-// a per-channel runForChannel(channel) so every --channel value drives
-// a real consumer + provider + rate-limit-aware loop. The Phase 1
-// stub for email / push is retired.
+// subcommand. The `--channel` value drives a per-channel
+// runForChannel(channel) that wires a Kafka consumer, an HTTP provider,
+// and the Redis-backed rate limiter into a single processing loop;
+// every channel runs the same code path with channel-scoped topic and
+// consumer-group names.
 package worker
 
 import (
@@ -21,6 +22,7 @@ import (
 
 	"github.com/tarkandikmen/notifications/internal/config"
 	"github.com/tarkandikmen/notifications/internal/db"
+	"github.com/tarkandikmen/notifications/internal/health"
 	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/metricsserver"
 	"github.com/tarkandikmen/notifications/internal/observability"
@@ -38,18 +40,17 @@ const (
 // subcommand. main.go owns the flag registration; Run reads the value.
 const ChannelFlag = "channel"
 
-// validChannels mirrors docs/design/01-schema.md §Domain values for
-// notifications.channel. Worker is the only mode where the channel
-// matters at startup; api / dispatcher / relay / reaper handle every
-// channel.
+// validChannels lists the accepted notifications.channel values.
+// Worker is the only mode where the channel matters at startup;
+// api / dispatcher / relay / reaper handle every channel.
 var validChannels = map[string]struct{}{
 	"sms":   {},
 	"email": {},
 	"push":  {},
 }
 
-// Run is the worker binary's entry point. Phase 3 Chunk 7 collapses
-// the lifecycle to a single channel-parameterized path:
+// Run is the worker binary's entry point. The lifecycle is a single
+// channel-parameterized path:
 //
 //	config → telemetry → pgxpool → redis → ratelimit.Bucket → kgo
 //	consumer (group worker.<channel>, topic send.<channel>) →
@@ -92,15 +93,11 @@ func Run(cmd *cobra.Command, _ []string) error {
 // worker.<channel>, build the provider HTTP client, run Loop until
 // ctx is done, then unwind.
 //
-// Phase 3 Chunk 7 generalizes Phase 2's runSMS over the channel
-// parameter — the consumer group / topic shape from
-// docs/design/04-kafka.md §1 ("Consumer group: worker.<channel>")
-// becomes the only thing that varies between channels. The bucket's
-// per-channel scoping (via the channel argument to Acquire) means
-// one bucket per worker process is sufficient — no per-channel
-// bucket is needed at this scope.
-//
-// docs/phases/03-resilience.md §12 + §Chunk 7.
+// The consumer-group / topic shape ("worker.<channel>" /
+// "send.<channel>") is the only thing that varies between channels.
+// The bucket's per-channel scoping (via the channel argument to
+// Acquire) means one bucket per worker process is sufficient — no
+// per-channel bucket is needed at this scope.
 func runForChannel(ctx context.Context, channel string, cfg *config.Config, logger *slog.Logger, shutdownTelemetry func(context.Context) error) error {
 	pool, err := db.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -124,12 +121,20 @@ func runForChannel(ctx context.Context, channel string, cfg *config.Config, logg
 
 	provider := NewProvider(cfg.WebhookURL)
 
-	// Phase 5: per-binary metricsserver on cfg.MetricsAddr exposes
-	// /metrics + /healthz from the shared metrics.Registry(). One
-	// worker process = one /metrics endpoint, irrespective of the
-	// channel — every worker binary's metrics carry the channel as
-	// a label on the relevant series.
-	metricsHTTP := metricsserver.New(cfg.MetricsAddr, metrics.Registry(), nil)
+	// Per-binary metricsserver on cfg.MetricsAddr exposes /metrics +
+	// /healthz from the shared metrics.Registry(). /healthz reports
+	// the worker's three real deps: postgres (pgxpool), redis (the
+	// rate-limiter's bucket lives here), and kafka (the consumer's
+	// *kgo.Client.Ping issues a metadata request). One worker process
+	// = one /metrics + /healthz pair, irrespective of channel — every
+	// worker binary's metrics carry the channel as a label on the
+	// relevant series.
+	healthz := health.Handler(map[string]health.ProbeFunc{
+		"postgres": pool.Ping,
+		"redis":    func(ctx context.Context) error { return redisClient.Ping(ctx).Err() },
+		"kafka":    func(ctx context.Context) error { return consumer.Ping(ctx) },
+	})
+	metricsHTTP := metricsserver.New(cfg.MetricsAddr, metrics.Registry(), healthz)
 	metricsListenErr := make(chan error, 1)
 	go func() {
 		if err := metricsHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -138,19 +143,18 @@ func runForChannel(ctx context.Context, channel string, cfg *config.Config, logg
 		close(metricsListenErr)
 	}()
 
-	// Phase 5: the per-record worker.handleRecord span is opened
-	// from this tracer; it's bound to the global tracer provider
-	// that observability.Init installs above so spans flow through
-	// the configured exporter (stdout in dev, OTLP/gRPC against
-	// jaeger when OTEL_EXPORTER_OTLP_ENDPOINT is set).
+	// The per-record worker.handleRecord span is opened from this
+	// tracer; it's bound to the global tracer provider that
+	// observability.Init installs above so spans flow through the
+	// configured exporter (stdout in dev, OTLP/gRPC against jaeger
+	// when OTEL_EXPORTER_OTLP_ENDPOINT is set).
 	tracer := otel.Tracer(serviceName)
 
-	// Phase 5 §8.3: per-channel rate-limit token gauge sampler. Runs
-	// alongside Loop, scoped to the worker's --channel value. Every
-	// 5 s issues HGET rate:<channel> tokens against Redis and
-	// publishes onto rate_limit_tokens_available{channel}. Three
-	// worker binaries → three samplers → three (channel) time
-	// series.
+	// Per-channel rate-limit token gauge sampler. Runs alongside Loop,
+	// scoped to the worker's --channel value. Every 5 s issues
+	// HGET rate:<channel> tokens against Redis and publishes onto
+	// rate_limit_tokens_available{channel}. Three worker binaries →
+	// three samplers → three (channel) time series.
 	go publishRateLimitTokens(ctx, bucket, channel, logger)
 
 	logger.Info("started", "mode", serviceName, "channel", channel, "metrics_addr", cfg.MetricsAddr)
@@ -191,15 +195,14 @@ func runForChannel(ctx context.Context, channel string, cfg *config.Config, logg
 }
 
 // rateLimitSampleInterval is the cadence at which the rate-limit
-// token sampler ticker fires per docs/phases/05-observability.md
-// §8.3. 5 s matches the relay's outbox-lag sampler (§8.1) so the
-// two periodic gauges share an operator's mental model.
+// token sampler ticker fires. 5 s matches the relay's outbox-lag
+// sampler so the two periodic gauges share an operator's mental
+// model.
 const rateLimitSampleInterval = 5 * time.Second
 
 // publishRateLimitTokens samples the per-channel Redis token bucket
 // every rateLimitSampleInterval and publishes the count onto
-// metrics.RateLimitTokensAvailable{channel} per
-// docs/phases/05-observability.md §8.3.
+// metrics.RateLimitTokensAvailable{channel}.
 //
 // On Redis-down (bucket.Sample returns ratelimit.ErrRedisDown) the
 // gauge is left at its previous value — no log spam, no retry. The
@@ -222,7 +225,7 @@ func publishRateLimitTokens(ctx context.Context, bucket *ratelimit.Bucket, chann
 			tokens, err := bucket.Sample(ctx, channel)
 			if err != nil {
 				if errors.Is(err, ratelimit.ErrRedisDown) {
-					// Leave gauge unchanged per spec §8.3 — Acquire's
+					// Leave the gauge unchanged — Acquire's
 					// redis_error counter is the alertable signal.
 					continue
 				}
@@ -240,22 +243,19 @@ func publishRateLimitTokens(ctx context.Context, bucket *ratelimit.Bucket, chann
 	}
 }
 
-// consumerOpts returns the franz-go consumer settings locked by
-// docs/design/04-kafka.md §6 + docs/phases/03-resilience.md §Chunk 7:
+// consumerOpts returns the franz-go consumer settings used by the
+// worker:
 //
 //   - SeedBrokers: from cfg.KafkaBrokers.
-//   - ConsumerGroup("worker."+channel): one group per channel per
-//     docs/design/04-kafka.md §1.
+//   - ConsumerGroup("worker."+channel): one group per channel.
 //   - ConsumeTopics("send."+channel): the per-channel send topic.
-//   - DisableAutoCommit: manual commit after RecordOutcome returns nil
-//     (docs/phases/02-walking-skeleton.md §9 step 6, unchanged in
-//     Phase 3).
+//   - DisableAutoCommit: manual commit after RecordOutcome returns nil.
 //   - ConsumeResetOffset(NewOffset().AtStart()): auto.offset.reset =
-//     earliest per docs/design/04-kafka.md §6.
+//     earliest, so a worker that joins a fresh group reads from the
+//     beginning.
 //
 // Session timeout / heartbeat / fetch.max.bytes are left at franz-go
-// defaults per the same doc ("Session timeout / heartbeat | franz-go
-// defaults | No tuning at this scope").
+// defaults — there is no tuning at this scope.
 //
 // Exposed (lowercase) at the package level so loop_test.go can reuse
 // the same options against the testcontainer broker — keeps the test

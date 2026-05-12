@@ -1,9 +1,7 @@
-// Package relay implements the `notifications relay` subcommand. Phase 1
-// was a block-on-signal stub; phase 2 fills in the outbox-to-Kafka loop
-// documented in ARCHITECTURE_v3.md §6.4 and
-// docs/phases/02-walking-skeleton.md §8. The lifecycle skeleton (config,
-// logger, telemetry, signal handling, graceful shutdown) inherits from
-// phase 1.
+// Package relay implements the `notifications relay` subcommand.
+// The binary runs an outbox-to-Kafka loop (documented in
+// docs/ARCHITECTURE.md §6.4) on top of the shared lifecycle skeleton
+// (config, logger, telemetry, signal handling, graceful shutdown).
 package relay
 
 import (
@@ -22,6 +20,7 @@ import (
 
 	"github.com/tarkandikmen/notifications/internal/config"
 	"github.com/tarkandikmen/notifications/internal/db"
+	"github.com/tarkandikmen/notifications/internal/health"
 	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/metricsserver"
 	"github.com/tarkandikmen/notifications/internal/observability"
@@ -37,8 +36,6 @@ const (
 // binary's lifecycle: config -> logger -> telemetry -> pgxpool ->
 // franz-go client -> topic bootstrap -> Loop -> wait for signal ->
 // graceful shutdown.
-//
-// docs/phases/02-walking-skeleton.md §8 + §Repo layout.
 func Run(cmd *cobra.Command, _ []string) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -72,9 +69,17 @@ func Run(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("relay: bootstrap topics: %w", err)
 	}
 
-	// Phase 5: per-binary metricsserver on cfg.MetricsAddr exposes
-	// /metrics + /healthz from the shared metrics.Registry().
-	metricsHTTP := metricsserver.New(cfg.MetricsAddr, metrics.Registry(), nil)
+	// Per-binary metricsserver on cfg.MetricsAddr exposes /metrics +
+	// /healthz from the shared metrics.Registry(). /healthz reports
+	// postgres (pgxpool) + kafka (the producer *kgo.Client.Ping issues
+	// a metadata request, same admin shape as dispatcher / reaper's
+	// lagClient.Ping but using the producer client we already own — no
+	// second Kafka client needed).
+	healthz := health.Handler(map[string]health.ProbeFunc{
+		"postgres": pool.Ping,
+		"kafka":    func(ctx context.Context) error { return client.Ping(ctx) },
+	})
+	metricsHTTP := metricsserver.New(cfg.MetricsAddr, metrics.Registry(), healthz)
 	metricsListenErr := make(chan error, 1)
 	go func() {
 		if err := metricsHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -85,11 +90,11 @@ func Run(cmd *cobra.Command, _ []string) error {
 
 	logger.Info("started", "mode", serviceName, "metrics_addr", cfg.MetricsAddr)
 
-	// Phase 5: the per-tick relay.tick span is opened from this
-	// tracer; it's bound to the global tracer provider that
-	// observability.Init installs above so spans flow through the
-	// configured exporter (stdout in dev, OTLP/gRPC against jaeger
-	// when OTEL_EXPORTER_OTLP_ENDPOINT is set).
+	// The per-tick relay.tick span is opened from this tracer; it's
+	// bound to the global tracer provider that observability.Init
+	// installs above so spans flow through the configured exporter
+	// (stdout in dev, OTLP/gRPC against jaeger when
+	// OTEL_EXPORTER_OTLP_ENDPOINT is set).
 	tracer := otel.Tracer(serviceName)
 
 	st := store.New(pool)
@@ -161,16 +166,14 @@ func RunBootstrap(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-// producerOpts returns the franz-go options locked by
-// docs/design/04-kafka.md §5: acks=all (waits for every in-sync
-// replica, required by the publish-then-mark ordering's at-least-once
-// guarantee), snappy compression for batched payloads. Idempotent
-// production is enabled by default in franz-go when acks=all, so no
-// explicit opt-in is required (verified against
-// docs/design/04-kafka.md §5 row "Idempotent producer | enabled").
+// producerOpts returns the franz-go options the relay producer uses:
+// acks=all (waits for every in-sync replica, required by the
+// publish-then-mark ordering's at-least-once guarantee) and snappy
+// compression for batched payloads. Idempotent production is enabled
+// by default in franz-go when acks=all, so no explicit opt-in is
+// required.
 //
-// Linger / batch / max.in.flight are left at franz-go defaults per the
-// same doc.
+// Linger / batch / max.in.flight are left at franz-go defaults.
 func producerOpts(brokers []string) []kgo.Opt {
 	return []kgo.Opt{
 		kgo.SeedBrokers(brokers...),

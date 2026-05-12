@@ -10,11 +10,10 @@
 -- Returns {ok, wait_ms}:
 --   {1, 0}        — a token was deducted; caller proceeds.
 --   {0, wait_ms}  — no token was available; caller sleeps wait_ms (plus
---                   small jitter, clamped per docs/phases/03-resilience.md
---                   §1) before retrying.
+--                   small jitter, clamped) before retrying.
 --
 -- Atomic in Redis. Multiple worker instances share one key safely.
--- See ARCHITECTURE_v3.md §6.6.
+-- See docs/ARCHITECTURE.md §6.6.
 
 local key      = KEYS[1]
 local rate     = tonumber(ARGV[1])

@@ -5,9 +5,8 @@ import "encoding/json"
 // CreateRequest is the JSON body of POST /v1/notifications.
 //
 // Fields are all string-typed (or json.RawMessage) so absent and empty
-// collapse to the same shape; ValidateCreate enforces the per-field rules
-// from docs/phases/02-walking-skeleton.md §5. Unknown fields are ignored
-// per docs/design/03-api.md §Conventions.
+// collapse to the same shape; ValidateCreate enforces the per-field
+// rules. Unknown fields are ignored.
 type CreateRequest struct {
 	Channel        string          `json:"channel"`
 	Recipient      string          `json:"recipient"`
@@ -27,8 +26,6 @@ type CreateResponse struct {
 // BatchItem is one entry in BatchCreateRequest.Notifications. The field
 // set mirrors CreateRequest exactly so the per-item validation logic
 // is single-sourced via validateCreateItem (see internal/api/validation.go).
-//
-// docs/phases/04-api-completeness.md §2.
 type BatchItem struct {
 	Channel        string          `json:"channel"`
 	Recipient      string          `json:"recipient"`
@@ -40,9 +37,8 @@ type BatchItem struct {
 	IdempotencyKey string          `json:"idempotency_key"`
 }
 
-// BatchCreateRequest is the JSON body of POST /v1/notifications/batch
-// per docs/design/03-api.md §POST /v1/notifications/batch. Up to
-// batch_max items per request (rejected with 413 payload_too_large
+// BatchCreateRequest is the JSON body of POST /v1/notifications/batch.
+// Up to batchMax items per request (rejected with 413 payload_too_large
 // otherwise).
 type BatchCreateRequest struct {
 	Notifications []BatchItem `json:"notifications"`
@@ -56,17 +52,14 @@ type BatchCreateResponse struct {
 	IDs     []string `json:"ids"`
 }
 
-// FieldIssue is one entry in the validation_failed details[] array per
-// docs/design/03-api.md §Error model.
+// FieldIssue is one entry in the validation_failed details[] array.
 type FieldIssue struct {
 	Path  string `json:"path"`
 	Issue string `json:"issue"`
 }
 
 // IdempotencyConflictDetail is the single entry in the
-// duplicate_idempotency_keys details[] array per
-// docs/phases/02-walking-skeleton.md §3 step 5 and
-// docs/design/03-api.md §Error model.
+// duplicate_idempotency_keys details[] array.
 type IdempotencyConflictDetail struct {
 	IdempotencyKey string `json:"idempotency_key"`
 	ExistingID     string `json:"existing_id"`
@@ -75,16 +68,12 @@ type IdempotencyConflictDetail struct {
 
 // TerminalStateDetail is the single entry in the terminal_state
 // details[] array surfaced by POST /v1/notifications/{id}/cancel when
-// the row is already DELIVERED or FAILED. Per
-// docs/design/03-api.md §Error model.
-//
-// docs/phases/04-api-completeness.md §2.
+// the row is already DELIVERED or FAILED.
 type TerminalStateDetail struct {
 	CurrentStatus string `json:"current_status"`
 }
 
-// ErrorEnvelope is the canonical wrapper for every non-2xx response per
-// docs/design/03-api.md §Error model.
+// ErrorEnvelope is the canonical wrapper for every non-2xx response.
 type ErrorEnvelope struct {
 	Error ErrorBody `json:"error"`
 }
@@ -99,16 +88,15 @@ type ErrorBody struct {
 	Details []any  `json:"details,omitempty"`
 }
 
-// NotificationResponse is the JSON shape returned by GET, list, batch-get,
-// and cancel endpoints per docs/design/03-api.md §Notification
-// representation. The six omitempty fields (batch_id, content, template,
-// template_data, scheduled_at, failure_reason) are dropped from the JSON
-// when null per the same doc.
+// NotificationResponse is the JSON shape returned by GET, list,
+// batch-get, and cancel endpoints. The six omitempty fields (batch_id,
+// content, template, template_data, scheduled_at, failure_reason) are
+// dropped from the JSON when null.
 //
 // Attempts uses *[]AttemptResponse so the field can be either:
 //   - nil → dropped entirely from the wire by `omitempty` (used by list /
-//     batch-get / cancel responses, which the spec says do not include
-//     nested attempts).
+//     batch-get / cancel responses, which do not include nested
+//     attempts).
 //   - non-nil pointer to a (possibly empty) slice → encoded as `[]` or
 //     `[{...}, ...]` (used by the single-GET response, which always
 //     renders `attempts: []` for a brand-new row with zero attempts).
@@ -137,10 +125,9 @@ type NotificationResponse struct {
 	Attempts       *[]AttemptResponse `json:"attempts,omitempty"`
 }
 
-// ListResponse is the 200 body of GET /v1/notifications per
-// docs/design/03-api.md §GET /v1/notifications + §Pagination. List items
-// use the notification representation without nested attempts; the
-// handler builds them via renderNotificationWithoutAttempts.
+// ListResponse is the 200 body of GET /v1/notifications. List items use
+// the notification representation without nested attempts; the handler
+// builds them via renderNotificationWithoutAttempts.
 type ListResponse struct {
 	Notifications []NotificationResponse `json:"notifications"`
 	Offset        int                    `json:"offset"`
@@ -148,9 +135,8 @@ type ListResponse struct {
 	HasMore       bool                   `json:"has_more"`
 }
 
-// BatchGetResponse is the 200 body of GET /v1/batches/{id} per
-// docs/design/03-api.md §GET /v1/batches/{id}. Items use the no-attempts
-// notification representation.
+// BatchGetResponse is the 200 body of GET /v1/batches/{id}. Items use
+// the no-attempts notification representation.
 type BatchGetResponse struct {
 	BatchID       string                 `json:"batch_id"`
 	Notifications []NotificationResponse `json:"notifications"`
@@ -158,8 +144,7 @@ type BatchGetResponse struct {
 
 // AttemptResponse is one item in NotificationResponse.Attempts. The four
 // omitempty fields (finished_at, classification, error_message, response)
-// are dropped from the JSON when null per docs/design/03-api.md
-// §Nested attempts.
+// are dropped from the JSON when null.
 type AttemptResponse struct {
 	Attempt        int             `json:"attempt"`
 	StartedAt      string          `json:"started_at"`

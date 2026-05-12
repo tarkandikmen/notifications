@@ -11,9 +11,7 @@ import (
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
-// handleGetBatch implements GET /v1/batches/{id} per
-// docs/design/03-api.md §GET /v1/batches/{id} and
-// docs/phases/04-api-completeness.md §6.
+// handleGetBatch implements GET /v1/batches/{id}.
 //
 // Behavior:
 //
@@ -22,8 +20,7 @@ import (
 //  2. Call deps.Store.GetBatch. ErrNotFound → 404; other errors →
 //     500 internal_error.
 //  3. Render rows via renderNotificationWithoutAttempts (no nested
-//     attempts per docs/design/03-api.md §Notification representation),
-//     respond 200 with the BatchGetResponse envelope.
+//     attempts), respond 200 with the BatchGetResponse envelope.
 //
 // The store enforces "no rows = ErrNotFound" so the handler never has
 // to discriminate empty-match from missing-batch.
@@ -59,11 +56,10 @@ func handleGetBatch(deps Deps) http.HandlerFunc {
 	}
 }
 
-// handleCancel implements POST /v1/notifications/{id}/cancel per
-// docs/design/03-api.md §POST /v1/notifications/{id}/cancel and
-// docs/phases/04-api-completeness.md §7. Transitions T3 (PENDING →
-// CANCELLED, emit events.notification) and T11 (DISPATCHED → CANCELLED,
-// no emit) are owned by the store; the handler is a thin translator.
+// handleCancel implements POST /v1/notifications/{id}/cancel.
+// Transitions T3 (PENDING → CANCELLED, emit events.notification) and
+// T11 (DISPATCHED → CANCELLED, no emit) are owned by the store; the
+// handler is a thin translator.
 //
 // Behavior:
 //
@@ -78,22 +74,18 @@ func handleGetBatch(deps Deps) http.HandlerFunc {
 //     with renderNotificationWithoutAttempts(n). The wire shape is
 //     identical for all three; the client cannot distinguish
 //     "cancelled by this call" from "was already cancelled" by the
-//     response shape alone, which is the intended idempotent contract
-//     per docs/design/03-api.md.
+//     response shape alone, which is the intended idempotent contract.
 //
 // Best-effort concurrency note: a T11 cancel may be silently
 // overwritten by a worker outcome (T4–T8) on the row's current
-// attempt; the realized state surfaces via a subsequent GET. See
-// docs/phases/04-api-completeness.md §7 Concurrency note and
-// docs/design/02-state-machine.md §Cancellation race.
+// attempt; the realized state surfaces via a subsequent GET.
 //
-// docs/phases/05-observability.md §1.1 (api_cancellations_total row)
-// adds the per-branch counter increment so a missing increment
-// surfaces as a counter-shape regression in cancel_test.go. Branch
-// label values match the locked vocabulary: t3_pending,
-// t11_dispatched, idempotent_no_op (success branches; the store's
-// CancelTransition return discriminates them since the wire shape is
-// identical), terminal_state, not_found.
+// Each branch increments the api_cancellations_total counter with the
+// matching transition label so a missing increment surfaces as a
+// counter-shape regression in cancel_test.go. Branch label values:
+// t3_pending, t11_dispatched, idempotent_no_op (success branches; the
+// store's CancelTransition return discriminates them since the wire
+// shape is identical), terminal_state, not_found.
 func handleCancel(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := uuid.Parse(r.PathValue("id"))
@@ -134,8 +126,8 @@ func handleCancel(deps Deps) http.HandlerFunc {
 }
 
 // writeTerminalState writes the canonical 409 terminal_state envelope
-// per docs/design/03-api.md §Error model with one TerminalStateDetail
-// carrying the row's observed terminal status.
+// with one TerminalStateDetail carrying the row's observed terminal
+// status.
 func writeTerminalState(w http.ResponseWriter, currentStatus string) {
 	writeJSON(w, http.StatusConflict, ErrorEnvelope{
 		Error: ErrorBody{

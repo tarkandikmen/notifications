@@ -1,7 +1,6 @@
 // Package kafkaadmin wraps franz-go's kadm client with a narrow helper —
 // MaxLag — that the dispatcher's circuit breaker and the reaper's cycle
-// skip both depend on per docs/design/02-state-machine.md §Transitions
-// (rows T2, T9, T10) and §Lag-query failure semantics.
+// skip both depend on for backpressure on transitions T2, T9, and T10.
 //
 // The wrapper is intentionally minimal: one struct, one read method.
 // Owning the Kafka admin lifecycle here keeps the dispatcher and reaper
@@ -21,13 +20,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// defaultLagQueryTimeout is the per-call ceiling on a MaxLag invocation,
-// inlined from docs/design/07-constants.md §H
-// (kafka_admin_lag_query_timeout = 5 s). Documented here so a future
-// caller that forgets to wrap ctx with its own deadline still gets a
-// bounded request; the dispatcher and reaper also wrap ctx at the call
-// site (per docs/phases/03-resilience.md §7 / §8), and the earlier of
-// the two deadlines wins.
+// defaultLagQueryTimeout is the per-call ceiling on a MaxLag
+// invocation. Set on the struct so a future caller that forgets to
+// wrap ctx with its own deadline still gets a bounded request; the
+// dispatcher and reaper also wrap ctx at the call site, and the
+// earlier of the two deadlines wins.
 const defaultLagQueryTimeout = 5 * time.Second
 
 // LagClient queries Kafka admin for consumer-group lag.
@@ -47,11 +44,9 @@ type LagClient struct {
 // kgo.Client is built with kgo.SeedBrokers only — no producer / consumer
 // options — because this client is admin-only.
 //
-// Caller is expected to wrap ctx with a deadline per
-// docs/phases/03-resilience.md §7 (dispatcher) and §8 (reaper) before
-// calling MaxLag; the struct's timeout field is informational and
-// documents the constant from docs/design/07-constants.md §H
-// (kafka_admin_lag_query_timeout).
+// Caller is expected to wrap ctx with a deadline before calling
+// MaxLag; the struct's timeout field is informational and exposes
+// the package's default ceiling to callers via Timeout().
 func New(brokers []string) (*LagClient, error) {
 	if len(brokers) == 0 {
 		return nil, errors.New("kafkaadmin: no brokers configured")
@@ -78,10 +73,27 @@ func (l *LagClient) Close() {
 	l.raw.Close()
 }
 
+// Ping issues a metadata request against the underlying *kgo.Client and
+// returns the first broker error. Used by every binary's /healthz probe
+// (api, dispatcher, reaper) where this LagClient is the binary's
+// existing Kafka admin handle; the relay binary uses its producer
+// *kgo.Client directly.
+//
+// Safe on a nil receiver so cmd.go can wire `lagClient.Ping` into a
+// health.Handler before the constructor has returned successfully —
+// returning a deterministic error is preferable to nil-deref panicking
+// inside the /healthz request goroutine.
+func (l *LagClient) Ping(ctx context.Context) error {
+	if l == nil || l.raw == nil {
+		return errors.New("kafkaadmin: lag client not initialized")
+	}
+	return l.raw.Ping(ctx)
+}
+
 // Timeout returns the per-call timeout this LagClient was configured
 // with. Callers (dispatcher + reaper cmd.go) use it to set their
-// Deps.LagTimeout so the constant from docs/design/07-constants.md §H
-// lives in exactly one place.
+// Deps.LagTimeout so the lag-query timeout constant lives in exactly
+// one place.
 func (l *LagClient) Timeout() time.Duration {
 	if l == nil {
 		return defaultLagQueryTimeout
@@ -95,8 +107,8 @@ func (l *LagClient) Timeout() time.Duration {
 // Lag semantics:
 //
 //   - A partition with no committed offset is treated as committed = 0
-//     (a new consumer would start at the log's start offset under the
-//     locked auto.offset.reset=earliest from docs/design/04-kafka.md §6).
+//     (a new consumer starts at the log's start offset under the
+//     auto.offset.reset=earliest the consumers are configured with).
 //     The dispatcher's fail-open posture means a fresh group with a
 //     fully-stocked topic correctly reports the full backlog as lag.
 //   - A group / topic combination with no end-offset entries (topic
@@ -104,9 +116,8 @@ func (l *LagClient) Timeout() time.Duration {
 //     unborn or empty, and there is no lag to circuit-break on.
 //   - Per-partition errors (UnknownTopicOrPartition, etc.) on either
 //     the fetch-offsets or list-end-offsets calls surface as
-//     (-1, error). Callers translate per their fail-open / fail-closed
-//     policy from docs/design/02-state-machine.md §Lag-query failure
-//     semantics.
+//     (-1, error). Callers translate per their fail-open
+//     (dispatcher) / fail-closed (reaper) policy.
 //
 // Two admin round trips per call (FetchOffsetsForTopics + ListEndOffsets)
 // rather than the convenience kadm.Client.Lag, because kadm's Lag walks
@@ -122,12 +133,12 @@ func (l *LagClient) MaxLag(ctx context.Context, group, topic string) (int64, err
 	fetched, err := l.client.FetchOffsetsForTopics(ctx, group, topic)
 	if err != nil {
 		// A group that has never had any member or commit surfaces as
-		// one of the "no coordinator yet" / "group unknown" errors. Per
-		// docs/phases/03-resilience.md §7 the empty-group disposition
-		// is "no committed offsets → treat as committed = 0," not
-		// "return an error." Falling through with an empty fetched
-		// map produces exactly that: every partition's Lookup misses
-		// and defaults to committed = 0, so lag = end_offset.
+		// one of the "no coordinator yet" / "group unknown" errors.
+		// The empty-group disposition is "no committed offsets →
+		// treat as committed = 0," not "return an error." Falling
+		// through with an empty fetched map produces exactly that:
+		// every partition's Lookup misses and defaults to committed
+		// = 0, so lag = end_offset.
 		if !isUninitializedGroupErr(err) {
 			return -1, fmt.Errorf("kafkaadmin: fetch offsets: %w", err)
 		}
@@ -189,10 +200,9 @@ func (l *LagClient) MaxLag(ctx context.Context, group, topic string) (int64, err
 // isUninitializedGroupErr identifies the family of broker responses
 // that mean "the consumer group has never been registered with this
 // cluster" — there is no coordinator elected, no metadata stored, no
-// commits to fetch. Per docs/phases/03-resilience.md §7 this is the
-// "empty group → no committed offsets → committed = 0" disposition;
-// the caller falls through with an empty fetched map rather than
-// returning an error.
+// commits to fetch. This is the "empty group → no committed offsets
+// → committed = 0" disposition; the caller falls through with an
+// empty fetched map rather than returning an error.
 //
 // We treat all four codes as the same disposition because the broker's
 // internal state machine moves through them as a group spins up (load
@@ -201,8 +211,7 @@ func (l *LagClient) MaxLag(ctx context.Context, group, topic string) (int64, err
 // reaper. A genuine outage where a real coordinator is unreachable
 // produces a network-layer error rather than these protocol codes; it
 // continues to surface as a wrapped error, triggering the dispatcher's
-// fail-open / reaper's fail-closed branches per
-// docs/design/02-state-machine.md §Lag-query failure semantics.
+// fail-open / reaper's fail-closed branches.
 func isUninitializedGroupErr(err error) bool {
 	return errors.Is(err, kerr.CoordinatorNotAvailable) ||
 		errors.Is(err, kerr.CoordinatorLoadInProgress) ||

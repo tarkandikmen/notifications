@@ -21,7 +21,7 @@ func validRequest() CreateRequest {
 	return CreateRequest{
 		Channel:        "sms",
 		Recipient:      "+905551234567",
-		Content:        "phase 2 happy path",
+		Content:        "happy path",
 		IdempotencyKey: "00000000-0000-4000-8000-000000000001",
 	}
 }
@@ -65,8 +65,8 @@ func TestValidateCreate_Channel(t *testing.T) {
 	}{
 		{"empty channel", "", "+905551234567", "ok", false, "required"},
 		{"sms accepted", "sms", "+905551234567", "ok", true, ""},
-		{"email accepted in phase 3", "email", "u@example.com", "ok", true, ""},
-		{"push accepted in phase 3", "push", strings.Repeat("a", recipientPushMin), "ok", true, ""},
+		{"email accepted", "email", "u@example.com", "ok", true, ""},
+		{"push accepted", "push", strings.Repeat("a", recipientPushMin), "ok", true, ""},
 		{"unknown rejected", "fax", "anything", "ok", false, "must be"},
 		{"uppercase channel rejected", "SMS", "+905551234567", "ok", false, "must be"},
 	}
@@ -89,9 +89,8 @@ func TestValidateCreate_Channel(t *testing.T) {
 }
 
 // TestValidateCreate_Recipient_Email exercises the per-channel email
-// recipient validator added in Phase 3 Chunk 7. The regex is
-// intentionally permissive (no full RFC 5322 enforcement) per
-// docs/design/03-api.md §Validation rules row `email`.
+// recipient validator. The regex is intentionally permissive (no full
+// RFC 5322 enforcement).
 func TestValidateCreate_Recipient_Email(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -128,7 +127,7 @@ func TestValidateCreate_Recipient_Email(t *testing.T) {
 
 // TestValidateCreate_Recipient_Push exercises the per-channel push
 // token validator. Push tokens are opaque per provider; the rule is
-// length-only with the bounds from docs/design/07-constants.md §G.
+// length-only.
 func TestValidateCreate_Recipient_Push(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -231,9 +230,8 @@ func TestValidateCreate_Content(t *testing.T) {
 }
 
 // TestValidateCreate_Content_PerChannelCaps locks the per-channel
-// content cap boundaries from docs/design/07-constants.md §G:
-// SMS = 1600, email = 100000, push = 4000. The boundary cases prove
-// the cap is exclusive of the +1th rune.
+// content cap boundaries: SMS = 1600, email = 100000, push = 4000.
+// The boundary cases prove the cap is exclusive of the +1th rune.
 func TestValidateCreate_Content_PerChannelCaps(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -669,8 +667,7 @@ func TestParseListRequest_AllFiltersAtOnce(t *testing.T) {
 
 // TestParseListRequest_AllInvalidParamsAtOnce verifies issues do NOT
 // short-circuit: a single parse pass surfaces every bad param at once,
-// matching the rest-of-validator posture from
-// docs/design/03-api.md §Error model.
+// matching the rest-of-validator posture.
 func TestParseListRequest_AllInvalidParamsAtOnce(t *testing.T) {
 	q := "offset=-1&limit=0&status=garbage&channel=fax&priority=urgent&batch_id=nope&created_after=tomorrow&created_before=yesterday"
 	req := httptest.NewRequest("GET", "/v1/notifications?"+q, nil)
@@ -682,10 +679,10 @@ func TestParseListRequest_AllInvalidParamsAtOnce(t *testing.T) {
 	}
 }
 
-// TestParseListRequest_UnknownParamsIgnored locks the behavior from
-// docs/design/03-api.md §Conventions ("Unknown request body fields are
-// ignored") applied symmetrically to the query string. A future
-// query-param widening (e.g., template_id) doesn't break older clients.
+// TestParseListRequest_UnknownParamsIgnored locks the
+// "unknown request body fields are ignored" behavior applied
+// symmetrically to the query string. A future query-param widening
+// (e.g., template_id) doesn't break older clients.
 func TestParseListRequest_UnknownParamsIgnored(t *testing.T) {
 	req := httptest.NewRequest("GET", "/v1/notifications?garbage=ignored&also_garbage=42", nil)
 	got, issues := parseListRequest(req)
@@ -739,8 +736,7 @@ func TestValidateBatchCreate_EmptyBatch(t *testing.T) {
 // TestValidateBatchCreate_OversizedBatch_ShortCircuits asserts an
 // oversize batch produces ONLY the "batch size exceeded" issue. The
 // per-item walk is skipped — the handler routes the single short-
-// circuit issue to 413 payload_too_large directly per
-// docs/phases/04-api-completeness.md §3.1.
+// circuit issue to 413 payload_too_large directly.
 func TestValidateBatchCreate_OversizedBatch_ShortCircuits(t *testing.T) {
 	items := make([]BatchItem, batchMax+1)
 	for i := range items {

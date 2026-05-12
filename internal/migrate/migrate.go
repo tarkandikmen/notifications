@@ -13,8 +13,6 @@ import (
 
 // Up applies every pending migration found at sourceURL against databaseURL.
 // A no-op (migrate.ErrNoChange) is treated as success.
-//
-// docs/phases/01-foundation.md §5 locks this signature.
 func Up(databaseURL, sourceURL string) error {
 	m, err := migrate.New(sourceURL, databaseURL)
 	if err != nil {

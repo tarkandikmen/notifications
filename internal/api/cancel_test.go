@@ -48,8 +48,7 @@ func cancelledRow(t *testing.T, idStr string) store.Notification {
 }
 
 // postNoBody is the cancel-handler counterpart of postJSON: the cancel
-// endpoint accepts a POST with an empty body per
-// docs/design/03-api.md §POST /v1/notifications/{id}/cancel.
+// endpoint accepts a POST with an empty body.
 func postNoBody(t *testing.T, url string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url, nil)
@@ -69,7 +68,7 @@ func TestHandleCancel_PendingPath_200(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+row.ID.String()+"/cancel")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -88,7 +87,7 @@ func TestHandleCancel_PendingPath_200(t *testing.T) {
 // against a notification that was DISPATCHED at cancel time. The wire
 // shape is identical to T3 — Status reads as CANCELLED post-trigger;
 // the client cannot tell T3 from T11 from the response shape (and is
-// not meant to, per docs/design/03-api.md §POST /v1/notifications/{id}/cancel).
+// not meant to).
 func TestHandleCancel_DispatchedPath_200(t *testing.T) {
 	row := cancelledRow(t, "01890000-0000-7000-8000-000000000c02")
 	row.Attempt = 1
@@ -96,7 +95,7 @@ func TestHandleCancel_DispatchedPath_200(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+row.ID.String()+"/cancel")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -116,7 +115,7 @@ func TestHandleCancel_AlreadyCancelled_200_Idempotent(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+row.ID.String()+"/cancel")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	var got NotificationResponse
@@ -125,17 +124,16 @@ func TestHandleCancel_AlreadyCancelled_200_Idempotent(t *testing.T) {
 }
 
 // TestHandleCancel_AttemptsOmitted asserts the cancel response body
-// omits the nested attempts key per docs/design/03-api.md §Notification
-// representation ("List, batch, and cancel responses do not include
-// nested attempts"). The single-GET handler is the only path that
-// renders attempts.
+// omits the nested attempts key (list, batch, and cancel responses do
+// not include nested attempts). The single-GET handler is the only
+// path that renders attempts.
 func TestHandleCancel_AttemptsOmitted(t *testing.T) {
 	row := cancelledRow(t, "01890000-0000-7000-8000-000000000c04")
 	fs := &fakeStore{cancelRow: row, cancelTransition: store.CancelTransitionT3Pending}
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+row.ID.String()+"/cancel")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	body, err := io.ReadAll(resp.Body)
@@ -150,7 +148,7 @@ func TestHandleCancel_AttemptsOmitted(t *testing.T) {
 // TestHandleCancel_DeliveredTerminalState_409 wires the fake to return
 // *store.TerminalStateError{CurrentStatus: "DELIVERED"}. The response
 // must be 409 with one details[] entry carrying current_status =
-// "DELIVERED" per docs/design/03-api.md §Error model.
+// "DELIVERED".
 func TestHandleCancel_DeliveredTerminalState_409(t *testing.T) {
 	fs := &fakeStore{
 		cancelErr: &store.TerminalStateError{CurrentStatus: "DELIVERED"},
@@ -159,7 +157,7 @@ func TestHandleCancel_DeliveredTerminalState_409(t *testing.T) {
 
 	id := "01890000-0000-7000-8000-000000000c05"
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+id+"/cancel")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusConflict, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -180,7 +178,7 @@ func TestHandleCancel_FailedTerminalState_409(t *testing.T) {
 
 	id := "01890000-0000-7000-8000-000000000c06"
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+id+"/cancel")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusConflict, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -198,7 +196,7 @@ func TestHandleCancel_NotFound_MissingRow(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/01890000-0000-7000-8000-000000000c07/cancel")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -213,7 +211,7 @@ func TestHandleCancel_NotFound_MalformedID(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/not-a-uuid/cancel")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	assert.Zero(t, fs.cancelCalled, "store must not be called for a malformed path id")
@@ -226,7 +224,7 @@ func TestHandleCancel_StoreError_500(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/01890000-0000-7000-8000-000000000c08/cancel")
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -234,8 +232,7 @@ func TestHandleCancel_StoreError_500(t *testing.T) {
 }
 
 // TestHandleCancel_EmptyBodyAccepted insists the cancel endpoint
-// accepts a POST with an empty body per docs/design/03-api.md
-// §POST /v1/notifications/{id}/cancel ("Request body: empty"). A
+// accepts a POST with an empty body ("Request body: empty"). A
 // Content-Type-less POST with no body must succeed.
 func TestHandleCancel_EmptyBodyAccepted(t *testing.T) {
 	row := cancelledRow(t, "01890000-0000-7000-8000-000000000c09")
@@ -246,7 +243,7 @@ func TestHandleCancel_EmptyBodyAccepted(t *testing.T) {
 	require.NoError(t, err)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
@@ -266,14 +263,12 @@ func decodeTerminalStateDetail(t *testing.T, raw any) TerminalStateDetail {
 // TestHandleCancel_IncrementsTransitionCounter exercises every
 // branch of handleCancel and asserts the api_cancellations_total
 // counter for the matching transition label increments by 1. A
-// missing increment surfaces as a counter-shape regression here per
-// docs/phases/05-observability.md §11.
+// missing increment surfaces as a counter-shape regression here.
 //
 // Each subtest reads the BEFORE counter for its specific transition
 // label (the registry is process-shared), runs the request, and
-// asserts AFTER == BEFORE+1. Locked transition vocabulary:
-// t3_pending, t11_dispatched, idempotent_no_op, terminal_state,
-// not_found per docs/phases/05-observability.md §1.1.
+// asserts AFTER == BEFORE+1. Transition vocabulary: t3_pending,
+// t11_dispatched, idempotent_no_op, terminal_state, not_found.
 func TestHandleCancel_IncrementsTransitionCounter(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -338,7 +333,7 @@ func TestHandleCancel_IncrementsTransitionCounter(t *testing.T) {
 
 			srv := newTestServer(t, tc.fs)
 			resp := postNoBody(t, srv.URL+tc.path)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			after := cancelCounterValue(t, tc.transition)
 			assert.Equal(t, before+1, after, "api_cancellations_total{transition=%q} must increment by 1", tc.transition)

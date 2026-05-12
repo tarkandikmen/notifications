@@ -19,13 +19,14 @@ import (
 )
 
 // redisDownBackoff is the wait the worker sits on after a rate-limit
-// Acquire returns ratelimit.ErrRedisDown per docs/phases/03-resilience.md
-// §2.4 step 5 ("sleep 1 s"). The wait is cancellable so a graceful
-// shutdown during a Redis outage isn't blocked behind the timer.
+// Acquire returns ratelimit.ErrRedisDown. The wait is cancellable so
+// a graceful shutdown during a Redis outage isn't blocked behind the
+// timer.
 const redisDownBackoff = 1 * time.Second
 
-// Phase 2 worker payload schema versions. Bumping either is a breaking
-// change and must be coordinated with docs/design/04-kafka.md §7.
+// Worker payload schema versions. Bumping either is a breaking
+// change to the wire schema and must be coordinated with every
+// downstream consumer.
 const (
 	sendPayloadVersion  = 1
 	eventPayloadVersion = 1
@@ -33,14 +34,12 @@ const (
 
 // previousStatusDispatched is the previous_status value the worker
 // always emits — the worker only acts on rows the dispatcher set to
-// DISPATCHED via T2 (docs/design/02-state-machine.md §State-driving
-// components). Even in the superseded-attempt edge case where the
-// attempt-guarded UPDATE matches zero rows, the worker's view at
+// DISPATCHED via T2. Even in the superseded-attempt edge case where
+// the attempt-guarded UPDATE matches zero rows, the worker's view at
 // poll time was DISPATCHED.
 const previousStatusDispatched = "DISPATCHED"
 
-// occurredAtFormat is the RFC 3339 + millisecond layout from
-// docs/design/04-kafka.md §Conventions
+// occurredAtFormat is the RFC 3339 + millisecond layout
 // ("2026-05-10T11:13:00.123Z"). Always called against a UTC time so
 // the trailing zone marker renders as "Z".
 const occurredAtFormat = "2006-01-02T15:04:05.000Z07:00"
@@ -70,12 +69,12 @@ type Sender interface {
 // does not exercise rate-limit semantics) or a fake that returns
 // ratelimit.ErrRedisDown (when the test exercises the redis-down branch).
 //
-// Acquire's contract matches docs/phases/03-resilience.md §1:
+// Acquire's contract:
 //
 //   - nil on success (a token was deducted; caller proceeds to the
 //     provider call).
 //   - ratelimit.ErrRedisDown on a Redis call failure (caller pauses
-//     processing per ARCHITECTURE_v3.md §6.6 — Kafka redelivers).
+//     processing per docs/ARCHITECTURE.md §6.6 — Kafka redelivers).
 //   - ctx.Err() on cancellation (graceful shutdown; caller returns
 //     without committing the Kafka offset).
 type Limiter interface {
@@ -89,9 +88,8 @@ type Limiter interface {
 //
 // Channel labels every log line and is the per-channel key the rate
 // limiter scopes against (final Redis key shape "rate:<channel>" per
-// ARCHITECTURE_v3.md §6.6). Phase 2 shipped only `sms`; Phase 3 wires
-// the Limiter and keeps the channel default; Phase 3 Chunk 7 widens
-// cmd.go to set the field per --channel value.
+// docs/ARCHITECTURE.md §6.6). cmd.go sets the field from the
+// --channel flag value.
 //
 // Limiter is required — applyDefaults panics when it is nil. Production
 // wiring always provides one (cmd.go builds a *ratelimit.Bucket from
@@ -101,8 +99,6 @@ type Limiter interface {
 // dispatcher / relay / reaper convention. Production (cmd.go) injects
 // otel.Tracer(serviceName) backed by the global tracer provider; tests
 // inject a noop tracer or an in-memory tracetest provider.
-//
-// docs/phases/05-observability.md §7.
 type Deps struct {
 	Store    *store.Store
 	Consumer Consumer
@@ -115,11 +111,10 @@ type Deps struct {
 }
 
 // sendPayload is the JSON shape the worker consumes from
-// `send.<channel>` per docs/design/04-kafka.md §1. The fields and
-// nullability map 1:1 onto the spec; unknown fields are tolerated by
-// json.Unmarshal (Phase 2 doesn't strict-mode the decode — additive
-// schema evolution per docs/design/04-kafka.md §7 must continue to
-// roll forward).
+// `send.<channel>`. Unknown fields are tolerated by json.Unmarshal
+// (the decode is not strict-mode), so additive schema evolution can
+// roll forward without the worker rejecting payloads it doesn't yet
+// understand.
 type sendPayload struct {
 	Version      int             `json:"version"`
 	ID           string          `json:"id"`
@@ -133,18 +128,16 @@ type sendPayload struct {
 }
 
 // eventPayload is the JSON shape the worker emits to
-// `events.notification` per docs/design/04-kafka.md §2.
+// `events.notification`.
 //
 // classification is `string` (not `*string`) because the worker is
 // the only emitter for which classification is guaranteed non-null
-// (docs/design/04-kafka.md §2 row "classification | string \| null |
-// Set when the worker emits (T4–T8); null for T3 and T10."). The
-// reaper / api emitters use their own payload constructors.
+// (the worker emits T4–T8; classification is null for T3 and T10).
+// The reaper / api emitters use their own payload constructors.
 //
-// failure_reason / batch_id stay `*string` so Phase 2 always renders
-// them as JSON null (the spec example shows `"failure_reason": null`
-// on success / transient outcomes, and Phase 2 single-creates have no
-// batch_id).
+// failure_reason / batch_id stay `*string` so the worker always
+// renders them as JSON null on success / transient outcomes and on
+// single-creates that have no batch_id.
 type eventPayload struct {
 	Version        int     `json:"version"`
 	ID             string  `json:"id"`
@@ -160,17 +153,14 @@ type eventPayload struct {
 
 // Loop drives the consume → provider → RecordOutcome cycle until ctx
 // is cancelled. Returns nil on graceful shutdown; never returns an
-// error in Phase 2 — every per-record failure is either committed and
-// skipped (decode failures, the Phase 3 DLQ source) or left
-// uncommitted for Kafka to redeliver (RecordOutcome failures).
+// error — every per-record failure is either committed and skipped
+// (decode failures route to the DLQ disposition) or left uncommitted
+// for Kafka to redeliver (RecordOutcome failures).
 //
-// The loop name avoids colliding with the package's cobra-bound Run
-// from cmd.go — same convention as internal/dispatcher/loop.go and
-// internal/relay/loop.go (the spec writes "loop.Run(ctx, deps)" in
-// docs/phases/02-walking-skeleton.md §Repo layout, but loop.go and
-// cmd.go share a package).
-//
-// docs/phases/02-walking-skeleton.md §9.
+// The entry point is named Loop (not Run) because loop.go and cmd.go
+// share a package and cmd.go owns the cobra-bound Run — same
+// convention as internal/dispatcher/loop.go and
+// internal/relay/loop.go.
 func Loop(ctx context.Context, deps Deps) error {
 	deps = applyDefaults(deps)
 
@@ -195,8 +185,8 @@ func Loop(ctx context.Context, deps Deps) error {
 		// during the poll — that's a graceful shutdown, not a fault.
 		// Other errors (broker unreachable, coordinator unavailable,
 		// per-partition fetch error) get a warn log and the loop
-		// continues; Phase 3 routes the consistent-broker-down case
-		// through metrics.
+		// continues; the consistent-broker-down case shows up on the
+		// fetch-error metrics.
 		for _, fe := range fetches.Errors() {
 			if errors.Is(fe.Err, context.Canceled) || errors.Is(fe.Err, context.DeadlineExceeded) {
 				deps.Logger.InfoContext(ctx, "loop stopped",
@@ -219,8 +209,7 @@ func Loop(ctx context.Context, deps Deps) error {
 	}
 }
 
-// handleRecord processes one Kafka record per the Phase 3 pipeline
-// from docs/phases/03-resilience.md §2.4. The locked step order is:
+// handleRecord processes one Kafka record. The locked step order is:
 //
 //  1. Decode + schema validation (decode_failed / schema_mismatch /
 //     missing_field / panic). Failures route to T8
@@ -235,16 +224,14 @@ func Loop(ctx context.Context, deps Deps) error {
 //     the offset uncommitted — Layer 2 catches the redelivery.
 //  7. Commit Kafka offset.
 //
-// Phase 5 instruments every branch:
+// Every branch is instrumented:
 //
 //   - worker.handleRecord span (parent = propagated Kafka trace context
 //     when present) wraps the full disposition with span events at each
 //     step boundary.
 //   - worker_records_consumed_total{channel} increments at the top.
 //   - worker_records_processed_total{channel, outcome} fires from
-//     the deferred closure on every terminal disposition (the
-//     locked outcome enum from docs/phases/05-observability.md
-//     §1.1 worker rows).
+//     the deferred closure on every terminal disposition.
 //   - per-step histograms / counters layered on the appropriate
 //     branches.
 func handleRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
@@ -262,8 +249,8 @@ func handleRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 	// outcome is the worker_records_processed_total label this record
 	// terminates with. Leave empty for the ctx-cancellation branches
 	// (graceful shutdown) — those are not "terminal dispositions" of
-	// the record per the locked enum in docs/phases/05-observability.md
-	// §1.1; the record will redeliver on the next worker session.
+	// the record; the record will redeliver on the next worker
+	// session.
 	outcome := ""
 	defer func() {
 		if outcome != "" {
@@ -280,9 +267,7 @@ func handleRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 	if errCode != "" {
 		// T8 path: route the corrupt message to send.<channel>.dlq
 		// (and, when the payload identified a target row, transition
-		// it to FAILED + emit events.notification) per
-		// docs/design/06-idempotency.md §T8 +
-		// docs/phases/03-resilience.md §4.
+		// it to FAILED + emit events.notification).
 		setSpanNotificationIDFromBrokerRecord(span, rec, msg)
 		span.SetAttributes(attribute.String("decode.error_code", errCode))
 		outcome = handleUnprocessable(ctx, deps, rec, msg, errCode, errDetails)
@@ -319,14 +304,17 @@ func handleRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 	// Layer 1: state guard. The read is non-transactional; Layer 2 +
 	// Layer 3 are the actual race-safety mechanisms. A Postgres call
 	// failure here surfaces as an error and leaves the offset
-	// uncommitted (Kafka redelivers).
+	// uncommitted: a worker restart or consumer rebalance redelivers
+	// the record, and within a stable session the reaper recovers the
+	// row after the stuck threshold (see redis-down branch below for
+	// the same recovery posture).
 	span.AddEvent("layer1.start")
 	guardStart := time.Now()
 	guard, err := CheckStateGuard(ctx, deps.Store, notificationID, msg.Attempt)
 	metrics.WorkerStateGuardDuration.WithLabelValues(deps.Channel).Observe(time.Since(guardStart).Seconds())
 	if err != nil {
 		span.RecordError(err)
-		deps.Logger.ErrorContext(ctx, "worker: state guard read failed; will be redelivered",
+		deps.Logger.ErrorContext(ctx, "worker: state guard read failed; offset uncommitted, reaper will recover the row after the stuck threshold",
 			"id", msg.ID,
 			"attempt", msg.Attempt,
 			"err", err,
@@ -349,8 +337,7 @@ func handleRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 	}
 
 	// Layer 2: separate-tx INSERT. started_at uses the worker's clock
-	// (deps.Clock) per docs/design/06-idempotency.md §Layer 2 +
-	// docs/phases/03-resilience.md §2.2.
+	// (deps.Clock).
 	span.AddEvent("layer2.start")
 	startedAt := deps.Clock()
 	started, err := deps.Store.BeginAttempt(ctx, notificationID, msg.Attempt, startedAt)
@@ -377,14 +364,23 @@ func handleRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 	span.AddEvent("layer2.done")
 
 	// Rate-limit wait. Sits between Layer 2 and the provider call per
-	// docs/design/06-idempotency.md §Worker-layer + §4.3 of
-	// ARCHITECTURE_v3.md ("directly before the provider call"). Tokens
-	// are scarce; we burn them only on calls actually committed.
+	// docs/ARCHITECTURE.md §4.3 ("directly before the provider call").
+	// Tokens are scarce; we burn them only on calls actually
+	// committed.
 	span.AddEvent("ratelimit.start")
 	if err := deps.Limiter.Acquire(ctx, deps.Channel); err != nil {
 		if errors.Is(err, ratelimit.ErrRedisDown) {
 			span.RecordError(err)
-			deps.Logger.WarnContext(ctx, "worker: rate-limit acquire failed; pausing record (Kafka redelivers)",
+			// The offset stays uncommitted: a worker restart or
+			// consumer rebalance will redeliver this record. In a
+			// stable session the reaper recovers the row instead —
+			// it sweeps DISPATCHED rows whose updated_at exceeds
+			// the stuck threshold (default 120 s) back to PENDING
+			// (T9), the dispatcher re-claims, and the next attempt
+			// runs. Either way the row eventually drains; the
+			// worker's job here is to stop burning CPU until Redis
+			// is reachable.
+			deps.Logger.WarnContext(ctx, "worker: rate-limit acquire failed (Redis down); pausing record (reaper will recover the row after the stuck threshold)",
 				"id", msg.ID,
 				"attempt", msg.Attempt,
 				"err", err,
@@ -447,11 +443,10 @@ func handleRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 	in := store.OutcomeInput{
 		NotificationID: notificationID,
 		Attempt:        msg.Attempt,
-		// StartedAt is ignored by the Phase 3 RecordOutcome
-		// implementation (Layer 2 set started_at in its own tx). The
-		// field stays in OutcomeInput for binary compatibility per
-		// docs/phases/03-resilience.md §2.3; passing it here keeps
-		// the call site self-documenting if a Phase 4+ test reads it.
+		// StartedAt is ignored by RecordOutcome (Layer 2 set
+		// started_at in its own tx). The field stays in OutcomeInput
+		// for binary compatibility; passing it here keeps the call
+		// site self-documenting if a future test reads it.
 		StartedAt:        startedAt,
 		FinishedAt:       finishedAt,
 		Classification:   classified.Classification,
@@ -488,16 +483,14 @@ func handleRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 		attribute.String("new_status", classified.NewStatus),
 	))
 
-	// Phase 5: terminal-classification observations. Spec lock from
-	// docs/phases/05-observability.md §1.1 worker rows:
+	// Terminal-classification observations:
 	//   - worker_attempts_at_outcome on T4 / T6 / T7 (terminal
 	//     classifications produced by the provider path). T5
 	//     (transient → PENDING) is non-terminal so it's excluded.
 	//   - notification_delivery_latency_seconds on T4 only — the
-	//     "happy-path" series. createdAt is from Layer 1's widened
-	//     ReadStateForGuard (see docs/phases/05-observability.md
-	//     §Repo layout); a zero value (defensive — should never
-	//     fire on the GuardProceed branch) is skipped so the
+	//     "happy-path" series. createdAt is from Layer 1's
+	//     ReadStateForGuard return; a zero value (defensive — should
+	//     never fire on the GuardProceed branch) is skipped so the
 	//     histogram doesn't pollute with bucket-0 garbage.
 	if classified.NewStatus != statusPending {
 		metrics.WorkerAttemptsAtOutcome.WithLabelValues(deps.Channel, classified.Classification).Observe(float64(msg.Attempt))
@@ -518,12 +511,11 @@ func handleRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 }
 
 // layerOneSkipOutcome maps a non-Proceed GuardOutcome onto the
-// worker_records_processed_total{outcome=...} label per
-// docs/phases/05-observability.md §1.1 worker row's locked enum.
-// GuardProceed is unreachable on this path (the caller's branch
-// guarantees the call site only fires on a skip outcome) — defensive
-// fallback returns "" so the deferred increment is suppressed
-// rather than stamping a counter with an out-of-enum value.
+// worker_records_processed_total{outcome=...} label. GuardProceed is
+// unreachable on this path (the caller's branch guarantees the call
+// site only fires on a skip outcome) — defensive fallback returns ""
+// so the deferred increment is suppressed rather than stamping a
+// counter with an out-of-enum value.
 func layerOneSkipOutcome(o GuardOutcome) string {
 	switch o {
 	case GuardSkipStale:
@@ -538,8 +530,7 @@ func layerOneSkipOutcome(o GuardOutcome) string {
 }
 
 // providerOutcomeLabel maps a successful-provider-path Outcome onto
-// the worker_records_processed_total{outcome=...} label per
-// docs/phases/05-observability.md §1.1 worker row's locked enum:
+// the worker_records_processed_total{outcome=...} label:
 //
 //   - DELIVERED → "delivered"           (T4)
 //   - PENDING   → "transient_retry"     (T5)
@@ -568,12 +559,11 @@ func providerOutcomeLabel(o Outcome) string {
 }
 
 // providerStatusClass maps a ProviderResult onto the
-// worker_provider_requests_total{status_class=...} label per
-// docs/phases/05-observability.md §1.1 worker row's locked enum:
+// worker_provider_requests_total{status_class=...} label:
 //
 //   - RequestErr != nil               → "no_response"
-//   - 408 / 425 / 429                  → "408_429"  (matches
-//     docs/design/05-retry.md §1's transient HTTP statuses)
+//   - 408 / 425 / 429                  → "408_429"  (the transient
+//     HTTP statuses)
 //   - 2xx / 4xx / 5xx                  → "2xx" / "4xx" / "5xx"
 //   - default (unknown 1xx / 3xx etc.) → "no_response"  (defensive)
 //
@@ -600,8 +590,8 @@ func providerStatusClass(result ProviderResult) string {
 }
 
 // setSpanNotificationIDFromBrokerRecord stamps notification.id on span for
-// Jaeger tag search on failure paths: valid id in payload, or Kafka record key
-// (per docs/design/04-kafka.md §1) when the payload is unusable.
+// Jaeger tag search on failure paths: valid id in payload, or the Kafka
+// record key when the payload is unusable.
 func setSpanNotificationIDFromBrokerRecord(span trace.Span, rec *kgo.Record, msg *sendPayload) {
 	if !span.IsRecording() {
 		return
@@ -622,11 +612,11 @@ func setSpanNotificationIDFromBrokerRecord(span trace.Span, rec *kgo.Record, msg
 
 // commitRecord acks one record's offset and logs on failure. A commit
 // failure here doesn't change the row's authoritative state (Tx B
-// already committed) — Kafka simply redelivers; Phase 3's Layer 2
+// already committed) — Kafka simply redelivers; Layer 2's
 // `ON CONFLICT DO NOTHING` on delivery_attempts catches the duplicate
-// (and Phase 3 Chunk 4's RecordUnprocessable wraps its own INSERT in
-// `ON CONFLICT DO NOTHING` so a redelivery on the T8 path is harmless
-// per docs/phases/03-resilience.md §Chunk 4 notes).
+// (and RecordUnprocessable wraps its own INSERT in
+// `ON CONFLICT DO NOTHING` so a redelivery on the T8 path is
+// harmless).
 func commitRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 	if err := deps.Consumer.CommitRecords(ctx, rec); err != nil {
 		deps.Logger.ErrorContext(ctx, "worker: commit kafka offset failed",
@@ -639,12 +629,10 @@ func commitRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 }
 
 // handleUnprocessable runs the T8 transaction for a corrupt Kafka
-// record per docs/design/06-idempotency.md §T8 +
-// docs/phases/03-resilience.md §4. The record's payload is either
-// undecodable (msg == nil) or decoded but invalid (msg != nil); either
-// way the disposition is the same: build the
-// store.UnprocessableInput, run RecordUnprocessable, commit the
-// offset.
+// record. The record's payload is either undecodable (msg == nil) or
+// decoded but invalid (msg != nil); either way the disposition is the
+// same: build the store.UnprocessableInput, run RecordUnprocessable,
+// commit the offset.
 //
 // On a Postgres failure inside RecordUnprocessable the offset is left
 // uncommitted (Kafka redelivers; the same T8 path runs on retry; the
@@ -655,14 +643,13 @@ func commitRecord(ctx context.Context, deps Deps, rec *kgo.Record) {
 // unrecoverable as far as the worker can tell, and replaying it would
 // loop forever.
 //
-// Returns the worker_records_processed_total{outcome=...} label
-// (locked enum from docs/phases/05-observability.md §1.1 worker
-// row). Empty string on a RecordUnprocessable failure (the record
-// is uncommitted; the next session will produce a real outcome).
-// Phase 5 also increments worker_dlq_routes_total{channel,
-// error_code, target} on every successful disposition and
-// worker_attempts_at_outcome on the targeted T8 branch (the only
-// branch where the attempt is well-defined).
+// Returns the worker_records_processed_total{outcome=...} label.
+// Empty string on a RecordUnprocessable failure (the record is
+// uncommitted; the next session will produce a real outcome). Also
+// increments worker_dlq_routes_total{channel, error_code, target} on
+// every successful disposition and worker_attempts_at_outcome on the
+// targeted T8 branch (the only branch where the attempt is
+// well-defined).
 func handleUnprocessable(ctx context.Context, deps Deps, rec *kgo.Record, msg *sendPayload, errCode, errDetails string) string {
 	in, err := BuildUnprocessable(rec, msg, errCode, errDetails, deps.Channel, deps.Clock())
 	if err != nil {
@@ -745,13 +732,13 @@ func handleUnprocessable(ctx context.Context, deps Deps, rec *kgo.Record, msg *s
 
 	commitRecord(ctx, deps, rec)
 
-	// Locked enum mapping per docs/phases/05-observability.md §1.1
-	// worker row: panic always surfaces as decode_panic (the cause
-	// dominates the disposition regardless of target). Non-panic
-	// codes (decode_failed / schema_mismatch / missing_field) split
-	// by target since the two have meaningfully different operator
-	// implications (a targeted T8 also moves the row to FAILED and
-	// emits events.notification; the no-target T8 only DLQs).
+	// Outcome label mapping: panic always surfaces as decode_panic
+	// (the cause dominates the disposition regardless of target).
+	// Non-panic codes (decode_failed / schema_mismatch /
+	// missing_field) split by target since the two have meaningfully
+	// different operator implications (a targeted T8 also moves the
+	// row to FAILED and emits events.notification; the no-target T8
+	// only DLQs).
 	if errCode == errCodePanic {
 		return "decode_panic"
 	}
@@ -761,16 +748,15 @@ func handleUnprocessable(ctx context.Context, deps Deps, rec *kgo.Record, msg *s
 	return "unprocessable_no_target"
 }
 
-// buildEventPayload constructs the events.notification body per
-// docs/design/04-kafka.md §2. The Phase 2 worker always sets
-// previous_status to DISPATCHED (the only state from which it acts)
-// and classification to "success" or "transient" (the Phase 2
-// taxonomy from §10).
+// buildEventPayload constructs the events.notification body. The
+// worker always sets previous_status to DISPATCHED (the only state
+// from which it acts) and classification to "success" or "transient"
+// on the provider path (T4 / T5).
 func buildEventPayload(id uuid.UUID, msg sendPayload, outcome Outcome, occurredAt time.Time) (json.RawMessage, error) {
 	payload := eventPayload{
 		Version:        eventPayloadVersion,
 		ID:             id.String(),
-		BatchID:        nil, // Phase 2 single-create only; Phase 4 ships batch
+		BatchID:        nil, // single-create only; batch publishes set this
 		Channel:        msg.Channel,
 		Attempt:        msg.Attempt,
 		PreviousStatus: previousStatusDispatched,
@@ -783,9 +769,8 @@ func buildEventPayload(id uuid.UUID, msg sendPayload, outcome Outcome, occurredA
 }
 
 // validResponseJSON returns the bytes only when they parse as JSON.
-// delivery_attempts.response is a JSONB column
-// (docs/design/01-schema.md §2); pgx rejects non-JSON bytes against
-// JSONB. The assessment provider (webhook.site) always returns JSON,
+// delivery_attempts.response is a JSONB column; pgx rejects non-JSON
+// bytes against JSONB. The webhook.site provider always returns JSON,
 // so the happy path passes through. A defective provider that returns
 // HTML / plain text drops the body to NULL rather than failing the
 // outcome transaction — the classification + status values are still
@@ -800,26 +785,23 @@ func validResponseJSON(b []byte) json.RawMessage {
 // applyDefaults fills in zero-valued Deps fields with the locked
 // defaults. Same shape as internal/dispatcher and internal/relay.
 //
-// Panics when Deps.Limiter is nil per docs/phases/03-resilience.md
-// §Chunk 2: production wiring (cmd.go) always provides a
-// *ratelimit.Bucket and a missing limiter is a programmer bug, not a
-// recoverable misconfiguration. Tests that exercise Loop must inject
-// a limiter (typically a no-op fixture or an ErrRedisDown fake).
+// Panics when Deps.Limiter is nil: production wiring (cmd.go) always
+// provides a *ratelimit.Bucket and a missing limiter is a programmer
+// bug, not a recoverable misconfiguration. Tests that exercise Loop
+// must inject a limiter (typically a no-op fixture or an ErrRedisDown
+// fake).
 //
-// Phase 3 Chunk 7 also requires Channel to be set explicitly: the
-// Phase 2 fallback to "sms" was a single-channel-only convenience
-// that, with three channels in flight, would silently route an
-// email or push worker through the wrong rate-limit key + log
-// labels if the cmd.go wiring forgot to set it. Production wiring
-// (cmd.go runForChannel) always sets Channel; tests that exercise
-// Loop must too.
+// Channel is also required to be set explicitly: a fallback to "sms"
+// would silently route an email or push worker through the wrong
+// rate-limit key + log labels if the cmd.go wiring forgot to set it.
+// Production wiring (cmd.go runForChannel) always sets Channel; tests
+// that exercise Loop must too.
 //
-// Phase 5 widened the panic set to cover Deps.Tracer to mirror the
-// dispatcher / relay / reaper convention (the per-record
-// worker.handleRecord span is opened from this tracer).
-// Production (cmd.go) injects otel.Tracer(serviceName) backed by
-// the global tracer provider; tests must inject a noop tracer or
-// an in-memory tracetest provider.
+// Deps.Tracer is required for the same reason as the dispatcher /
+// relay / reaper: the per-record worker.handleRecord span is opened
+// from this tracer. Production (cmd.go) injects
+// otel.Tracer(serviceName) backed by the global tracer provider;
+// tests must inject a noop tracer or an in-memory tracetest provider.
 func applyDefaults(d Deps) Deps {
 	if d.Limiter == nil {
 		panic("worker.Loop: Deps.Limiter must not be nil; production wiring always provides one")

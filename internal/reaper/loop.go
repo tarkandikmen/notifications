@@ -17,49 +17,37 @@ import (
 	"github.com/tarkandikmen/notifications/internal/worker"
 )
 
-// Phase 2 / Phase 3 reaper tunables. Values inlined from
-// docs/design/07-constants.md §A (reaper_interval), §B
-// (reaper_stuck_threshold), §C (reaper_lag_threshold), §D
-// (max_attempts, reaper_backoff_cap), §H (kafka_admin_lag_query_timeout);
-// named constants live here so the loop's call sites read declaratively.
-// Tests override via Deps fields.
+// Reaper tunables. Named constants live here so the loop's call sites
+// read declaratively; tests override via Deps fields.
 const (
 	defaultInterval       = 60 * time.Second
 	defaultStuckThreshold = 120 * time.Second
 	defaultMaxAttempts    = 7
 
-	// defaultReaperBackoffCap is reaper_backoff_cap from
-	// docs/design/07-constants.md §D ("reaper_backoff_cap = 8"). The
-	// cap limits the SQL-side deterministic backoff exponent inside
-	// store.ReapStuck; the post-pass jitter step further constrains
-	// the result via worker.ReaperBackoff which uses the same cap, so
-	// the eventual eligible_at lands within the documented
-	// `[deterministic_capped/2, deterministic_capped]` range from
-	// docs/design/05-retry.md §3.
+	// defaultReaperBackoffCap caps the exponent on the reaper's
+	// deterministic backoff (2^min(attempt, cap) seconds) inside
+	// store.ReapStuck; the post-pass jitter step uses the same cap
+	// via worker.ReaperBackoff, so the eventual eligible_at lands
+	// within `[deterministic_capped/2, deterministic_capped]`.
 	defaultReaperBackoffCap = 8
 
-	// defaultLagThreshold is reaper_lag_threshold from
-	// docs/design/07-constants.md §C. When the worker consumer group's
-	// max-across-partitions lag on send.<channel> exceeds this value,
-	// the reaper's runOnce skips the cycle (per
-	// docs/design/02-state-machine.md §Reaper cycle skip + Phase 3
-	// docs/phases/03-resilience.md §8).
+	// defaultLagThreshold is the reaper's cycle-skip threshold. When
+	// the worker consumer group's max-across-partitions lag on
+	// send.<channel> exceeds this value, runOnce skips the cycle
+	// (T9 / T10 transitions in the state machine).
 	defaultLagThreshold = int64(1000)
 
-	// defaultLagTimeout is kafka_admin_lag_query_timeout from
-	// docs/design/07-constants.md §H. Caps any single lag-query
-	// admin call so a hung Kafka coordinator can't lock up the
-	// reaper's tick — the timeout firing routes through the
-	// fail-closed branch in runOnce.
+	// defaultLagTimeout caps any single lag-query admin call so a hung
+	// Kafka coordinator can't lock up the reaper's tick — the timeout
+	// firing routes through the fail-closed branch in runOnce.
 	defaultLagTimeout = 5 * time.Second
 )
 
 // defaultChannels is the channel set the reaper iterates for the
-// per-channel lag check. Hardcoded to the full Phase 3 set
-// {sms, email, push} because the reaper's cycle is global (the
-// stuck-row sweep is channel-agnostic) and a stalled pipeline on any
-// one channel must pause recovery for the whole cycle per
-// docs/phases/03-resilience.md §8.
+// per-channel lag check. Hardcoded to {sms, email, push} because the
+// reaper's cycle is global (the stuck-row sweep is channel-agnostic)
+// and a stalled pipeline on any one channel must pause recovery for
+// the whole cycle.
 //
 // Returned by value (slice literal) on every call so callers can't
 // mutate the package-level state.
@@ -79,19 +67,17 @@ type LagQuery interface {
 
 // Deps is the reaper loop's per-process dependency bundle. The shape
 // mirrors internal/dispatcher/loop.go's Deps for consistency: storage +
-// logger + injectable knobs, plus the Phase 3 lag-aware fields.
+// logger + injectable knobs, plus the lag-aware fields.
 //
-// The loop holds *store.Store directly rather than wrapping it — Phase
-// 2's only loop-level test (loop_test.go) is the integration test that
+// The loop holds *store.Store directly rather than wrapping it — the
+// only loop-level test (loop_test.go) is the integration test that
 // always runs against a real Postgres testcontainer, so there is no
 // handler-style fake to satisfy.
 //
-// Phase 3 Chunk 6 adds Lag / LagTimeout / LagThreshold / Channels /
-// ReaperBackoffCap so the per-cycle reap can fail-closed when Kafka
-// consumer-group lag exceeds the reaper_lag_threshold per
-// docs/design/02-state-machine.md §Reaper cycle skip + §Lag-query
-// failure semantics, and so the post-pass equal-jitter UPDATE has the
-// same cap the SQL used.
+// Lag / LagTimeout / LagThreshold / Channels / ReaperBackoffCap let
+// the per-cycle reap fail-closed when Kafka consumer-group lag exceeds
+// the threshold (T9 / T10 in the state machine), and let the post-pass
+// equal-jitter UPDATE share the same cap the SQL used.
 type Deps struct {
 	Store  *store.Store
 	Logger *slog.Logger
@@ -109,8 +95,7 @@ type Deps struct {
 	// ReaperBackoffCap is the exponent ceiling for the SQL-side
 	// deterministic backoff in store.ReapStuck and for the Go-side
 	// equal-jitter recompute in worker.ReaperBackoff. Zero-valued at
-	// construction; applyDefaults fills in defaultReaperBackoffCap
-	// (reaper_backoff_cap from docs/design/07-constants.md §D).
+	// construction; applyDefaults fills in defaultReaperBackoffCap.
 	ReaperBackoffCap int
 
 	// Lag is the consumer-group lag oracle. Required; applyDefaults
@@ -121,23 +106,20 @@ type Deps struct {
 	Lag LagQuery
 
 	// LagTimeout caps the lag-query admin call. Zero-valued at
-	// construction; applyDefaults fills in defaultLagTimeout
-	// (kafka_admin_lag_query_timeout from
-	// docs/design/07-constants.md §H).
+	// construction; applyDefaults fills in defaultLagTimeout.
 	LagTimeout time.Duration
 
 	// LagThreshold is the per-channel cycle-skip threshold. Zero-valued
-	// at construction; applyDefaults fills in defaultLagThreshold
-	// (reaper_lag_threshold from docs/design/07-constants.md §C).
+	// at construction; applyDefaults fills in defaultLagThreshold.
 	// Surfaced on Deps (rather than inlined) so the integration test
 	// can drive the threshold-crossing branch deterministically.
 	LagThreshold int64
 
 	// Channels is the channel set the lag check iterates. Zero-valued
 	// at construction; applyDefaults fills in defaultChannels (the
-	// full Phase 3 set {sms, email, push}). Tests can narrow this to
-	// a single channel for cleaner assertions; production always uses
-	// the full set.
+	// full {sms, email, push} set). Tests can narrow this to a single
+	// channel for cleaner assertions; production always uses the full
+	// set.
 	Channels []string
 
 	// Now returns the wall-clock time the reaper uses when computing
@@ -148,29 +130,20 @@ type Deps struct {
 	Now func() time.Time
 
 	// Tracer is the OpenTelemetry tracer used to open the per-cycle
-	// reaper.cycle span. Required; applyDefaults panics when nil
-	// to mirror the Phase 3 lag-client convention. Production
-	// (cmd.go) injects otel.Tracer(serviceName) backed by the global
-	// tracer provider; tests inject a noop tracer or an in-memory
-	// tracetest provider.
-	//
-	// docs/phases/05-observability.md §7.
+	// reaper.cycle span. Required; applyDefaults panics when nil to
+	// mirror the lag-client convention. Production (cmd.go) injects
+	// otel.Tracer(serviceName) backed by the global tracer provider;
+	// tests inject a noop tracer or an in-memory tracetest provider.
 	Tracer trace.Tracer
 }
 
 // Loop drives the stuck-row recovery cycle until ctx is cancelled.
-// Returns nil on graceful shutdown; never returns an error in Phase 2 /
-// Phase 3 — per-tick failures are logged at warn and the next tick
-// retries.
+// Returns nil on graceful shutdown; never returns an error — per-tick
+// failures are logged at warn and the next tick retries.
 //
-// The loop name avoids colliding with the package's cobra-bound Run
-// from cmd.go. The spec writes "loop.Run(ctx, deps)" in
-// docs/phases/02-walking-skeleton.md §Repo layout, but loop.go and
-// cmd.go share a package; renaming the loop entry to Loop preserves the
-// cobra convention without splitting the package. Same shape as
+// The entry point is named Loop (not Run) because loop.go and cmd.go
+// share a package and cmd.go owns the cobra-bound Run. Same shape as
 // internal/dispatcher/loop.go and internal/relay/loop.go.
-//
-// docs/phases/02-walking-skeleton.md §11 + docs/phases/03-resilience.md §6 + §8.
 func Loop(ctx context.Context, deps Deps) error {
 	deps = applyDefaults(deps)
 
@@ -208,30 +181,25 @@ func Loop(ctx context.Context, deps Deps) error {
 //
 //   - Lag check per channel: skip the cycle (fail-closed) on any
 //     channel whose worker.<channel> consumer-group lag exceeds
-//     reaper_lag_threshold OR whose lag query errors. Conservative —
+//     deps.LagThreshold OR whose lag query errors. Conservative —
 //     a single overloaded channel pauses recovery for every channel.
-//     Per docs/design/02-state-machine.md §Reaper cycle skip +
-//     §Lag-query failure semantics rows T9 / T10 +
-//     docs/phases/03-resilience.md §8.
 //   - T9 (DISPATCHED → PENDING) for stuck rows below max_attempts. No
-//     events.notification emission (docs/design/04-kafka.md §2 row T9).
-//     The SQL stamps a deterministic eligible_at; the loop then runs
-//     the post-pass equal-jitter UPDATE per
-//     docs/phases/03-resilience.md §6.
-//   - T10 (DISPATCHED → FAILED) for stuck rows at max_attempts, with one
-//     events.notification outbox row per affected notification.
+//     events.notification emission. The SQL stamps a deterministic
+//     eligible_at; the loop then runs the post-pass equal-jitter
+//     UPDATE.
+//   - T10 (DISPATCHED → FAILED) for stuck rows at max_attempts, with
+//     one events.notification outbox row per affected notification.
 //
 // T9 + T10 happen in a single store.ReapStuck transaction; on any error
 // the deferred rollback inside ReapStuck fires and the rows stay
 // DISPATCHED for the next cycle to retry. The post-pass UPDATE runs
 // outside that transaction (one extra round trip) so the SQL layer
 // stays integer-arithmetic-only — equal jitter is computed in Go to
-// avoid coupling the test surface to Postgres's PRNG. Per
-// docs/phases/03-resilience.md §6.
+// avoid coupling the test surface to Postgres's PRNG.
 //
-// Phase 5 layers per-cycle observability:
+// Per-cycle observability layered on top:
 //   - One reaper.cycle span per call, attributed with reset / failed
-//     counts + outcome (docs/phases/05-observability.md §7).
+//     counts + outcome.
 //   - reaper_cycles_total{outcome} counter on every branch
 //     (ran, lag_skip, lag_query_error).
 //   - reaper_rows_reset_total / reaper_rows_terminal_failed_total
@@ -240,20 +208,18 @@ func Loop(ctx context.Context, deps Deps) error {
 //   - reaper_post_pass_jitter_failures_total counter incremented on
 //     the existing log-warn-and-continue branch.
 //
-// The reaper does NOT stamp an "error" outcome on the cycle counter
-// (the spec locks the three outcomes {ran, lag_skip, lag_query_error}
-// in docs/phases/05-observability.md §1.1). When ReapStuck or any
-// inner SQL call errors, the runOnce return path surfaces the error
-// to Loop's per-tick log-warn — but the cycle counter increment for
-// "ran" still fires under the deferred outcome-stamp, since the cycle
-// was attempted (lag check passed). Operators see the SQL error in
-// the warn log, not the metric vocabulary.
+// The reaper does NOT stamp an "error" outcome on the cycle counter;
+// the three outcomes {ran, lag_skip, lag_query_error} together exhaust
+// the cycle counter's vocabulary. When ReapStuck or any inner SQL call
+// errors, the runOnce return path surfaces the error to Loop's
+// per-tick log-warn — but the cycle counter increment for "ran" still
+// fires under the deferred outcome-stamp, since the cycle was
+// attempted (lag check passed). Operators see the SQL error in the
+// warn log, not the metric vocabulary.
 //
 // Exposed (lowercase) at the package level so loop_test.go can drive a
 // single, deterministic cycle rather than racing the time.Ticker — same
 // pattern as internal/dispatcher/loop.go and internal/relay/loop.go.
-//
-// docs/phases/02-walking-skeleton.md §11 + docs/phases/03-resilience.md §6 + §8.
 func runOnce(ctx context.Context, deps Deps) error {
 	start := time.Now()
 	ctx, span := deps.Tracer.Start(ctx, "reaper.cycle")
@@ -337,9 +303,8 @@ func runOnce(ctx context.Context, deps Deps) error {
 //   - ("lag_skip", true): some channel reported lag > threshold; the
 //     caller stamps "lag_skip" and returns nil.
 //   - ("lag_query_error", true): some channel's lag query errored;
-//     the caller fails closed (per docs/design/02-state-machine.md
-//     §Lag-query failure semantics rows T9 / T10) and stamps
-//     "lag_query_error" on the cycle counter.
+//     the caller fails closed (T9 / T10 fail-closed semantic) and
+//     stamps "lag_query_error" on the cycle counter.
 //
 // The check iterates every channel in deps.Channels in order; the
 // first channel that crosses the threshold or errors short-circuits
@@ -366,11 +331,10 @@ func lagCheckSkip(ctx context.Context, deps Deps) (string, bool) {
 		metrics.PublishLagSample(group, topic, lag, err)
 
 		if err != nil {
-			// Fail-closed per docs/design/02-state-machine.md §Lag-query
-			// failure semantics rows T9 / T10. Logged at info (not warn)
-			// because the disposition is documented and benign — stuck
-			// rows stay DISPATCHED through the outage and recover when
-			// the broker returns.
+			// Fail-closed on T9 / T10 lag-query errors. Logged at info
+			// (not warn) because the disposition is documented and
+			// benign — stuck rows stay DISPATCHED through the outage
+			// and recover when the broker returns.
 			deps.Logger.Info("reaper: lag query failed; skipping cycle (fail-closed)",
 				"channel", channel,
 				"group", group,
@@ -402,8 +366,7 @@ func lagCheckSkip(ctx context.Context, deps Deps) (string, bool) {
 // reset commit and this call.
 //
 // A zero-length reset slice is a no-op (no SQL fires); the helper
-// returns nil so the caller can invoke it unconditionally. Per
-// docs/phases/03-resilience.md §6.
+// returns nil so the caller can invoke it unconditionally.
 func applyJitterPostPass(ctx context.Context, deps Deps, reset []store.ResetReturn) error {
 	if len(reset) == 0 {
 		return nil
@@ -422,9 +385,9 @@ func applyJitterPostPass(ctx context.Context, deps Deps, reset []store.ResetRetu
 	return fn(ctx, ids, eligibleAt)
 }
 
-// applyDefaults fills in zero-valued Deps fields with the locked Phase 2 /
-// Phase 3 defaults so callers (cmd.go in production, loop_test.go in
-// tests) only need to set what they're customizing. Same shape as
+// applyDefaults fills in zero-valued Deps fields with the locked
+// defaults so callers (cmd.go in production, loop_test.go in tests)
+// only need to set what they're customizing. Same shape as
 // internal/dispatcher and internal/relay.
 //
 // Lag and Tracer are required: nil values for either panic here so
@@ -433,7 +396,7 @@ func applyJitterPostPass(ctx context.Context, deps Deps, reset []store.ResetRetu
 // testable; the Tracer is similarly satisfied by trace.Tracer
 // implementations from go.opentelemetry.io/otel/trace/noop or an
 // in-memory tracetest provider. An alternative (treat nil as "no
-// spans" / "no lag check") would silently regress the §7 / §8
+// spans" / "no lag check") would silently regress span / lag-aware
 // behavior under a future cmd.go that forgets to wire them.
 func applyDefaults(d Deps) Deps {
 	if d.Interval <= 0 {

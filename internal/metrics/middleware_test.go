@@ -19,7 +19,7 @@ import (
 //
 // Each subtest uses a unique mux pattern so the per-test counter
 // vector is isolated from other tests in this package — the registry
-// is process-shared per docs/phases/05-observability.md §1.2.
+// is process-shared.
 func TestMiddleware_RecordsStatusClass_2xx_4xx_5xx(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -47,7 +47,7 @@ func TestMiddleware_RecordsStatusClass_2xx_4xx_5xx(t *testing.T) {
 			require.NoError(t, err)
 			resp, err := ts.Client().Do(req)
 			require.NoError(t, err)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			after := counterValue(t, APIRequests.WithLabelValues(tc.pattern, http.MethodPost, tc.statusClass))
 			assert.Equal(t, before+1, after, "counter for status class %s must increment by 1", tc.statusClass)
@@ -74,7 +74,7 @@ func TestMiddleware_DefaultsTo200WhenHandlerNeverWritesStatus(t *testing.T) {
 	require.NoError(t, err)
 	resp, err := ts.Client().Do(req)
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	after := counterValue(t, APIRequests.WithLabelValues(pattern, http.MethodPost, "2xx"))
 	assert.Equal(t, before+1, after, "implicit 200 must be recorded as 2xx")
@@ -100,7 +100,7 @@ func TestMiddleware_RecordsDuration(t *testing.T) {
 	require.NoError(t, err)
 	resp, err := ts.Client().Do(req)
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	after := histogramSampleCount(t, APIRequestDuration.WithLabelValues(pattern, http.MethodPost))
 	assert.Equal(t, before+1, after, "duration histogram sample count must increment by 1")
@@ -124,7 +124,7 @@ func TestMiddleware_LabelsPattern(t *testing.T) {
 
 	resp, err := http.Get(ts.URL + "/metrics-test/pattern/abc-123")
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	after := counterValue(t, APIRequests.WithLabelValues(pattern, http.MethodGet, "2xx"))
 	assert.Equal(t, before+1, after, "endpoint label must be the mux pattern, not the live path")
@@ -147,7 +147,7 @@ func TestMiddleware_NoMatchedRouteEndpointEmpty(t *testing.T) {
 
 	resp, err := http.Get(ts.URL + "/metrics-test/no-such-route")
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
 	after := counterValue(t, APIRequests.WithLabelValues("", http.MethodGet, "4xx"))

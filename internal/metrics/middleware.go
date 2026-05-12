@@ -21,12 +21,10 @@ import (
 // ignored, matching net/http's standard behavior). When the handler
 // never explicitly writes a status the implicit 200 is recorded.
 //
-// Per docs/phases/05-observability.md §1.3, the middleware does NOT
-// introspect request bodies; the per-handler size histograms
-// (APIBatchSize, APIListResultSize) are observed inside the handlers
-// themselves where the parsed request / response shape is in scope.
-//
-// docs/phases/05-observability.md §1.3.
+// The middleware does NOT introspect request bodies; the per-handler
+// size histograms (APIBatchSize, APIListResultSize) are observed
+// inside the handlers themselves where the parsed request / response
+// shape is in scope.
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

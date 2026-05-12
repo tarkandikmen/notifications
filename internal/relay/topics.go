@@ -14,11 +14,11 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// Phase 3 Kafka topology, locked by docs/design/04-kafka.md §Topic catalog
-// and docs/design/07-constants.md §F. Phase 2 shipped only the SMS pipeline
-// plus the shared events.notification topic; Phase 3 Chunk 4 adds the per-
-// channel send.<channel>.dlq triplet, and Chunk 7 widens the send.<channel>
-// fan-out to email + push.
+// Kafka topology constants. The send.<channel> set fans out per
+// channel to a per-channel worker pool; events.notification carries
+// terminal-state events for downstream consumers; send.<channel>.dlq
+// holds unprocessable messages routed by the worker's no-target /
+// permanent-fail paths.
 const (
 	topicSendSMS            = "send.sms"
 	topicSendEmail          = "send.email"
@@ -28,42 +28,34 @@ const (
 	topicSendEmailDLQ       = "send.email.dlq"
 	topicSendPushDLQ        = "send.push.dlq"
 
-	// sendPartitions / eventsPartitions are inlined from
-	// docs/design/07-constants.md §F (send_partitions, events_partitions).
-	// Both pinned at 20 to give later phases headroom for worker-pool
-	// scaling without a re-partition; the per-channel rate cap bounds
-	// throughput regardless.
+	// sendPartitions / eventsPartitions are pinned at 20 to give the
+	// worker pool headroom for scaling without a re-partition; the
+	// per-channel rate cap bounds throughput regardless.
 	sendPartitions   = int32(20)
 	eventsPartitions = int32(20)
 
-	// dlqPartitions is the per-channel DLQ partition count from
-	// docs/design/07-constants.md §F (dlq_partitions = 1). Low-volume by
-	// definition (only unprocessable messages reach the DLQ per
-	// docs/design/04-kafka.md §3); single-partition keeps replay tooling's
-	// ordering trivial. Also matters operationally: docs/design/04-kafka.md
-	// §3 ("Key when notification_id is null") specifies that the
-	// no-target T8 path produces records with no Kafka key, and
-	// dlq_partitions=1 makes the partition assignment deterministic.
+	// dlqPartitions sets the per-channel DLQ partition count to 1.
+	// DLQs are low-volume by definition (only unprocessable messages
+	// reach them); single-partition keeps replay tooling's ordering
+	// trivial. Also matters operationally: the no-target T8 path
+	// produces records with no Kafka key, and dlqPartitions=1 makes
+	// the partition assignment deterministic.
 	dlqPartitions = int32(1)
 
-	// kafkaReplicationFactorDev is the docker-compose dev cluster's RF
-	// from docs/design/07-constants.md §F (kafka_replication_factor_dev).
-	// Production targets RF=3; phase 2 / 3 deploy against a single broker.
+	// kafkaReplicationFactorDev is the docker-compose dev cluster's
+	// replication factor (1 broker). Production targets RF=3.
 	kafkaReplicationFactorDev = int16(1)
 
-	// kafkaDLQRetention is the per-DLQ retention period from
-	// docs/design/07-constants.md §F (kafka_dlq_retention = 30 days).
-	// Longer than the main pipeline (kafka_main_retention = 7 days, the
-	// broker default the main topics inherit) so corrupt messages stay
-	// available for human investigation while normal traffic ages out.
+	// kafkaDLQRetention is the per-DLQ retention period. Longer than
+	// the main pipeline (the broker default the main topics inherit
+	// is 7 days) so corrupt messages stay available for human
+	// investigation while normal traffic ages out.
 	kafkaDLQRetention = 30 * 24 * time.Hour
 )
 
 // desiredTopics is the canonical (topic → partition count) set
 // Bootstrap creates on first run. Order of iteration doesn't matter —
-// per-topic CreateTopic calls run independently. Renamed from Phase 2's
-// phase2Topics to track Phase 3's expanded set; the name no longer ties
-// to a specific phase.
+// per-topic CreateTopic calls run independently.
 var desiredTopics = map[string]int32{
 	topicSendSMS:            sendPartitions,
 	topicSendEmail:          sendPartitions,
@@ -75,10 +67,9 @@ var desiredTopics = map[string]int32{
 }
 
 // dlqTopics is the set of topics that take the per-topic
-// `retention.ms` override during Bootstrap. The main topics (send.<channel>,
-// events.notification) inherit the broker default (Kafka's 7-day default,
-// matching docs/design/07-constants.md §F kafka_main_retention) so no
-// override is needed there.
+// `retention.ms` override during Bootstrap. The main topics
+// (send.<channel>, events.notification) inherit the broker default
+// (Kafka's 7-day default) so no override is needed there.
 var dlqTopics = map[string]struct{}{
 	topicSendSMSDLQ:   {},
 	topicSendEmailDLQ: {},
@@ -91,7 +82,7 @@ var dlqTopics = map[string]struct{}{
 // fails the relay startup so a misconfigured cluster is loud rather than
 // silently broken.
 //
-// Bootstrap is structured in three phases that together absorb the
+// Bootstrap is structured in three stages that together absorb the
 // startup-time races we observed under heavy parallel testcontainer
 // load (and that real production clusters can hit on first deploy or
 // during a rolling broker restart):
@@ -104,8 +95,9 @@ var dlqTopics = map[string]struct{}{
 //     waitForBrokerReady polls a cheap ListTopics call until it
 //     succeeds, eating that brief window deterministically.
 //
-//  2. Issue CreateTopic per topic. Same per-topic error handling as
-//     before; TOPIC_ALREADY_EXISTS still routes to the success branch.
+//  2. Issue CreateTopic per topic. TOPIC_ALREADY_EXISTS routes to the
+//     success branch; any other per-topic error fails the relay
+//     startup.
 //
 //  3. After each successful CreateTopic (or already-exists), wait until
 //     ListTopics reports the topic with at least the requested
@@ -118,8 +110,6 @@ var dlqTopics = map[string]struct{}{
 //     the first record per topic until franz-go's UnknownTopicRetries
 //     budget triggers a metadata refresh — which on a slow / contended
 //     broker can run out before the metadata propagates.
-//
-// docs/phases/02-walking-skeleton.md §8 + docs/phases/03-resilience.md §9.
 func Bootstrap(ctx context.Context, brokers []string, logger *slog.Logger) error {
 	if len(brokers) == 0 {
 		return errors.New("relay bootstrap: no kafka brokers configured")
@@ -136,7 +126,7 @@ func Bootstrap(ctx context.Context, brokers []string, logger *slog.Logger) error
 
 	adm := kadm.NewClient(cl)
 
-	// Phase 1: gate every subsequent admin call behind proof that the
+	// Stage 1: gate every subsequent admin call behind proof that the
 	// broker is responsive. Bounded by bootstrapBrokerReadyTimeout so a
 	// truly broken cluster fails loud instead of hanging.
 	readyCtx, readyCancel := context.WithTimeout(ctx, bootstrapBrokerReadyTimeout)
@@ -146,7 +136,7 @@ func Bootstrap(ctx context.Context, brokers []string, logger *slog.Logger) error
 	}
 	readyCancel()
 
-	// Phase 2 + 3: one round trip per topic keeps each create
+	// Stages 2 + 3: one round trip per topic keeps each create
 	// independent — a bad partition count or config on one topic never
 	// blocks another from being created. The per-topic loop is small
 	// (seven topics) so the extra latency from the visibility check is
@@ -224,7 +214,7 @@ const (
 // waitForBrokerReady polls ListTopics until it returns without error or
 // ctx expires. ListTopics is one of the cheapest admin-API round trips
 // and serves as a proxy for "the broker is answering ApiVersions and
-// admin requests." Used by Bootstrap (Phase 1) to absorb the brief
+// admin requests." Used by Bootstrap's first stage to absorb the brief
 // post-listen window where confluent-local accepts TCP but isn't yet
 // serving the API.
 func waitForBrokerReady(ctx context.Context, adm *kadm.Client) error {
@@ -298,9 +288,8 @@ func retryUntilSuccess(ctx context.Context, fn func(context.Context) error) erro
 
 // topicConfigs returns the per-topic configuration map for topic. The
 // DLQ triplet stamps `retention.ms = kafkaDLQRetention` so corrupt
-// messages live longer than normal pipeline traffic per
-// docs/design/07-constants.md §F. Main topics return nil — they inherit
-// the broker default.
+// messages live longer than normal pipeline traffic. Main topics
+// return nil — they inherit the broker default.
 //
 // kadm's CreateTopic accepts map[string]*string for configs; the *string
 // value is the documented carrier for "this is a string config" vs. nil

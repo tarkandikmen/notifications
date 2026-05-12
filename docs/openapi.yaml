@@ -3,18 +3,15 @@ info:
   title: Notifications API
   version: 1.0.0
   description: |
-    HTTP surface for the notifications service shipped through Phase 4 per
-    `ARCHITECTURE_v3.md` and the `Software Engineer Assessment - Golang.md`
-    brief. Accepts notifications (single or batch), returns notification
-    state, supports best-effort cancellation, and lists / filters
-    notifications. Notifications dispatch across SMS, email, and push
-    channels via a Postgres-backed outbox + per-channel Kafka topics +
-    per-channel worker pools.
+    HTTP surface for the notifications service. Accepts notifications
+    (single or batch), returns notification state, supports best-effort
+    cancellation, and lists / filters notifications. Notifications
+    dispatch across SMS, email, and push channels via a Postgres-backed
+    outbox + per-channel Kafka topics + per-channel worker pools.
 
-    All endpoints are unauthenticated by design (out of scope per
-    `docs/design/03-api.md` §Conventions). Idempotency is enforced via
-    the request-body `idempotency_key` (UUIDv4 canonical lowercase) on
-    every notification.
+    All endpoints are unauthenticated by design. Idempotency is enforced
+    via the request-body `idempotency_key` (UUIDv4 canonical lowercase)
+    on every notification.
   contact:
     name: Notifications API maintainers
     url: https://github.com/tarkandikmen/notifications
@@ -44,9 +41,7 @@ paths:
       summary: Process liveness probe
       description: |
         Returns 200 with `{"status":"ok"}` while the api process is up
-        and serving HTTP. Phase 1 ships the minimum (process-up only);
-        Phase 5 / Phase 7 widen this to per-dependency liveness checks
-        (Postgres / Redis / Kafka pings) and adds the 503 response.
+        and serving HTTP.
       tags: [Operations]
       responses:
         '200':
@@ -62,8 +57,7 @@ paths:
       summary: Prometheus metrics scrape endpoint
       description: |
         Prometheus text exposition format. Scraped by the prometheus
-        container in the docker-compose stack. The metric set ships
-        skeleton in Phase 1 and is filled out by Phase 5.
+        container in the docker-compose stack.
       tags: [Operations]
       responses:
         '200':
@@ -137,8 +131,7 @@ paths:
 
         Pagination is offset-based. `has_more` is computed via the
         `LIMIT limit + 1` trick (no `COUNT(*)` is run); the response
-        does not include a `total` field at this scope per
-        `docs/design/03-api.md` §Pagination.
+        does not include a `total` field.
 
         Each result item is the no-attempts notification representation;
         clients that need delivery attempts must follow up with
@@ -296,7 +289,7 @@ paths:
       description: |
         Runs the cancel transition `T3` (PENDING → CANCELLED, emits
         `events.notification`) or `T11` (DISPATCHED → CANCELLED, no
-        emit) per `docs/design/02-state-machine.md` §Transitions.
+        emit).
 
         Already-CANCELLED rows return 200 with the same body shape
         (idempotent no-op). Hard-terminal rows (DELIVERED / FAILED)
@@ -307,8 +300,7 @@ paths:
         be silently overwritten by a worker outcome (T4–T8) on the
         row's current `attempt`. The realized state surfaces via a
         subsequent GET; the cancel response itself reflects the row at
-        cancel-commit time. See `docs/design/02-state-machine.md`
-        §Cancellation race for the full contract.
+        cancel-commit time.
       tags: [Notifications]
       parameters:
         - $ref: '#/components/parameters/NotificationId'
@@ -387,19 +379,17 @@ components:
       type: string
       enum: [PENDING, DISPATCHED, DELIVERED, FAILED, CANCELLED]
       description: |
-        Notification lifecycle status per
-        `docs/design/02-state-machine.md` §States. `DELIVERED` and
-        `FAILED` are hard-terminal; `CANCELLED` is soft-terminal (a
-        worker may overwrite a `DISPATCHED → CANCELLED` cancel during
-        the cancellation race).
+        Notification lifecycle status. `DELIVERED` and `FAILED` are
+        hard-terminal; `CANCELLED` is soft-terminal (a worker may
+        overwrite a `DISPATCHED → CANCELLED` cancel during the
+        cancellation race).
 
     Priority:
       type: string
       enum: [low, normal, high]
       description: |
-        Priority bucket. Stored as int (`low=0`, `normal=1`, `high=2`)
-        per `docs/design/01-schema.md` §1; the API accepts and returns
-        the string form.
+        Priority bucket. Stored as int (`low=0`, `normal=1`, `high=2`);
+        the API accepts and returns the string form.
 
     FailureReason:
       type: string
@@ -412,9 +402,7 @@ components:
     Classification:
       type: string
       enum: [success, transient, permanent, unprocessable]
-      description: |
-        Worker outcome classification per
-        `docs/design/05-retry.md`.
+      description: Worker outcome classification.
 
     CreateRequest:
       type: object
@@ -443,17 +431,17 @@ components:
           type: string
           nullable: true
           description: |
-            Phase 6 (templates not yet supplied). When set, the
-            request returns 400 in Phase 4. The field is documented
-            here so the OpenAPI surface tracks the wire schema across
-            phases without breaking changes.
+            Reserved for future template support. When set, the request
+            returns 400. The field is documented here so the OpenAPI
+            surface tracks the wire schema without breaking changes.
         template_data:
           type: object
           additionalProperties: true
           nullable: true
           description: |
-            Phase 6. Free-form JSON object substituted into `template`
-            placeholders by the renderer. Rejected with 400 in Phase 4.
+            Reserved for future template support: free-form JSON object
+            substituted into `template` placeholders by the renderer.
+            Rejected with 400.
         priority:
           allOf:
             - $ref: '#/components/schemas/Priority'
@@ -509,12 +497,12 @@ components:
         template:
           type: string
           nullable: true
-          description: Phase 6 (templates not yet supplied; rejected with 400 in Phase 4).
+          description: Reserved for future template support; rejected with 400 today.
         template_data:
           type: object
           additionalProperties: true
           nullable: true
-          description: Phase 6 (rejected with 400 in Phase 4).
+          description: Reserved for future template support; rejected with 400 today.
         priority:
           allOf:
             - $ref: '#/components/schemas/Priority'
@@ -574,8 +562,7 @@ components:
       type: object
       description: |
         The no-attempts notification shape returned by list, batch-get,
-        and cancel responses per `docs/design/03-api.md` §Notification
-        representation.
+        and cancel responses.
       required:
         - id
         - channel
@@ -607,11 +594,11 @@ components:
           description: Omitted when null. Exactly one of `content` / `template` is non-null per row.
         template:
           type: string
-          description: Omitted when null. Phase 6.
+          description: Omitted when null. Reserved for future template support.
         template_data:
           type: object
           additionalProperties: true
-          description: Omitted when null. Phase 6.
+          description: Omitted when null. Reserved for future template support.
         status:
           $ref: '#/components/schemas/Status'
         attempt:
@@ -620,8 +607,7 @@ components:
           description: |
             Number of dispatch claims so far. Incremented by the
             dispatcher in T2 only; every other transition leaves it
-            unchanged per `docs/design/02-state-machine.md`
-            §Counter discipline.
+            unchanged.
         eligible_at:
           type: string
           format: date-time
@@ -653,8 +639,7 @@ components:
 
     NotificationRepresentationWithAttempts:
       description: |
-        The single-GET notification shape per
-        `docs/design/03-api.md` §Notification representation. Extends
+        The single-GET notification shape. Extends
         `NotificationRepresentation` with the nested `attempts` array
         (rendered even when empty for a brand-new row).
       allOf:
@@ -679,8 +664,7 @@ components:
           minimum: 1
           description: |
             Matches `notifications.attempt` at the time the worker
-            began handling this attempt. Append-only per
-            `docs/design/02-state-machine.md` §Counter discipline.
+            began handling this attempt. Append-only.
         started_at:
           type: string
           format: date-time
@@ -839,8 +823,7 @@ components:
           description: |
             The observed terminal status. `CANCELLED` does not appear
             here — already-cancelled rows return 200 (idempotent
-            no-op) per `docs/design/03-api.md`
-            §POST /v1/notifications/{id}/cancel.
+            no-op).
 
   responses:
     Created201:
@@ -862,8 +845,7 @@ components:
     OK200Notification:
       description: |
         Notification representation without nested delivery attempts.
-        Used by cancel responses per
-        `docs/design/03-api.md` §Notification representation.
+        Used by cancel responses.
       content:
         application/json:
           schema:

@@ -54,7 +54,7 @@ func TestHandleList_HappyPath(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var got ListResponse
@@ -68,9 +68,8 @@ func TestHandleList_HappyPath(t *testing.T) {
 }
 
 // TestHandleList_AttemptsOmitted insists list items render WITHOUT the
-// nested attempts key per docs/design/03-api.md §Notification
-// representation ("List, batch, and cancel responses do not include
-// nested attempts").
+// nested attempts key (list, batch, and cancel responses do not
+// include nested attempts).
 func TestHandleList_AttemptsOmitted(t *testing.T) {
 	rows := []store.Notification{
 		fakeNotificationRow(t, "01890000-0000-7000-8000-000000000210", "sms", "+905551234567", "no attempts", "00000000-0000-4000-8000-000000000210"),
@@ -80,7 +79,7 @@ func TestHandleList_AttemptsOmitted(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	body, err := io.ReadAll(resp.Body)
@@ -110,7 +109,7 @@ func TestHandleList_HasMoreTrue(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications?limit=1")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var got ListResponse
@@ -128,7 +127,7 @@ func TestHandleList_EmptyResult_200_EmptyList(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications?status=DELIVERED")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	body, err := io.ReadAll(resp.Body)
@@ -151,7 +150,7 @@ func TestHandleList_FilterCombination(t *testing.T) {
 	q := "status=DISPATCHED&channel=email&priority=high&batch_id=11110000-0000-7000-8000-000000000222"
 	resp, err := http.Get(srv.URL + "/v1/notifications?" + q)
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	require.Equal(t, 1, fs.listCalled)
@@ -173,7 +172,7 @@ func TestHandleList_DefaultsApplied(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	require.Equal(t, 1, fs.listCalled)
@@ -190,7 +189,7 @@ func TestHandleList_OffsetLimitForwarded(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications?offset=20&limit=5")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	require.Equal(t, 1, fs.listCalled)
@@ -207,7 +206,7 @@ func TestHandleList_InvalidParams_400(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications?offset=-1&limit=999&status=NOPE")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -232,7 +231,7 @@ func TestHandleList_StoreError_500(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -242,8 +241,7 @@ func TestHandleList_StoreError_500(t *testing.T) {
 // TestHandleList_ObservesResultSize asserts the
 // api_list_result_size_items histogram observation rises by 1 per
 // list request, with the observed value matching the post-pagination
-// row count returned by the store. Per
-// docs/phases/05-observability.md §1.1 the observation reflects the
+// row count returned by the store. The observation reflects the
 // rendered result size, NOT the requested limit — so dashboards can
 // graph "page-fill ratio" against has_more=true tails.
 func TestHandleList_ObservesResultSize(t *testing.T) {
@@ -259,7 +257,7 @@ func TestHandleList_ObservesResultSize(t *testing.T) {
 	srv := newTestServer(t, fs)
 	resp, err := http.Get(srv.URL + "/v1/notifications")
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	after := histogramObservation(t, metrics.APIListResultSize.WithLabelValues(endpoint))
@@ -281,7 +279,7 @@ func TestHandleList_EmptyResult_ObservesZero(t *testing.T) {
 	srv := newTestServer(t, fs)
 	resp, err := http.Get(srv.URL + "/v1/notifications?status=DELIVERED")
 	require.NoError(t, err)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	after := histogramObservation(t, metrics.APIListResultSize.WithLabelValues(endpoint))
@@ -306,7 +304,7 @@ func TestHandleGetBatch_HappyPath(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/batches/" + batchID.String())
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var got BatchGetResponse
@@ -335,7 +333,7 @@ func TestHandleGetBatch_AttemptsOmitted(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/batches/" + batchID.String())
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	body, err := io.ReadAll(resp.Body)
@@ -361,7 +359,7 @@ func TestHandleGetBatch_NotFound_MissingBatch(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/batches/11110000-0000-7000-8000-000000000999")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -369,15 +367,14 @@ func TestHandleGetBatch_NotFound_MissingBatch(t *testing.T) {
 }
 
 // TestHandleGetBatch_NotFound_MalformedID asserts a malformed UUID in
-// the path surfaces 404 (mirrors handleGet's posture from
-// docs/phases/02-walking-skeleton.md §4).
+// the path surfaces 404 (mirrors handleGet's posture).
 func TestHandleGetBatch_NotFound_MalformedID(t *testing.T) {
 	fs := &fakeStore{}
 	srv := newTestServer(t, fs)
 
 	resp, err := http.Get(srv.URL + "/v1/batches/not-a-uuid")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
 	assert.Zero(t, fs.getBatchCalled, "store must not be called for a malformed path id")
@@ -391,7 +388,7 @@ func TestHandleGetBatch_StoreError_500(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/batches/11110000-0000-7000-8000-000000000888")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 
 	env := decodeErrorEnvelope(t, resp.Body)

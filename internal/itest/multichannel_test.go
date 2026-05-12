@@ -1,6 +1,6 @@
 package itest
 
-// Phase 3 Chunk 7 full-stack three-channel end-to-end test.
+// Full-stack three-channel end-to-end test.
 //
 // Boots Postgres + Kafka + Redis testcontainers, spins up the api +
 // dispatcher + relay + reaper goroutines, plus three worker
@@ -9,8 +9,6 @@ package itest
 // webhook (the body's `channel` field discriminates), then asserts
 // each notification reaches DELIVERED independently and that the
 // webhook was hit exactly once per notification.
-//
-// docs/phases/03-resilience.md §13 + §Chunk 7.
 
 import (
 	"context"
@@ -44,11 +42,10 @@ import (
 	"github.com/tarkandikmen/notifications/internal/worker"
 )
 
-// TestMultiChannel_AllThreeDelivered is the Phase 3 Chunk 7
-// acceptance test from docs/phases/03-resilience.md §13: posting one
-// notification per channel against a single shared webhook proves
-// (a) the api validators accept the per-channel recipient + content
-// rules, (b) the dispatcher's channel loop fans out claims to
+// TestMultiChannel_AllThreeDelivered posts one notification per
+// channel against a single shared webhook and proves (a) the api
+// validators accept the per-channel recipient + content rules,
+// (b) the dispatcher's channel loop fans out claims to
 // send.{sms,email,push}, (c) each per-channel worker consumes from
 // its own send.<channel> topic via worker.<channel> consumer group,
 // and (d) the events.notification + delivery_attempts side effects
@@ -62,12 +59,13 @@ func TestMultiChannel_AllThreeDelivered(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// Phase 3 topology: send.{sms,email,push}, events.notification,
+	// Bootstrap creates send.{sms,email,push}, events.notification,
 	// and the three send.<channel>.dlq topics. relay.Bootstrap is
 	// idempotent, so calling it once before the workers start is
 	// sufficient.
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	// Single httptest webhook serves all three channels. Tracks per-
 	// channel hit counts so the assertion can verify each channel
@@ -119,8 +117,8 @@ func TestMultiChannel_AllThreeDelivered(t *testing.T) {
 	require.NoError(t, err, "build relay producer")
 	t.Cleanup(producer.Close)
 
-	// Phase 3 Chunk 5/6: the dispatcher + reaper read consumer-group
-	// lag via a shared kafkaadmin.LagClient. One client serves both.
+	// Dispatcher + reaper read consumer-group lag via a shared
+	// kafkaadmin.LagClient. One client serves both.
 	lagClient, err := kafkaadmin.New(brokers)
 	require.NoError(t, err, "build kafkaadmin lag client")
 	t.Cleanup(lagClient.Close)
@@ -215,9 +213,9 @@ func TestMultiChannel_AllThreeDelivered(t *testing.T) {
 		})
 	}
 
-	// Reaper across all three channels — the lag check in §8
-	// iterates the channel set and short-circuits on any stalled
-	// channel; with no real backlog the cycle proceeds normally.
+	// Reaper across all three channels — the lag check iterates the
+	// channel set and short-circuits on any stalled channel; with no
+	// real backlog the cycle proceeds normally.
 	startLoop("reaper", func() error {
 		return reaper.Loop(ctx, reaper.Deps{
 			Store:          st,
@@ -232,33 +230,32 @@ func TestMultiChannel_AllThreeDelivered(t *testing.T) {
 	})
 
 	// Post one notification per channel via the api. Each row
-	// satisfies the per-channel recipient + content rules from
-	// docs/design/03-api.md §Validation rules.
+	// satisfies the per-channel recipient + content rules.
 	smsID := postNotification(t, apiServer.URL, `{
 		"channel": "sms",
 		"recipient": "+905551234567",
-		"content": "phase 3 multichannel sms",
+		"content": "multichannel sms",
 		"idempotency_key": "00000000-0000-4000-8000-000000000700"
 	}`)
 
 	emailID := postNotification(t, apiServer.URL, `{
 		"channel": "email",
 		"recipient": "u@example.com",
-		"content": "phase 3 multichannel email",
+		"content": "multichannel email",
 		"idempotency_key": "00000000-0000-4000-8000-000000000701"
 	}`)
 
 	pushID := postNotification(t, apiServer.URL, `{
 		"channel": "push",
 		"recipient": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		"content": "phase 3 multichannel push",
+		"content": "multichannel push",
 		"idempotency_key": "00000000-0000-4000-8000-000000000702"
 	}`)
 
 	// Each notification reaches DELIVERED independently. The 30 s
-	// budget per notification is the same the Phase 2 e2e test uses;
-	// the per-channel pipelines run in parallel so the wall time is
-	// roughly the slowest (not the sum).
+	// budget per notification matches the single-notification e2e
+	// test; the per-channel pipelines run in parallel so the wall
+	// time is roughly the slowest (not the sum).
 	cases := []struct {
 		channel string
 		id      uuid.UUID
@@ -282,8 +279,8 @@ func TestMultiChannel_AllThreeDelivered(t *testing.T) {
 
 	// One events.notification outbox row per notification. The relay
 	// drains them to Kafka; we don't assert against the topic here
-	// (the Phase 2 e2e test covers that path) — three outbox rows is
-	// the locked invariant.
+	// (the single-notification e2e test covers that path) — three
+	// outbox rows is the locked invariant.
 	awaitOutboxCount(t, pool, "events.notification", 3, 5*time.Second)
 
 	// The webhook is hit exactly once per channel. Catches a
@@ -310,11 +307,11 @@ func TestMultiChannel_AllThreeDelivered(t *testing.T) {
 
 // consumerOptsForChannel returns the franz-go consumer settings the
 // per-channel worker uses. Mirrors internal/worker/cmd.go's
-// consumerOpts (which now takes a channel argument since Phase 3
-// Chunk 7) — re-declared locally for the same reason
-// internal/itest/end_to_end_test.go re-declares the SMS-only
-// consumerOpts: cmd.go's helper is package-private and the test
-// shouldn't reach across the package boundary.
+// consumerOpts (which takes a channel argument) — re-declared
+// locally for the same reason internal/itest/end_to_end_test.go
+// re-declares the SMS-only consumerOpts: cmd.go's helper is
+// package-private and the test shouldn't reach across the package
+// boundary.
 func consumerOptsForChannel(brokers []string, channel string) []kgo.Opt {
 	return []kgo.Opt{
 		kgo.SeedBrokers(brokers...),

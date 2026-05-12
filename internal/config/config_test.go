@@ -166,10 +166,10 @@ func TestLoad_MissingRequired(t *testing.T) {
 	}
 }
 
-// TestLoad_RejectsWebhookPlaceholder enforces docs/phases/02-walking-skeleton.md
-// §12: Load() must refuse the committed-placeholder URL so a deployer who
-// forgets to swap in a real webhook.site UUID fails at startup rather than
-// silently delivering nowhere.
+// TestLoad_RejectsWebhookPlaceholder verifies Load() refuses the
+// committed-placeholder URL so a deployer who forgets to swap in a real
+// webhook.site UUID fails at startup rather than silently delivering
+// nowhere.
 func TestLoad_RejectsWebhookPlaceholder(t *testing.T) {
 	setEnv(t, validEnv())
 	t.Setenv("WEBHOOK_URL", "https://webhook.site/REPLACE-WITH-YOUR-UUID")

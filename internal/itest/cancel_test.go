@@ -1,10 +1,10 @@
 package itest
 
-// Phase 4 Chunk 5 full-stack cancel end-to-end test.
+// Full-stack cancel end-to-end test.
 //
 // Boots Postgres + Kafka testcontainers, stands up the api +
 // dispatcher + relay + worker + reaper (single channel: sms), then
-// drives the three documented cancel scenarios end-to-end:
+// drives the three cancel scenarios end-to-end:
 //
 //  1. T3 path (PENDING → CANCELLED): post one SMS notification with
 //     scheduled_at = now + 60s so the dispatcher's `eligible_at <= now()`
@@ -25,11 +25,7 @@ package itest
 // Finally drains events.notification from Kafka and asserts the wire
 // records match the outbox rows (one T3 record for SMS_1 keyed on
 // its id, one T4 record for SMS_2 keyed on its id) — verifying the
-// relay actually published the T3 emission per
-// docs/design/04-kafka.md §2 (emission policy row T3).
-//
-// docs/phases/04-api-completeness.md §10 (Tests, internal/itest/cancel_test.go
-// row) + §Chunk 5.
+// relay actually published the T3 emission.
 
 import (
 	"context"
@@ -73,8 +69,9 @@ func TestCancel_T3PathPlusIdempotentPlusTerminalState(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	// Webhook hit counter tracks the SMS_2 delivery in scenario (3).
 	// Stays at zero for scenario (1) — SMS_1 never reaches the worker
@@ -200,15 +197,15 @@ func TestCancel_T3PathPlusIdempotentPlusTerminalState(t *testing.T) {
 		"T3 transitions PENDING → CANCELLED on the wire")
 	assert.Equal(t, "sms", canceledRow.Channel)
 	assert.Nil(t, canceledRow.Attempts,
-		"cancel response uses the no-attempts representation per docs/design/03-api.md §Notification representation")
+		"cancel response uses the no-attempts representation")
 
 	// T3 must emit one events.notification outbox row within the
 	// relay's poll cadence + Postgres commit slack.
 	awaitOutboxCount(t, pool, "events.notification", 1, 10*time.Second)
 
-	// Verify the outbox row's payload mirrors docs/design/04-kafka.md
-	// §2 emission policy row T3: previous_status=PENDING,
-	// current_status=CANCELLED, classification=null, failure_reason=null.
+	// Verify the outbox row's payload mirrors the T3 emission shape:
+	// previous_status=PENDING, current_status=CANCELLED,
+	// classification=null, failure_reason=null.
 	var cancelPayloadBytes []byte
 	var partitionKey *string
 	require.NoError(t, pool.QueryRow(context.Background(),
@@ -226,7 +223,7 @@ func TestCancel_T3PathPlusIdempotentPlusTerminalState(t *testing.T) {
 	assert.Equal(t, smsID1.String(), cancelEvent.ID)
 	assert.Equal(t, "sms", cancelEvent.Channel)
 	assert.Equal(t, "PENDING", cancelEvent.PreviousStatus,
-		"T3 emission carries previous_status=PENDING per docs/design/04-kafka.md §2")
+		"T3 emission carries previous_status=PENDING")
 	assert.Equal(t, "CANCELLED", cancelEvent.CurrentStatus,
 		"T3 emission carries current_status=CANCELLED")
 	assert.Empty(t, cancelEvent.Classification,

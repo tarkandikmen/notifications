@@ -15,8 +15,8 @@ import (
 
 // TestBuildEventPayload_MatchesKafkaSchema is a unit-style test (no
 // testcontainers) that locks the events.notification JSON shape
-// against docs/design/04-kafka.md §2. Catches regressions to the wire
-// format without requiring a Postgres / Kafka container.
+// emitted by the worker. Catches regressions to the wire format
+// without requiring a Postgres / Kafka container.
 func TestBuildEventPayload_MatchesKafkaSchema(t *testing.T) {
 	id := uuid.MustParse("01927000-0000-7000-8000-000000000001")
 	occurredAt := time.Date(2026, 5, 11, 12, 0, 0, 123_000_000, time.UTC)
@@ -78,7 +78,7 @@ func TestBuildEventPayload_MatchesKafkaSchema(t *testing.T) {
 
 			assert.Equal(t, float64(1), decoded["version"], "version locked at 1")
 			assert.Equal(t, id.String(), decoded["id"])
-			assert.Nil(t, decoded["batch_id"], "phase 2 single-create has null batch_id")
+			assert.Nil(t, decoded["batch_id"], "single-create has null batch_id")
 			assert.Equal(t, "sms", decoded["channel"])
 			assert.Equal(t, float64(3), decoded["attempt"])
 			assert.Equal(t, "DISPATCHED", decoded["previous_status"])
@@ -132,14 +132,9 @@ func TestValidResponseJSON_KeepsValidDropsInvalid(t *testing.T) {
 // Same shape as internal/dispatcher and internal/relay's equivalent
 // tests so the three loops' default machinery stays consistent.
 //
-// Phase 3 Chunk 2: applyDefaults panics when Deps.Limiter is nil.
-// Phase 3 Chunk 7: applyDefaults panics when Deps.Channel is empty —
-// production wiring (cmd.go runForChannel) always sets it explicitly,
-// and silently defaulting to "sms" would route an email or push
-// worker through the wrong rate-limit key + log labels.
-// Phase 5: applyDefaults panics when Deps.Tracer is nil — the
-// per-record worker.handleRecord span is opened from the tracer.
-// Each panic branch is covered by TestApplyDefaults_PanicsWhen*.
+// applyDefaults panics when Deps.Limiter is nil, Deps.Channel is
+// empty, or Deps.Tracer is nil. Each panic branch is covered by
+// TestApplyDefaults_PanicsWhen*.
 func TestApplyDefaults(t *testing.T) {
 	tracer := noop.NewTracerProvider().Tracer("test")
 	d := applyDefaults(Deps{Limiter: stubLimiter{}, Channel: "sms", Tracer: tracer})
@@ -161,13 +156,12 @@ func TestApplyDefaults(t *testing.T) {
 	}
 }
 
-// TestApplyDefaults_PanicsWhenLimiterMissing pins the Phase 3 Chunk 2
-// invariant: production wiring (cmd.go) always provides a
-// *ratelimit.Bucket via Deps.Limiter, and Loop's applyDefaults treats
-// a nil Limiter as a programmer bug rather than a recoverable
-// misconfiguration. The panic surfaces immediately so tests + CI
-// catch the bug at the first call rather than silently nil-defaulting
-// to a different limiter.
+// TestApplyDefaults_PanicsWhenLimiterMissing pins the invariant that
+// production wiring (cmd.go) always provides a *ratelimit.Bucket via
+// Deps.Limiter, and Loop's applyDefaults treats a nil Limiter as a
+// programmer bug rather than a recoverable misconfiguration. The
+// panic surfaces immediately so tests + CI catch the bug at the first
+// call rather than silently nil-defaulting to a different limiter.
 func TestApplyDefaults_PanicsWhenLimiterMissing(t *testing.T) {
 	tracer := noop.NewTracerProvider().Tracer("test")
 	assert.Panics(t, func() {
@@ -175,11 +169,11 @@ func TestApplyDefaults_PanicsWhenLimiterMissing(t *testing.T) {
 	})
 }
 
-// TestApplyDefaults_PanicsWhenChannelMissing pins the Phase 3 Chunk 7
-// invariant: production wiring (cmd.go runForChannel) always sets
-// Deps.Channel from the --channel flag, and silently defaulting to
-// "sms" would route an email or push worker through the wrong
-// rate-limit key + log labels.
+// TestApplyDefaults_PanicsWhenChannelMissing pins the invariant that
+// production wiring (cmd.go runForChannel) always sets Deps.Channel
+// from the --channel flag, and silently defaulting to "sms" would
+// route an email or push worker through the wrong rate-limit key +
+// log labels.
 func TestApplyDefaults_PanicsWhenChannelMissing(t *testing.T) {
 	tracer := noop.NewTracerProvider().Tracer("test")
 	assert.Panics(t, func() {
@@ -187,12 +181,12 @@ func TestApplyDefaults_PanicsWhenChannelMissing(t *testing.T) {
 	})
 }
 
-// TestApplyDefaults_PanicsWhenTracerMissing pins the Phase 5
-// invariant: production wiring (cmd.go runForChannel) always
-// injects otel.Tracer(serviceName) into Deps.Tracer for the
-// per-record worker.handleRecord span. Tests that exercise Loop
-// must inject a tracer (typically a noop tracer or an in-memory
-// tracetest provider). docs/phases/05-observability.md §7.
+// TestApplyDefaults_PanicsWhenTracerMissing pins the invariant that
+// production wiring (cmd.go runForChannel) always injects
+// otel.Tracer(serviceName) into Deps.Tracer for the per-record
+// worker.handleRecord span. Tests that exercise Loop must inject a
+// tracer (typically a noop tracer or an in-memory tracetest
+// provider).
 func TestApplyDefaults_PanicsWhenTracerMissing(t *testing.T) {
 	assert.Panics(t, func() {
 		applyDefaults(Deps{Limiter: stubLimiter{}, Channel: "sms"})
@@ -216,11 +210,8 @@ func ptrOf[T any](v T) *T {
 	return &v
 }
 
-// TestDecodeAndValidate exercises every branch of the Phase 3 §2.4
-// step 1–2 helper that handleRecord calls before any state mutation.
-// Each case asserts the (msg, errCode, errDetails, panicked) tuple
-// matches the locked spec in docs/phases/03-resilience.md §4
-// (BuildUnprocessable notes) + §13's loop_internal_test.go row.
+// TestDecodeAndValidate exercises every branch of the helper that
+// handleRecord calls before any state mutation.
 //
 // The msg-vs-nil contract: msg is nil ONLY when JSON failed to
 // unmarshal (decode_failed) or a panic interrupted decoding. Schema +
@@ -333,9 +324,8 @@ func TestDecodeAndValidate(t *testing.T) {
 	}
 }
 
-// TestDecodeAndValidate_PanicRecovery pins the locked
-// docs/phases/03-resilience.md §2.4 "Panic recovery" branch: a panic
-// fired during decode (injected via the package-level
+// TestDecodeAndValidate_PanicRecovery pins the panic-recovery branch:
+// a panic fired during decode (injected via the package-level
 // SetDecodeAndValidatePanicHook seam) surfaces as
 // (nil, "panic", "<%v of recovered>", true) without unwinding the
 // goroutine. Without this protection the worker's franz-go partition

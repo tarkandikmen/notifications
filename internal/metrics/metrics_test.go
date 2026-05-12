@@ -10,9 +10,9 @@ import (
 )
 
 // TestRegistry_OneRegistryPerProcess locks the single-shared-registry
-// invariant from docs/phases/05-observability.md §1.2: Registry()
-// returns the same *prometheus.Registry on every call so a metric
-// registered anywhere is visible everywhere on the process.
+// invariant: Registry() returns the same *prometheus.Registry on
+// every call so a metric registered anywhere is visible everywhere on
+// the process.
 func TestRegistry_OneRegistryPerProcess(t *testing.T) {
 	r1 := Registry()
 	r2 := Registry()
@@ -22,8 +22,7 @@ func TestRegistry_OneRegistryPerProcess(t *testing.T) {
 
 // TestRegistry_DefaultCollectors_Registered asserts the Go runtime
 // and process collectors are pre-registered so the /metrics body
-// carries the standard go_* and process_* series Phase 1's contract
-// already exposed.
+// carries the standard go_* and process_* series.
 func TestRegistry_DefaultCollectors_Registered(t *testing.T) {
 	families, err := Registry().Gather()
 	require.NoError(t, err)

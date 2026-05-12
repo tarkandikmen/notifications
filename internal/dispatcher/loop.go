@@ -16,40 +16,32 @@ import (
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
-// Phase 2 / Phase 3 dispatcher tunables. Values inlined from
-// docs/design/07-constants.md §A (poll interval, batch size) and §C
-// (dispatcher_lag_threshold) and §H (kafka_admin_lag_query_timeout);
-// named constants live here so the loop's call sites read declaratively.
-// Tests override via Deps fields.
+// Dispatcher tunables. Named constants live here so the loop's call
+// sites read declaratively; tests override via Deps fields.
 const (
 	defaultPollInterval = 100 * time.Millisecond
 	defaultBatchSize    = 200
 
-	// defaultLagThreshold is dispatcher_lag_threshold from
-	// docs/design/07-constants.md §C. When the worker consumer group's
-	// max-across-partitions lag on send.<channel> exceeds this value,
-	// the dispatcher's runOnce skips the claim (per
-	// docs/design/02-state-machine.md §Transitions row T2 + Phase 3
-	// docs/phases/03-resilience.md §7).
+	// defaultLagThreshold is the dispatcher's lag-skip threshold. When
+	// the worker consumer group's max-across-partitions lag on
+	// send.<channel> exceeds this value, runOnce skips the claim
+	// (transition T2 in the state machine).
 	defaultLagThreshold = int64(1000)
 
-	// defaultLagTimeout is kafka_admin_lag_query_timeout from
-	// docs/design/07-constants.md §H. Caps any single lag-query
-	// admin call so a hung Kafka coordinator can't lock up the
-	// dispatcher's tick — the timeout firing routes through the
-	// fail-open branch in runOnce.
+	// defaultLagTimeout caps any single lag-query admin call so a hung
+	// Kafka coordinator can't lock up the dispatcher's tick — the
+	// timeout firing routes through the fail-open branch in runOnce.
 	defaultLagTimeout = 5 * time.Second
 
-	// sendPayloadVersion locks the payload schema version per
-	// docs/design/04-kafka.md §1. Bumping this is a breaking change.
+	// sendPayloadVersion locks the send.<channel> payload schema
+	// version. Bumping this is a breaking change.
 	sendPayloadVersion = 1
 )
 
-// defaultChannels is the Phase 3 channel set per
-// docs/phases/03-resilience.md §7 + §Chunk 7. The dispatcher fans
-// claim ticks across all three channels; each channel's send.<channel>
-// topic is fed by the per-channel worker pool (one worker binary per
-// --channel value, sharing the same dispatcher).
+// defaultChannels is the channel set the dispatcher fans claim ticks
+// across; each channel's send.<channel> topic is fed by the
+// per-channel worker pool (one worker binary per --channel value,
+// sharing the same dispatcher).
 //
 // Returned by value (slice literal) on every call so callers can't
 // mutate the package-level state.
@@ -58,8 +50,8 @@ func defaultChannels() []string { return []string{"sms", "email", "push"} }
 // LagQuery is the slim interface runOnce uses to check Kafka
 // consumer-group lag before claiming. Defined here (rather than
 // imported from internal/kafkaadmin) so the loop is independently
-// testable with a fake — Chunk 5's loop_test.go injects a fakeLag
-// that returns programmed (int64, error) pairs.
+// testable with a fake — loop_test.go injects a fakeLag that returns
+// programmed (int64, error) pairs.
 //
 // *kafkaadmin.LagClient satisfies it for production; cmd.go wires the
 // real client into Deps.Lag.
@@ -72,14 +64,13 @@ type LagQuery interface {
 // is intentionally similar (storage + logger + injectable knobs).
 //
 // The loop holds *store.Store directly rather than an interface because
-// Phase 2's only loop-level test is the integration test in loop_test.go —
-// it always runs against a real Postgres testcontainer. There is no
+// the only loop-level test is the integration test in loop_test.go — it
+// always runs against a real Postgres testcontainer. There is no
 // corresponding handler-style fake to satisfy.
 //
-// Phase 3 Chunk 5 adds Lag / LagTimeout / LagThreshold so the per-tick
-// claim can fail-open when Kafka consumer-group lag exceeds the
-// dispatcher_lag_threshold per docs/design/02-state-machine.md
-// §Transitions row T2 + §Lag-query failure semantics.
+// Lag / LagTimeout / LagThreshold let the per-tick claim fail-open when
+// Kafka consumer-group lag exceeds the dispatcher's threshold (T2 in
+// the state machine).
 type Deps struct {
 	Store        *store.Store
 	Logger       *slog.Logger
@@ -95,42 +86,30 @@ type Deps struct {
 	Lag LagQuery
 
 	// LagTimeout caps the lag-query admin call. Zero-valued at
-	// construction; applyDefaults fills in defaultLagTimeout
-	// (kafka_admin_lag_query_timeout from
-	// docs/design/07-constants.md §H).
+	// construction; applyDefaults fills in defaultLagTimeout.
 	LagTimeout time.Duration
 
 	// LagThreshold is the per-channel claim-skip threshold. Zero-valued
-	// at construction; applyDefaults fills in defaultLagThreshold
-	// (dispatcher_lag_threshold from
-	// docs/design/07-constants.md §C). Surfaced on Deps (rather than
-	// inlined) so the integration test can drive the threshold-crossing
-	// branch deterministically.
+	// at construction; applyDefaults fills in defaultLagThreshold.
+	// Surfaced on Deps (rather than inlined) so the integration test
+	// can drive the threshold-crossing branch deterministically.
 	LagThreshold int64
 
 	// Tracer is the OpenTelemetry tracer used to open the per-tick
 	// dispatcher.tick span. Required; applyDefaults panics when nil
-	// to mirror the Phase 3 lag-client convention. Production
-	// (cmd.go) injects otel.Tracer(serviceName) backed by the global
-	// tracer provider; tests inject a noop tracer or an in-memory
-	// recording tracer.
-	//
-	// docs/phases/05-observability.md §7.
+	// to mirror the lag-client convention. Production (cmd.go) injects
+	// otel.Tracer(serviceName) backed by the global tracer provider;
+	// tests inject a noop tracer or an in-memory recording tracer.
 	Tracer trace.Tracer
 }
 
 // Loop drives the claim-and-publish cycle until ctx is cancelled. Returns
-// nil on graceful shutdown; never returns an error in Phase 2 — per-tick
-// failures are logged at warn and the next tick retries (the rolled-back
-// claim leaves the rows PENDING).
+// nil on graceful shutdown; never returns an error — per-tick failures
+// are logged at warn and the next tick retries (the rolled-back claim
+// leaves the rows PENDING).
 //
-// The loop name avoids colliding with the package's cobra-bound Run from
-// cmd.go. The spec writes "loop.Run(ctx, deps)" in
-// docs/phases/02-walking-skeleton.md §Repo layout, but loop.go and cmd.go
-// share a package; renaming the loop entry to Loop preserves the cobra
-// convention without splitting the package.
-//
-// docs/phases/02-walking-skeleton.md §7.
+// The entry point is named Loop (not Run) because loop.go and cmd.go
+// share a package and cmd.go owns the cobra-bound Run.
 func Loop(ctx context.Context, deps Deps) error {
 	deps = applyDefaults(deps)
 
@@ -171,8 +150,7 @@ func Loop(ctx context.Context, deps Deps) error {
 // On any error along the way the deferred rollback fires, leaving the
 // rows PENDING for the next tick to retry.
 //
-// Lag-check disposition (docs/design/02-state-machine.md §Lag-query
-// failure semantics row T2 + docs/phases/03-resilience.md §7):
+// Lag-check disposition (T2 in the state machine):
 //
 //   - lag > deps.LagThreshold → skip this tick (the worker is falling
 //     behind; claiming more would just deepen the backlog). Returns
@@ -182,21 +160,21 @@ func Loop(ctx context.Context, deps Deps) error {
 //   - lag query errors → fail-open: log at warn and continue with the
 //     claim. The api keeps accepting requests; pausing the dispatcher
 //     just delays the inevitable, and the outbox absorbs the backlog
-//     while the relay can't publish (per ARCHITECTURE_v3.md §6.9
+//     while the relay can't publish (per docs/ARCHITECTURE.md §6.9
 //     row "dispatcher" under Kafka outage). The tick counter still
 //     stamps `lag_query_error` so the outage shows up in metrics
 //     even though the dispatch behavior is "continue".
 //
-// Phase 5 layers per-tick observability:
+// Per-tick observability layered on top:
 //   - One dispatcher.tick span per call, attributed with channel +
-//     row count + outcome (docs/phases/05-observability.md §7).
+//     row count + outcome.
 //   - dispatcher_ticks_total{channel,outcome} counter on every
 //     branch (claimed, empty, lag_skip, lag_query_error, error).
 //   - dispatcher_claimed_rows_per_tick{channel} histogram on the
 //     successful-claim branches (claimed + empty).
 //   - dispatcher_tick_duration_seconds{channel} histogram on every
 //     branch including the early-return paths so tail latency stays
-//     visible under sustained lag (docs/phases/05-observability.md §1.1).
+//     visible under sustained lag.
 //
 // Each tick records exactly one outcome on the tick counter. When the
 // lag-query path fail-opens, the outcome is `lag_query_error` (the
@@ -315,16 +293,14 @@ func runOnce(ctx context.Context, deps Deps, channel string) error {
 	return nil
 }
 
-// sendPayload mirrors the JSON shape locked in docs/design/04-kafka.md §1.
-// Order of fields here matches the doc's example for readability; the
-// JSON encoder serializes by struct order so the produced bytes match the
-// documented layout 1:1.
+// sendPayload is the send.<channel> Kafka payload. The JSON encoder
+// serializes by struct order, so field order here is the wire order.
 //
-// Phase 2 always populates Content (api validation rejects the empty
-// string) and never populates Template / TemplateData (api validation
+// Content is always populated (api validation rejects the empty string)
+// and Template / TemplateData are never populated (api validation
 // rejects either). The struct keeps the nullable shape so the produced
-// JSON renders `template: null, template_data: null` exactly as the doc
-// shows.
+// JSON renders `template: null, template_data: null` for downstream
+// consumers that expect the full envelope.
 type sendPayload struct {
 	Version      int             `json:"version"`
 	ID           string          `json:"id"`
@@ -360,17 +336,15 @@ func buildSendPayload(n *store.Notification) (json.RawMessage, error) {
 //   - ("lag_skip", true): lag is strictly above the threshold; the
 //     caller stamps "lag_skip" and returns nil.
 //   - ("lag_query_error", false): lag query failed; the caller fails
-//     open (per docs/design/02-state-machine.md §Lag-query failure
-//     semantics row T2) and proceeds with the claim, but the outcome
-//     stamped on the tick counter is "lag_query_error" so the outage
-//     stays visible in metrics even though dispatch behavior is
-//     "continue".
+//     open (T2 fail-open semantic) and proceeds with the claim, but
+//     the outcome stamped on the tick counter is "lag_query_error" so
+//     the outage stays visible in metrics even though dispatch
+//     behavior is "continue".
 //
 // On a successful query the result is also published to the
-// kafka_consumer_lag gauge via metrics.PublishLagSample. On error
-// the helper leaves the gauge untouched (per the helper's
-// "error → leave previous value" semantic in
-// docs/phases/05-observability.md §1.4).
+// kafka_consumer_lag gauge via metrics.PublishLagSample. On error the
+// helper leaves the gauge untouched (per the helper's "error → leave
+// previous value" semantic).
 //
 // The lag query wraps deps.LagTimeout around the parent ctx — the
 // resulting deadline is the earlier of the two, so a graceful-shutdown
@@ -407,9 +381,9 @@ func lagCheckSkip(ctx context.Context, deps Deps, channel string) (string, bool)
 	return "", false
 }
 
-// applyDefaults fills in zero-valued Deps fields with the locked Phase 2 /
-// Phase 3 defaults so callers (cmd.go in production, loop_test.go in
-// tests) only need to set what they're customizing.
+// applyDefaults fills in zero-valued Deps fields with the locked
+// defaults so callers (cmd.go in production, loop_test.go in tests)
+// only need to set what they're customizing.
 //
 // Lag and Tracer are required: a nil value for either panics here so
 // production wiring (cmd.go) and tests that exercise runOnce must
@@ -417,7 +391,7 @@ func lagCheckSkip(ctx context.Context, deps Deps, channel string) (string, bool)
 // testable; the Tracer is similarly satisfied by trace.Tracer
 // implementations from go.opentelemetry.io/otel/trace/noop or an
 // in-memory tracetest provider. An alternative (treat nil Tracer as
-// "no spans") would silently regress the §7 trace behavior under a
+// "no spans") would silently regress per-tick trace behavior under a
 // future cmd.go that forgets to wire the global tracer provider.
 func applyDefaults(d Deps) Deps {
 	if d.PollInterval <= 0 {

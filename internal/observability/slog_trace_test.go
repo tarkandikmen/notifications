@@ -110,8 +110,7 @@ func TestWithGroup_PreservesTraceContext(t *testing.T) {
 }
 
 // newTestTracerProvider builds an in-memory tracer provider so the
-// tests don't depend on the global default state. Mirrors the
-// pattern internal/itest will use in Chunk 6's tracing_test.go.
+// tests don't depend on the global default state.
 func newTestTracerProvider() *trace.TracerProvider {
 	exp := tracetest.NewInMemoryExporter()
 	return trace.NewTracerProvider(trace.WithSyncer(exp))

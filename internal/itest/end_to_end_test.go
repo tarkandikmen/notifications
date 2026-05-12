@@ -1,12 +1,10 @@
-// Package itest hosts the Phase 2 end-to-end integration test.
-//
-// docs/phases/02-walking-skeleton.md §13 (Tests) and §Chunk 7 lock the
-// shape: stand up Postgres + Kafka via testcontainers, run an httptest
-// webhook, register the api routes against a real *store.Store, run
-// dispatcher.Loop / relay.Loop / worker.Loop / reaper.Loop in
-// goroutines, POST one notification through the api, poll GET until
-// status is DELIVERED, and assert the per-attempt + outbox + Kafka
-// side effects.
+// Package itest hosts the end-to-end integration test for the
+// walking skeleton: stand up Postgres + Kafka via testcontainers, run
+// an httptest webhook, register the api routes against a real
+// *store.Store, run dispatcher.Loop / relay.Loop / worker.Loop /
+// reaper.Loop in goroutines, POST one notification through the api,
+// poll GET until status is DELIVERED, and assert the per-attempt +
+// outbox + Kafka side effects.
 //
 // This file is the only thing in the package — the build only ever
 // compiles it as part of the test binary. The package name stays plain
@@ -49,14 +47,11 @@ import (
 	"github.com/tarkandikmen/notifications/internal/worker"
 )
 
-// TestEndToEnd_HappyPath_Delivered is the Phase 2 acceptance walking
-// skeleton: one POST /v1/notifications enters the system, all four
-// loops cooperate, and the GET response eventually shows DELIVERED.
-//
-// docs/phases/02-walking-skeleton.md §13 (Tests, internal/itest row)
-// + §Chunk 7. Mirrors acceptance steps 6–7 in §Acceptance tests, but
-// drives every component directly so the test binary doesn't depend
-// on docker-compose.
+// TestEndToEnd_HappyPath_Delivered is the walking-skeleton acceptance
+// test: one POST /v1/notifications enters the system, all four loops
+// cooperate, and the GET response eventually shows DELIVERED. Drives
+// every component directly so the test binary doesn't depend on
+// docker-compose.
 //
 // Skips automatically when TEST_INTEGRATION != 1 via the testsupport
 // container helpers — no Docker, no test, no flake.
@@ -70,13 +65,14 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 	// fans out to send.sms, the worker's outcome lands an
 	// events.notification outbox row that the relay drains. Both
 	// topics must exist before either producer talks to the broker.
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
-	// httptest webhook returning 202 + the documented body shape
-	// from docs/phases/02-walking-skeleton.md §13. The atomic counter
-	// lets us assert the worker called the provider exactly once
-	// (no Kafka redelivery races in the happy path).
+	// httptest webhook returning 202 + the documented body shape.
+	// The atomic counter lets us assert the worker called the
+	// provider exactly once (no Kafka redelivery races in the happy
+	// path).
 	var webhookHits atomic.Int32
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		webhookHits.Add(1)
@@ -106,18 +102,17 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 
 	provider := worker.NewProvider(webhook.URL)
 
-	// Phase 3 Chunk 5: the dispatcher reads consumer-group lag via a
-	// kafkaadmin.LagClient before each tick. Build it against the same
-	// broker the producer / consumer use; injected into the dispatcher
-	// Deps below.
+	// The dispatcher reads consumer-group lag via a kafkaadmin.LagClient
+	// before each tick. Build it against the same broker the producer /
+	// consumer use; injected into the dispatcher Deps below.
 	lagClient, err := kafkaadmin.New(brokers)
 	require.NoError(t, err, "build kafkaadmin lag client")
 	t.Cleanup(lagClient.Close)
 
-	// API mux behind an httptest.Server. Phase 2 §6 has the api
-	// package own route registration; we hand it the same Deps shape
-	// the api.Run binary builds in cmd.go (real *store.Store, fresh
-	// registry, real-time clock).
+	// API mux behind an httptest.Server. The api package owns route
+	// registration; we hand it the same Deps shape the api.Run binary
+	// builds in cmd.go (real *store.Store, fresh registry, real-time
+	// clock).
 	mux := http.NewServeMux()
 	api.RegisterRoutes(mux, api.Deps{
 		Store:    st,
@@ -158,8 +153,7 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 	// dispatcher / relay tick boundary. Worker is Kafka-paced, no
 	// poll interval. Reaper is set to 60 s so the happy path's
 	// 30 s window never sees a cycle (the reaper isn't needed for
-	// T4; it's started only because §Chunk 7 requires all four
-	// loops to run concurrently).
+	// T4; it's started so all four loops run concurrently).
 	startLoop("dispatcher", func() error {
 		return dispatcher.Loop(ctx, dispatcher.Deps{
 			Store:        st,
@@ -186,11 +180,10 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 			Store:    st,
 			Consumer: workerConsumer,
 			Provider: provider,
-			// Phase 3 Chunk 2 made worker.Loop require a Limiter.
-			// This e2e test does not exercise the rate-limit
-			// branch — Phase 3 Chunk 8 owns the rate-limit
+			// worker.Loop requires a Limiter. This e2e test does
+			// not exercise the rate-limit branch — the rate-limit
 			// integration test in internal/itest/rate_limit_test.go
-			// where a real *ratelimit.Bucket runs against a Redis
+			// runs a real *ratelimit.Bucket against a Redis
 			// testcontainer. Here we inject a no-op so Acquire is
 			// a pass-through.
 			Limiter: noOpLimiter{},
@@ -207,11 +200,11 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 			Interval:       60 * time.Second,
 			StuckThreshold: 120 * time.Second,
 			MaxAttempts:    7,
-			// Phase 3 Chunk 6: the reaper reads consumer-group lag via
-			// a kafkaadmin.LagClient before each cycle and skips on
+			// The reaper reads consumer-group lag via a
+			// kafkaadmin.LagClient before each cycle and skips on
 			// fail-closed disposition. Channels narrowed to {"sms"} to
-			// match Phase 2's single-channel test scope; the lag
-			// client itself is shared with the dispatcher.
+			// match this test's single-channel scope; the lag client
+			// itself is shared with the dispatcher.
 			Channels: []string{"sms"},
 			Lag:      lagClient,
 			Tracer:   noop.NewTracerProvider().Tracer("reaper"),
@@ -223,12 +216,11 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 	notifID := postNotification(t, apiServer.URL, `{
 		"channel": "sms",
 		"recipient": "+905551234567",
-		"content": "phase 2 end-to-end",
+		"content": "end-to-end",
 		"idempotency_key": "00000000-0000-4000-8000-000000000400"
 	}`)
 
-	// Poll GET until DELIVERED. Spec window is 30 s
-	// (docs/phases/02-walking-skeleton.md §13).
+	// Poll GET until DELIVERED. 30 s window.
 	resp := awaitNotificationStatus(t, apiServer.URL, notifID, "DELIVERED", 30*time.Second)
 
 	// Assertion 1: one delivery_attempts row, classification=success.
@@ -247,15 +239,15 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 	assert.Equal(t, 1, resp.Attempt, "notifications.attempt is the dispatcher's bumped value")
 	assert.Nil(t, resp.FailureReason, "DELIVERED row has no failure_reason")
 
-	// Phase 5 Chunk 5: outbox backlog gauge reaches steady state (no
-	// unpublished send.sms rows) — scraped from a /metrics handler backed
-	// by metrics.Registry(), same body as the relay binary's listener.
+	// Outbox backlog gauge reaches steady state (no unpublished
+	// send.sms rows) — scraped from a /metrics handler backed by
+	// metrics.Registry(), same body as the relay binary's listener.
 	awaitOutboxUnpublishedSteady(t, metricsServer.URL, "send.sms", 20*time.Second)
 
 	// Assertion 2: exactly one events.notification outbox row.
 	awaitOutboxCount(t, pool, "events.notification", 1, 5*time.Second)
 
-	// Verify the outbox row's payload matches docs/design/04-kafka.md §2.
+	// Verify the outbox row's payload shape.
 	var payloadBytes []byte
 	var partitionKey *string
 	require.NoError(t, pool.QueryRow(context.Background(),
@@ -268,7 +260,7 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 	require.NoError(t, json.Unmarshal(payloadBytes, &event))
 	assert.Equal(t, 1, event.Version)
 	assert.Equal(t, notifID.String(), event.ID)
-	assert.Nil(t, event.BatchID, "Phase 2 single-create has null batch_id")
+	assert.Nil(t, event.BatchID, "single-create has null batch_id")
 	assert.Equal(t, "sms", event.Channel)
 	assert.Equal(t, 1, event.Attempt)
 	assert.Equal(t, "DISPATCHED", event.PreviousStatus)
@@ -305,10 +297,10 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 }
 
 // producerOpts mirrors internal/relay/cmd.go's producerOpts so this
-// test exercises the locked-Phase 2 producer settings (acks=all,
-// snappy). Re-declared here rather than imported because cmd.go's
-// version is unexported. Keeping the two in lockstep is the
-// developer-discipline cost of cmd.go owning the kgo lifecycle.
+// test exercises the same producer settings (acks=all, snappy).
+// Re-declared here rather than imported because cmd.go's version is
+// unexported. Keeping the two in lockstep is the developer-discipline
+// cost of cmd.go owning the kgo lifecycle.
 func producerOpts(brokers []string) []kgo.Opt {
 	return []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
@@ -335,10 +327,10 @@ func consumerOpts(brokers []string) []kgo.Opt {
 // locally so the e2e test reads against a stable JSON shape without
 // importing internal types from the api package.
 //
-// Phase 4 Chunk 5 adds BatchID (*string with omitempty) so batch_test.go
-// can assert every row in a batch carries the same batch_id. Existing
-// single-create tests leave the field nil; the wire-level omitempty
-// keeps their JSON shape unchanged.
+// BatchID (*string with omitempty) lets batch_test.go assert every
+// row in a batch carries the same batch_id. Single-create tests leave
+// the field nil; the wire-level omitempty keeps their JSON shape
+// unchanged.
 type notificationGetResponse struct {
 	ID            string                       `json:"id"`
 	BatchID       *string                      `json:"batch_id,omitempty"`
@@ -361,10 +353,9 @@ type notificationGetAttemptResp struct {
 }
 
 // eventNotificationPayload matches the worker's eventPayload (kept
-// internal to internal/worker). Documented here because §13 calls
-// out the events.notification payload assertion explicitly; locking
-// the shape in this test would catch a regression in the worker's
-// JSON encoding even if internal/worker's tests were silently broken.
+// internal to internal/worker). Locking the shape in this test
+// catches a regression in the worker's JSON encoding even if
+// internal/worker's tests were silently broken.
 type eventNotificationPayload struct {
 	Version        int     `json:"version"`
 	ID             string  `json:"id"`
@@ -533,9 +524,9 @@ func drainEventsNotification(t *testing.T, brokers []string, firstTimeout, tailT
 // pipeline order in handleRecord (Layer 1 → Layer 2 → rate-limit
 // wait → provider call) reaches the provider call unconditionally.
 //
-// Phase 3 Chunk 8's internal/itest/rate_limit_test.go wires the real
-// *ratelimit.Bucket against a Redis testcontainer for tests that do
-// exercise rate limiting end-to-end.
+// internal/itest/rate_limit_test.go wires the real *ratelimit.Bucket
+// against a Redis testcontainer for tests that do exercise rate
+// limiting end-to-end.
 type noOpLimiter struct{}
 
 func (noOpLimiter) Acquire(_ context.Context, _ string) error { return nil }

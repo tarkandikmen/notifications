@@ -1,6 +1,6 @@
 package itest
 
-// Phase 4 Chunk 5 full-stack batch + get-batch end-to-end test.
+// Full-stack batch + get-batch end-to-end test.
 //
 // Boots Postgres + Kafka testcontainers, stands up the api + dispatcher
 // + relay + reaper plus one worker goroutine per channel (sms, email,
@@ -13,14 +13,10 @@ package itest
 //     status=DELIVERED within the 30 s window.
 //  3. Every row's batch_id matches the response's batch_id.
 //  4. Per-row GET /v1/notifications/{id} (the only endpoint that
-//     surfaces nested attempts per docs/design/03-api.md §Notification
-//     representation) shows one delivery_attempts row with
+//     surfaces nested attempts) shows one delivery_attempts row with
 //     classification=success.
 //  5. The webhook hit count is exactly 5 — one provider call per
 //     notification, no Kafka redelivery races.
-//
-// docs/phases/04-api-completeness.md §10 (Tests, internal/itest/batch_test.go
-// row) and §Chunk 5.
 
 import (
 	"context"
@@ -53,9 +49,9 @@ import (
 	"github.com/tarkandikmen/notifications/internal/worker"
 )
 
-// TestBatchCreateAndGet_FiveItems_AllDelivered exercises the
-// Phase 4 batch + get-batch acceptance flow end-to-end. The 1+2+2
-// channel split proves:
+// TestBatchCreateAndGet_FiveItems_AllDelivered exercises the batch +
+// get-batch acceptance flow end-to-end. The 1+2+2 channel split
+// proves:
 //
 //   - POST /v1/notifications/batch accepts mixed-channel items in
 //     one request and mints one batch_id;
@@ -74,8 +70,9 @@ func TestBatchCreateAndGet_FiveItems_AllDelivered(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	// Single webhook serves all three channels. Per-channel counters
 	// catch a routing regression (e.g., the email worker accidentally
@@ -218,8 +215,7 @@ func TestBatchCreateAndGet_FiveItems_AllDelivered(t *testing.T) {
 	})
 
 	// 5-item mixed-channel batch: 1 sms + 2 email + 2 push. Each
-	// satisfies the per-channel recipient + content rules from
-	// docs/design/03-api.md §Validation rules.
+	// satisfies the per-channel recipient + content rules.
 	batchBody := `{
 		"notifications": [
 			{"channel": "sms",   "recipient": "+905551234567", "content": "batch itest sms 1",
@@ -259,9 +255,9 @@ func TestBatchCreateAndGet_FiveItems_AllDelivered(t *testing.T) {
 	}
 
 	// Poll GET /v1/batches/{id} until every row of the batch is
-	// DELIVERED. 30 s is the same window the Phase 2 e2e test uses
-	// for a single notification; with three pipelines running in
-	// parallel a 5-item batch resolves well within that.
+	// DELIVERED. 30 s matches the single-notification e2e window;
+	// with three pipelines running in parallel a 5-item batch
+	// resolves well within that.
 	finalBatch := awaitBatchAllStatus(t, apiServer.URL, batchID, "DELIVERED", 30*time.Second)
 	require.Equal(t, batchID.String(), finalBatch.BatchID,
 		"batch_id in GET response equals the one from POST")
@@ -285,9 +281,8 @@ func TestBatchCreateAndGet_FiveItems_AllDelivered(t *testing.T) {
 	assert.Equal(t, 2, channelCounts["push"], "exactly two push rows in the batch")
 
 	// Per-row GET /v1/notifications/{id} — the only endpoint that
-	// renders the nested attempts array per
-	// docs/design/03-api.md §Notification representation. Verifies
-	// the success classification landed for every row.
+	// renders the nested attempts array. Verifies the success
+	// classification landed for every row.
 	for _, id := range parsedIDs {
 		got := fetchNotification(t, apiServer.URL, id)
 		assert.Equal(t, "DELIVERED", got.Status,

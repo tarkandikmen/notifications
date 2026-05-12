@@ -8,9 +8,9 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// OutboxRow mirrors docs/design/01-schema.md §3 — the columns producers
-// write and the relay reads. Phase 2 producers always leave Headers null
-// (W3C Trace Context propagation lands in Phase 5).
+// OutboxRow holds the columns producers write and the relay reads.
+// Headers carries W3C Trace Context (JSON) when the producer propagates
+// an upstream span; the column is null otherwise.
 type OutboxRow struct {
 	ID           int64
 	Topic        string
@@ -40,8 +40,8 @@ func (s *Store) InsertOutboxRow(ctx context.Context, db DBTX, row OutboxRow) err
 
 // ClaimUnpublishedOutbox claims up to limit unpublished outbox rows inside
 // the caller-supplied tx. Uses FOR UPDATE SKIP LOCKED so multiple relay
-// instances can run safely (docs/phases/02-walking-skeleton.md §8). The
-// rows returned remain locked for the lifetime of tx.
+// instances can run safely. The rows returned remain locked for the
+// lifetime of tx.
 func (s *Store) ClaimUnpublishedOutbox(ctx context.Context, tx pgx.Tx, limit int) ([]OutboxRow, error) {
 	const sql = `
 		SELECT id, topic, partition_key, headers, payload

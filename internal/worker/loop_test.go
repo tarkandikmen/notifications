@@ -38,7 +38,7 @@ import (
 // exercise rate-limit semantics injects via Deps.Limiter. Acquire
 // always returns nil so the rate-limit step in handleRecord becomes a
 // pass-through; the test then exercises Layer 1 / Layer 2 / Tx B in
-// isolation. Phase 3 Chunk 8's full-stack rate-limit test in
+// isolation. The full-stack rate-limit test in
 // internal/itest/rate_limit_test.go uses the real *ratelimit.Bucket
 // against a Redis testcontainer.
 type noOpBucket struct{}
@@ -54,30 +54,27 @@ type errBucket struct{ err error }
 func (b errBucket) Acquire(_ context.Context, _ string) error { return b.err }
 
 const (
-	// consumerGroupSMS is the canonical Phase 2 SMS worker consumer
-	// group from docs/design/04-kafka.md §1 ("Consumer group:
-	// worker.<channel>"). Tests use the same value as production so
-	// the join / commit code paths match.
+	// consumerGroupSMS is the canonical SMS worker consumer group
+	// ("worker.<channel>"). Tests use the same value as production
+	// so the join / commit code paths match.
 	consumerGroupSMS = "worker.sms"
 
-	// topicSendSMS is the SMS send topic from docs/design/04-kafka.md
-	// §Topic catalog. Inlined (not imported from internal/relay)
-	// because the relay package's constant is unexported.
+	// topicSendSMS is the SMS send topic. Inlined (not imported from
+	// internal/relay) because the relay package's constant is
+	// unexported.
 	topicSendSMS = "send.sms"
 
-	// topicEventsNotification is the events topic from
-	// docs/design/04-kafka.md §Topic catalog. Used to assert that the
-	// events.notification outbox row eventually drains to Kafka via
-	// the events outbox path (Phase 2 leaves that drain to the relay
-	// in production; the worker test verifies only that the outbox
-	// row was inserted).
+	// topicEventsNotification is the events topic. Used to assert
+	// that the events.notification outbox row eventually drains to
+	// Kafka via the events outbox path; the worker test verifies
+	// only that the outbox row was inserted (the relay drains it in
+	// production).
 	topicEventsNotification = "events.notification"
 
-	// topicSendSMSDLQ is the SMS dead-letter topic from
-	// docs/design/04-kafka.md §Topic catalog. Used by the T8 tests
-	// below to assert the DLQ outbox row is emitted to the right
-	// topic. Inlined (not imported from internal/relay) because the
-	// relay package's constant is unexported.
+	// topicSendSMSDLQ is the SMS dead-letter topic. Used by the T8
+	// tests below to assert the DLQ outbox row is emitted to the
+	// right topic. Inlined (not imported from internal/relay)
+	// because the relay package's constant is unexported.
 	topicSendSMSDLQ = "send.sms.dlq"
 )
 
@@ -88,9 +85,9 @@ const (
 // integration tests read consistently.
 //
 // channel is the per-test channel value; the consumer group + topic
-// names derive from it (worker.<channel> / send.<channel>). Phase 3
-// Chunk 7 added per-channel happy-path tests that need the topic
-// derived from the test's channel rather than hardcoded to "sms".
+// names derive from it (worker.<channel> / send.<channel>). The
+// per-channel happy-path tests need the topic derived from the test's
+// channel rather than hardcoded to "sms".
 type testEnv struct {
 	st       *store.Store
 	deps     Deps
@@ -101,7 +98,7 @@ type testEnv struct {
 	channel  string
 }
 
-// newTestEnv boots Postgres + Kafka, creates the Phase 3 topics via
+// newTestEnv boots Postgres + Kafka, creates the topics via
 // relay.Bootstrap, builds a kgo consumer client for the SMS channel
 // wired with the same settings as production cmd.go (group
 // worker.sms, topic send.sms, auto.offset.reset=earliest, manual
@@ -111,18 +108,18 @@ type testEnv struct {
 // The webhook handler is a parameter so each test can pin its own
 // status / body / latency without reaching into the Provider.
 //
-// Phase 3 Chunk 7's email + push channel happy-path tests use
-// newTestEnvForChannel (below) instead so the consumer group + topic
-// match the channel under test.
+// The email + push channel happy-path tests use newTestEnvForChannel
+// (below) instead so the consumer group + topic match the channel
+// under test.
 func newTestEnv(t *testing.T, handler http.HandlerFunc) *testEnv {
 	t.Helper()
 	return newTestEnvForChannel(t, "sms", handler)
 }
 
-// newTestEnvForChannel is the channel-parameterized variant added by
-// Phase 3 Chunk 7. The consumer group becomes "worker.<channel>" and
-// the topic becomes "send.<channel>"; everything else (Postgres
-// container, webhook, Provider) is shared shape across channels.
+// newTestEnvForChannel is the channel-parameterized variant of
+// newTestEnv. The consumer group becomes "worker.<channel>" and the
+// topic becomes "send.<channel>"; everything else (Postgres container,
+// webhook, Provider) is shared shape across channels.
 func newTestEnvForChannel(t *testing.T, channel string, handler http.HandlerFunc) *testEnv {
 	t.Helper()
 
@@ -130,8 +127,9 @@ func newTestEnvForChannel(t *testing.T, channel string, handler http.HandlerFunc
 	brokers := testsupport.StartKafka(t)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	requests := &atomic.Int32{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -161,11 +159,11 @@ func newTestEnvForChannel(t *testing.T, channel string, handler http.HandlerFunc
 			Logger:   logger,
 			Channel:  channel,
 			Clock:    time.Now,
-			// Phase 5: a noop tracer satisfies Deps.Tracer for unit
-			// tests so the per-record worker.handleRecord span is
-			// opened (and ended) without any exporter wiring. Tests
-			// that need to assert on span shape build an in-memory
-			// tracetest provider in-line.
+			// A noop tracer satisfies Deps.Tracer for unit tests so
+			// the per-record worker.handleRecord span is opened (and
+			// ended) without any exporter wiring. Tests that need to
+			// assert on span shape build an in-memory tracetest
+			// provider in-line.
 			Tracer: noop.NewTracerProvider().Tracer("test"),
 		},
 	}
@@ -181,9 +179,9 @@ func produceSendSMS(t *testing.T, brokers []string, key string, payload []byte) 
 }
 
 // produceSendForChannel is the channel-parameterized variant of
-// produceSendSMS, added by Phase 3 Chunk 7 so the email + push
-// happy-path tests can produce to send.email / send.push without
-// re-implementing the kgo producer setup.
+// produceSendSMS so the email + push happy-path tests can produce to
+// send.email / send.push without re-implementing the kgo producer
+// setup.
 func produceSendForChannel(t *testing.T, brokers []string, channel, key string, payload []byte) {
 	t.Helper()
 
@@ -226,23 +224,23 @@ func produceSendForChannelWithHeaders(t *testing.T, brokers []string, channel, k
 // insertDispatched persists one notification in DISPATCHED state at
 // `attempt`, mimicking what the dispatcher would have done at T2. The
 // fixture skips the dispatcher's CTE-based claim because the worker
-// test is exercising worker.Loop in isolation; the next chunk's
-// end-to-end test wires the dispatcher in.
+// test is exercising worker.Loop in isolation; the end-to-end
+// integration test wires the dispatcher in.
 func insertDispatched(t *testing.T, st *store.Store, idempKey string, attempt int) store.Notification {
 	t.Helper()
 	return insertDispatchedForChannel(t, st, "sms", "+905551234567", idempKey, attempt)
 }
 
 // insertDispatchedForChannel is the channel-parameterized variant of
-// insertDispatched added by Phase 3 Chunk 7 so the email + push
-// happy-path tests can stage rows of their respective channels
-// before producing to the channel's send topic.
+// insertDispatched so the email + push happy-path tests can stage
+// rows of their respective channels before producing to the channel's
+// send topic.
 func insertDispatchedForChannel(t *testing.T, st *store.Store, channel, recipient, idempKey string, attempt int) store.Notification {
 	t.Helper()
 
 	id, err := store.NewID()
 	require.NoError(t, err)
-	content := "phase 3 worker test"
+	content := "worker test"
 	row := store.Notification{
 		ID:             id,
 		Channel:        channel,
@@ -266,19 +264,17 @@ func insertDispatchedForChannel(t *testing.T, st *store.Store, channel, recipien
 	return row
 }
 
-// sendPayloadJSON returns a marshaled send.sms payload matching
-// docs/design/04-kafka.md §1. Keeps the shape in one place so the
-// per-test variants (different attempts, different content) read
-// declaratively.
+// sendPayloadJSON returns a marshaled send.sms payload. Keeps the
+// shape in one place so the per-test variants (different attempts,
+// different content) read declaratively.
 func sendPayloadJSON(t *testing.T, id uuid.UUID, attempt int, content string) []byte {
 	t.Helper()
 	return sendPayloadJSONForChannel(t, id, attempt, "sms", "+905551234567", content)
 }
 
-// sendPayloadJSONForChannel is the channel-parameterized variant
-// added by Phase 3 Chunk 7 so the email + push happy-path tests can
-// build a payload whose channel + recipient match the channel under
-// test.
+// sendPayloadJSONForChannel is the channel-parameterized variant of
+// sendPayloadJSON so the email + push happy-path tests can build a
+// payload whose channel + recipient match the channel under test.
 func sendPayloadJSONForChannel(t *testing.T, id uuid.UUID, attempt int, channel, recipient, content string) []byte {
 	t.Helper()
 
@@ -346,7 +342,7 @@ func awaitOutboxCount(t *testing.T, st *store.Store, topic string, want int, tim
 
 // awaitOffsetCommitted polls Kafka's group coordinator until the
 // committed offset for (group, topicSendSMS) is non-zero on at least
-// one partition. Phase 2 publishes one message per test, so a single
+// one partition. Each test publishes one message, so a single
 // committed offset across the 20 partitions is sufficient evidence
 // that worker.Loop fired CommitRecords.
 func awaitOffsetCommitted(t *testing.T, brokers []string, group string, timeout time.Duration) {
@@ -354,9 +350,9 @@ func awaitOffsetCommitted(t *testing.T, brokers []string, group string, timeout 
 	awaitOffsetCommittedOn(t, brokers, group, topicSendSMS, timeout)
 }
 
-// awaitOffsetCommittedOn is the topic-parameterized variant added by
-// Phase 3 Chunk 7 so the email + push happy-path tests can poll for a
-// commit on send.email / send.push without rewriting the kgo
+// awaitOffsetCommittedOn is the topic-parameterized variant of
+// awaitOffsetCommitted so the email + push happy-path tests can poll
+// for a commit on send.email / send.push without rewriting the kgo
 // FetchOffsets dance.
 func awaitOffsetCommittedOn(t *testing.T, brokers []string, group, topic string, timeout time.Duration) {
 	t.Helper()
@@ -443,12 +439,11 @@ func notificationLatencyHistSnap(t *testing.T, channel string) (count uint64, su
 	return *m.Histogram.SampleCount, *m.Histogram.SampleSum
 }
 
-// TestLoop_HappyPath_Delivered is the primary integration test
-// required by docs/phases/02-walking-skeleton.md §Chunk 5: one
-// DISPATCHED row + one send.sms message + an httptest webhook
-// returning 202 → row reaches DELIVERED, one delivery_attempts row
-// with classification=success, one events.notification outbox row,
-// the Kafka offset is committed.
+// TestLoop_HappyPath_Delivered is the primary integration test for
+// the worker loop: one DISPATCHED row + one send.sms message + an
+// httptest webhook returning 202 → row reaches DELIVERED, one
+// delivery_attempts row with classification=success, one
+// events.notification outbox row, the Kafka offset is committed.
 func TestLoop_HappyPath_Delivered(t *testing.T) {
 	env := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPost, r.Method)
@@ -459,7 +454,7 @@ func TestLoop_HappyPath_Delivered(t *testing.T) {
 		require.NoError(t, json.Unmarshal(body, &got))
 		assert.Equal(t, "+905551234567", got["to"])
 		assert.Equal(t, "sms", got["channel"])
-		assert.Equal(t, "phase 2 happy path", got["content"])
+		assert.Equal(t, "happy path", got["content"])
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -468,7 +463,7 @@ func TestLoop_HappyPath_Delivered(t *testing.T) {
 
 	row := insertDispatched(t, env.st, "00000000-0000-4000-8000-000000000200", 1)
 	produceSendSMS(t, env.brokers, row.ID.String(),
-		sendPayloadJSON(t, row.ID, 1, "phase 2 happy path"))
+		sendPayloadJSON(t, row.ID, 1, "happy path"))
 
 	beforeDelivered := testutil.ToFloat64(metrics.WorkerRecordsProcessed.WithLabelValues("sms", "delivered"))
 	beforeLatCount, beforeLatSum := notificationLatencyHistSnap(t, "sms")
@@ -519,10 +514,10 @@ func TestLoop_HappyPath_Delivered(t *testing.T) {
 	requireLoopReturns(t, loopDone, 5*time.Second)
 }
 
-// TestLoop_HappyPath_Email_Delivered is Phase 3 Chunk 7's email
-// counterpart of TestLoop_HappyPath_Delivered. The worker joins
-// worker.email, consumes from send.email, hits the test webhook, and
-// the row reaches DELIVERED with classification=success. Locks the
+// TestLoop_HappyPath_Email_Delivered is the email counterpart of
+// TestLoop_HappyPath_Delivered. The worker joins worker.email,
+// consumes from send.email, hits the test webhook, and the row
+// reaches DELIVERED with classification=success. Locks the
 // per-channel consumer-group / topic plumbing end-to-end against the
 // real testcontainer broker.
 func TestLoop_HappyPath_Email_Delivered(t *testing.T) {
@@ -533,7 +528,7 @@ func TestLoop_HappyPath_Email_Delivered(t *testing.T) {
 		require.NoError(t, json.Unmarshal(body, &got))
 		assert.Equal(t, "u@example.com", got["to"])
 		assert.Equal(t, "email", got["channel"])
-		assert.Equal(t, "phase 3 email happy path", got["content"])
+		assert.Equal(t, "email happy path", got["content"])
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -543,7 +538,7 @@ func TestLoop_HappyPath_Email_Delivered(t *testing.T) {
 	row := insertDispatchedForChannel(t, env.st, "email", "u@example.com",
 		"00000000-0000-4000-8000-000000000600", 1)
 	produceSendForChannel(t, env.brokers, "email", row.ID.String(),
-		sendPayloadJSONForChannel(t, row.ID, 1, "email", "u@example.com", "phase 3 email happy path"))
+		sendPayloadJSONForChannel(t, row.ID, 1, "email", "u@example.com", "email happy path"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -574,10 +569,10 @@ func TestLoop_HappyPath_Email_Delivered(t *testing.T) {
 	requireLoopReturns(t, loopDone, 5*time.Second)
 }
 
-// TestLoop_HappyPath_Push_Delivered is Phase 3 Chunk 7's push
-// counterpart. Same shape as the email test above but the consumer
-// group becomes worker.push and the topic becomes send.push; the
-// recipient is an opaque token within recipientPushMin..max bounds.
+// TestLoop_HappyPath_Push_Delivered is the push counterpart. Same
+// shape as the email test above but the consumer group becomes
+// worker.push and the topic becomes send.push; the recipient is an
+// opaque token within recipientPushMin..max bounds.
 func TestLoop_HappyPath_Push_Delivered(t *testing.T) {
 	pushToken := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
@@ -588,7 +583,7 @@ func TestLoop_HappyPath_Push_Delivered(t *testing.T) {
 		require.NoError(t, json.Unmarshal(body, &got))
 		assert.Equal(t, pushToken, got["to"])
 		assert.Equal(t, "push", got["channel"])
-		assert.Equal(t, "phase 3 push happy path", got["content"])
+		assert.Equal(t, "push happy path", got["content"])
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -598,7 +593,7 @@ func TestLoop_HappyPath_Push_Delivered(t *testing.T) {
 	row := insertDispatchedForChannel(t, env.st, "push", pushToken,
 		"00000000-0000-4000-8000-000000000601", 1)
 	produceSendForChannel(t, env.brokers, "push", row.ID.String(),
-		sendPayloadJSONForChannel(t, row.ID, 1, "push", pushToken, "phase 3 push happy path"))
+		sendPayloadJSONForChannel(t, row.ID, 1, "push", pushToken, "push happy path"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -629,10 +624,10 @@ func TestLoop_HappyPath_Push_Delivered(t *testing.T) {
 	requireLoopReturns(t, loopDone, 5*time.Second)
 }
 
-// TestLoop_TransientHTTPFailure_StaysPending exercises §10's second
-// row: a non-2xx response with attempt < max_attempts classifies as
-// transient (T5). The row goes back to PENDING, attempt is unchanged,
-// eligible_at advances by backoff(attempt), and the
+// TestLoop_TransientHTTPFailure_StaysPending exercises the transient
+// branch: a non-2xx response with attempt < max_attempts classifies
+// as transient (T5). The row goes back to PENDING, attempt is
+// unchanged, eligible_at advances by backoff(attempt), and the
 // delivery_attempts row records the body.
 func TestLoop_TransientHTTPFailure_StaysPending(t *testing.T) {
 	env := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
@@ -643,14 +638,14 @@ func TestLoop_TransientHTTPFailure_StaysPending(t *testing.T) {
 
 	row := insertDispatched(t, env.st, "00000000-0000-4000-8000-000000000201", 3)
 	produceSendSMS(t, env.brokers, row.ID.String(),
-		sendPayloadJSON(t, row.ID, 3, "phase 2 transient"))
+		sendPayloadJSON(t, row.ID, 3, "transient"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	loopDone := runLoopAsync(ctx, env.deps)
 
 	got := awaitStatus(t, env.st, row.ID, "PENDING", 30*time.Second)
-	assert.Equal(t, 3, got.Attempt, "attempt unchanged on T5 (counter discipline §Counter discipline)")
+	assert.Equal(t, 3, got.Attempt, "attempt unchanged on T5 (counter discipline)")
 	assert.Nil(t, got.FailureReason)
 	assert.True(t, got.EligibleAt.After(time.Now().UTC()),
 		"eligible_at should advance into the future by backoff(3) = 8 s")
@@ -673,9 +668,9 @@ func TestLoop_TransientHTTPFailure_StaysPending(t *testing.T) {
 	requireLoopReturns(t, loopDone, 5*time.Second)
 }
 
-// TestLoop_TerminalFailure_AtMaxAttempts exercises §10's third row:
-// non-2xx with attempt >= max_attempts terminal-fails the row (T7)
-// with failure_reason=max_attempts_exceeded.
+// TestLoop_TerminalFailure_AtMaxAttempts exercises the terminal
+// branch: non-2xx with attempt >= max_attempts terminal-fails the row
+// (T7) with failure_reason=max_attempts_exceeded.
 func TestLoop_TerminalFailure_AtMaxAttempts(t *testing.T) {
 	env := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -684,7 +679,7 @@ func TestLoop_TerminalFailure_AtMaxAttempts(t *testing.T) {
 
 	row := insertDispatched(t, env.st, "00000000-0000-4000-8000-000000000202", 7)
 	produceSendSMS(t, env.brokers, row.ID.String(),
-		sendPayloadJSON(t, row.ID, 7, "phase 2 terminal"))
+		sendPayloadJSON(t, row.ID, 7, "terminal"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -707,9 +702,7 @@ func TestLoop_TerminalFailure_AtMaxAttempts(t *testing.T) {
 // TestLoop_DecodeFailure_CommitsAndSkips exercises the no-target T8
 // path in handleRecord: a malformed JSON payload is routed via
 // RecordUnprocessable to send.<channel>.dlq, the offset is committed,
-// and the provider is never called. Phase 3 Chunk 4 promoted what was
-// a Phase 2 "ack + skip" branch into the full T8 disposition per
-// docs/design/06-idempotency.md §T8 + docs/phases/03-resilience.md §4:
+// and the provider is never called. Asserts the full T8 disposition:
 //
 //   - exactly one DLQ outbox row on send.sms.dlq with partition_key=null
 //     (no-target), the locked dlqPayload schema (version 1, error =
@@ -753,8 +746,7 @@ func TestLoop_DecodeFailure_CommitsAndSkips(t *testing.T) {
 
 	// Inspect the DLQ outbox row directly: partition_key must be NULL
 	// (no notification id to key off of) and the payload must match
-	// the docs/design/04-kafka.md §3 schema for an undecodable
-	// message.
+	// the dlqPayload schema for an undecodable message.
 	var partitionKey *string
 	var dlqPayloadBytes []byte
 	require.NoError(t, env.st.Pool().QueryRow(context.Background(),
@@ -763,7 +755,7 @@ func TestLoop_DecodeFailure_CommitsAndSkips(t *testing.T) {
 	).Scan(&partitionKey, &dlqPayloadBytes))
 
 	assert.Nil(t, partitionKey,
-		"no-target T8 leaves outbox.partition_key NULL so the relay drops the record on dlq_partitions=1's only partition (docs/design/07-constants.md §F)")
+		"no-target T8 leaves outbox.partition_key NULL so the relay drops the record on the DLQ topic's single partition")
 
 	var got struct {
 		Version            int     `json:"version"`
@@ -798,8 +790,8 @@ func TestLoop_DecodeFailure_CommitsAndSkips(t *testing.T) {
 // TestLoop_Unprocessable_TargetedT8_FailsRowAndDLQs exercises the
 // targeted T8 path: a record decodes as JSON but fails validation
 // (missing recipient, invalid id format, attempt <= 0, etc.) AND
-// carries a valid id + attempt > 0 so RecordUnprocessable can run all
-// four statements per docs/design/06-idempotency.md §T8.
+// carries a valid id + attempt > 0 so RecordUnprocessable can run
+// all four statements of the T8 transaction.
 //
 // The locked invariants verified here:
 //   - the notifications row transitions DISPATCHED → FAILED,
@@ -832,7 +824,7 @@ func TestLoop_Unprocessable_TargetedT8_FailsRowAndDLQs(t *testing.T) {
 		"attempt":   2,
 		"channel":   "sms",
 		"recipient": "", // invalid: triggers missing_field branch
-		"content":   "phase 3 targeted t8",
+		"content":   "targeted t8",
 		"priority":  1,
 	}
 	payload, err := json.Marshal(body)
@@ -944,11 +936,12 @@ func TestLoop_StopsOnContextCancel(t *testing.T) {
 	requireLoopReturns(t, loopDone, 10*time.Second)
 }
 
-// TestLoop_Layer1_StaleAttempt_AcksAndSkips exercises Phase 3 §2.1:
-// a Kafka record whose attempt has been superseded between dispatcher
-// publish and worker poll (mimicking a reaper-reset + dispatcher
-// re-claim cycle) must be ack'd and skipped at Layer 1, with no
-// Layer 2 INSERT, no provider call, and no Tx B effect.
+// TestLoop_Layer1_StaleAttempt_AcksAndSkips exercises the Layer 1
+// stale-attempt branch: a Kafka record whose attempt has been
+// superseded between dispatcher publish and worker poll (mimicking a
+// reaper-reset + dispatcher re-claim cycle) must be ack'd and skipped
+// at Layer 1, with no Layer 2 INSERT, no provider call, and no Tx B
+// effect.
 func TestLoop_Layer1_StaleAttempt_AcksAndSkips(t *testing.T) {
 	env := newTestEnv(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Errorf("provider must not be called on a Layer 1 stale-attempt skip")
@@ -957,7 +950,7 @@ func TestLoop_Layer1_StaleAttempt_AcksAndSkips(t *testing.T) {
 
 	row := insertDispatched(t, env.st, "00000000-0000-4000-8000-000000000300", 1)
 	produceSendSMS(t, env.brokers, row.ID.String(),
-		sendPayloadJSON(t, row.ID, 1, "phase 3 stale"))
+		sendPayloadJSON(t, row.ID, 1, "stale"))
 
 	// Mimic the reaper-reset + dispatcher re-claim cycle: bump attempt
 	// to 2 while keeping status DISPATCHED. A real run would also
@@ -1000,11 +993,12 @@ func TestLoop_Layer1_StaleAttempt_AcksAndSkips(t *testing.T) {
 	requireLoopReturns(t, loopDone, 5*time.Second)
 }
 
-// TestLoop_Layer2_AlreadyStarted_AcksAndSkips exercises Phase 3 §2.2:
-// when another worker has already inserted the (notification_id,
-// attempt) row in delivery_attempts (Kafka redelivery, relay
-// duplicate, etc.), BeginAttempt returns started=false and the worker
-// acks + skips. No provider call, no Tx B effect.
+// TestLoop_Layer2_AlreadyStarted_AcksAndSkips exercises the Layer 2
+// conflict branch: when another worker has already inserted the
+// (notification_id, attempt) row in delivery_attempts (Kafka
+// redelivery, relay duplicate, etc.), BeginAttempt returns
+// started=false and the worker acks + skips. No provider call, no
+// Tx B effect.
 func TestLoop_Layer2_AlreadyStarted_AcksAndSkips(t *testing.T) {
 	env := newTestEnv(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Errorf("provider must not be called on a Layer 2 conflict skip")
@@ -1024,7 +1018,7 @@ func TestLoop_Layer2_AlreadyStarted_AcksAndSkips(t *testing.T) {
 	require.NoError(t, err)
 
 	produceSendSMS(t, env.brokers, row.ID.String(),
-		sendPayloadJSON(t, row.ID, 1, "phase 3 layer-2 conflict"))
+		sendPayloadJSON(t, row.ID, 1, "layer-2 conflict"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1061,20 +1055,22 @@ func TestLoop_Layer2_AlreadyStarted_AcksAndSkips(t *testing.T) {
 	requireLoopReturns(t, loopDone, 5*time.Second)
 }
 
-// TestLoop_RateLimit_RedisDown_DoesNotCommit exercises Phase 3 §2.4
-// step 5: when deps.Limiter.Acquire returns ratelimit.ErrRedisDown
-// the worker inserts the Layer 2 row, bails before the provider call,
-// and leaves the Kafka offset uncommitted so a future worker session
+// TestLoop_RateLimit_RedisDown_DoesNotCommit exercises the
+// redis-down branch of the rate-limit step: when
+// deps.Limiter.Acquire returns ratelimit.ErrRedisDown the worker
+// inserts the Layer 2 row, bails before the provider call, and
+// leaves the Kafka offset uncommitted so a future worker session
 // (or a session rejoin after the current one ends) re-fetches the
 // record from Kafka. Layer 2's row carries the started_at evidence
-// that the worker reached step 4; no Tx B effects are visible.
+// that the worker reached the rate-limit step; no Tx B effects are
+// visible.
 //
 // franz-go's consumer does not re-fetch an uncommitted record within
-// the same session (the offset commit only matters across joins), so
-// this test asserts the steady-state precondition for redelivery
-// rather than driving a redelivery directly. The Phase 3 itest in
-// internal/itest/lag_aware_test.go (Chunk 8) and the operational
-// docs cover the cross-session redelivery behavior end-to-end.
+// the same session (the offset commit only matters across joins),
+// so this test asserts the steady-state precondition for redelivery
+// rather than driving a redelivery directly. The integration test
+// in internal/itest/lag_aware_test.go covers the cross-session
+// redelivery behavior end-to-end.
 func TestLoop_RateLimit_RedisDown_DoesNotCommit(t *testing.T) {
 	env := newTestEnv(t, func(w http.ResponseWriter, _ *http.Request) {
 		t.Errorf("provider must not be called when the rate limiter reports Redis down")
@@ -1084,14 +1080,15 @@ func TestLoop_RateLimit_RedisDown_DoesNotCommit(t *testing.T) {
 
 	row := insertDispatched(t, env.st, "00000000-0000-4000-8000-000000000302", 1)
 	produceSendSMS(t, env.brokers, row.ID.String(),
-		sendPayloadJSON(t, row.ID, 1, "phase 3 redis down"))
+		sendPayloadJSON(t, row.ID, 1, "redis down"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	loopDone := runLoopAsync(ctx, env.deps)
 
-	// Layer 2's INSERT proves the worker reached step 4 of the
-	// pipeline (Layer 1 + Layer 2 ran; Acquire then bailed).
+	// Layer 2's INSERT proves the worker reached the rate-limit
+	// step of the pipeline (Layer 1 + Layer 2 ran; Acquire then
+	// bailed).
 	awaitDeliveryAttemptsCount(t, env.st, row.ID, 1, 30*time.Second)
 
 	// Settle past the worker's redisDownBackoff (1 s) so any side
@@ -1119,9 +1116,9 @@ func TestLoop_RateLimit_RedisDown_DoesNotCommit(t *testing.T) {
 		"row remains DISPATCHED until either Redis recovers or the reaper resets the row")
 	assert.Equal(t, 1, got.Attempt)
 
-	// The locked Phase 3 §2.4 step 5 invariant: ErrRedisDown leaves
-	// the offset uncommitted so a future session sees the record
-	// again. Verify directly against the Kafka group coordinator.
+	// The locked invariant: ErrRedisDown leaves the offset
+	// uncommitted so a future session sees the record again. Verify
+	// directly against the Kafka group coordinator.
 	assertOffsetNotCommitted(t, env.brokers, consumerGroupSMS)
 
 	assert.Equal(t, int32(0), env.requests.Load(),
@@ -1151,7 +1148,7 @@ func requireLoopReturns(t *testing.T, loopDone <-chan error, timeout time.Durati
 // rather than against raw bytes.
 //
 // Defaults the expected channel to "sms" — the SMS-only happy-path
-// tests rely on this. Phase 3 Chunk 7's email + push tests use
+// tests rely on this. The email + push tests use
 // assertEventOutboxForChannel to assert the matching channel value.
 func assertEventOutbox(t *testing.T, st *store.Store, id uuid.UUID, currentStatus, classification string, failureReason *string) {
 	t.Helper()
@@ -1159,8 +1156,8 @@ func assertEventOutbox(t *testing.T, st *store.Store, id uuid.UUID, currentStatu
 }
 
 // assertEventOutboxForChannel is the channel-parameterized variant
-// added by Phase 3 Chunk 7. Asserts the events.notification outbox
-// row's `channel` field matches the test's channel under test (so a
+// of assertEventOutbox. Asserts the events.notification outbox row's
+// `channel` field matches the test's channel under test (so a
 // regression that emits the wrong channel value surfaces here).
 func assertEventOutboxForChannel(t *testing.T, st *store.Store, id uuid.UUID, channel, currentStatus, classification string, failureReason *string) {
 	t.Helper()
@@ -1193,7 +1190,7 @@ func assertEventOutboxForChannel(t *testing.T, st *store.Store, id uuid.UUID, ch
 
 	assert.Equal(t, 1, got.Version)
 	assert.Equal(t, id.String(), got.ID)
-	assert.Nil(t, got.BatchID, "Phase 2 single-create has null batch_id")
+	assert.Nil(t, got.BatchID, "single-create has null batch_id")
 	assert.Equal(t, channel, got.Channel)
 	assert.Equal(t, "DISPATCHED", got.PreviousStatus,
 		"worker only acts on DISPATCHED rows; previous_status is always DISPATCHED")
@@ -1222,8 +1219,9 @@ func newIntegrationTracerProvider(t *testing.T) (*tracetest.InMemoryExporter, *s
 	return exp, tp
 }
 
-// TestLoop_EventOutboxCarriesTraceHeadersTxB asserts Chunk 6: Tx B writes
-// worker.handleRecord trace context into events.notification outbox headers.
+// TestLoop_EventOutboxCarriesTraceHeadersTxB asserts Tx B writes
+// worker.handleRecord trace context into events.notification outbox
+// headers.
 func TestLoop_EventOutboxCarriesTraceHeadersTxB(t *testing.T) {
 	env := newTestEnv(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1291,16 +1289,28 @@ func TestLoop_RebuildsContextFromKafkaHeaders(t *testing.T) {
 
 	_ = awaitStatus(t, env.st, row.ID, "DELIVERED", 30*time.Second)
 
-	require.NoError(t, tp.ForceFlush(context.Background()))
+	// awaitStatus returns the moment notifications.status flips to
+	// DELIVERED, but handleRecord still has commitRecord(rec) (a Kafka
+	// offset commit; 10–300 ms on a loaded CI runner) to run before its
+	// deferred span.End() fires. SimpleSpanProcessor exports
+	// synchronously on End, so the lookup only needs to wait until End
+	// happens — ForceFlush is a no-op on the SimpleSpanProcessor path
+	// but kept inside the loop so a future BatchSpanProcessor swap stays
+	// correct. Mirrors the Eventually pattern in
+	// internal/itest/tracing_test.go that exists for the same race.
 	var handle *tracetest.SpanStub
-	for _, s := range exp.GetSpans() {
-		if s.Name == "worker.handleRecord" {
-			cp := s
-			handle = &cp
-			break
+	require.Eventually(t, func() bool {
+		_ = tp.ForceFlush(context.Background())
+		for _, s := range exp.GetSpans() {
+			if s.Name == "worker.handleRecord" {
+				cp := s
+				handle = &cp
+				return true
+			}
 		}
-	}
-	require.NotNil(t, handle)
+		return false
+	}, 10*time.Second, 50*time.Millisecond,
+		"worker.handleRecord span never appeared in the exporter")
 	assert.True(t, handle.Parent.SpanID().IsValid())
 	assert.Equal(t, parentSpanID, handle.Parent.SpanID())
 

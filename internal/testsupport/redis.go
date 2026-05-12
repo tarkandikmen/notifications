@@ -12,18 +12,15 @@ import (
 
 // redisImage matches docker-compose.yml's redis service so test
 // behavior tracks the deployed container behavior. redis:7 ships
-// Lua / EVALSHA / NOSCRIPT (the script-cache fallback go-redis/v9's
-// Script.Run depends on) per docs/phases/03-resilience.md §1.
+// Lua / EVALSHA / NOSCRIPT — the script-cache fallback go-redis/v9's
+// Script.Run depends on.
 const redisImage = "redis:7"
 
 // StartRedis boots a redis:7 testcontainer, waits for the standard
 // "Ready to accept connections" log line, returns the redis://host:port
 // URL, and registers a t.Cleanup that terminates the container. Same
 // gating shape as StartPostgres / StartKafka so tests that compose
-// helpers (Phase 3 Chunk 7's full-stack tests) need no per-helper
-// guards.
-//
-// docs/phases/03-resilience.md §1 (Chunk 1 integration tests).
+// helpers (full-stack rate-limit tests) need no per-helper guards.
 func StartRedis(t *testing.T) string {
 	t.Helper()
 	IntegrationGuard(t)

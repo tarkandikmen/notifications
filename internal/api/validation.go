@@ -12,33 +12,28 @@ import (
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
-// Validation rules — per-channel surface locked in
-// docs/design/03-api.md §Validation rules and
-// docs/phases/03-resilience.md §10. Phase 2 only handled SMS;
-// Phase 3 Chunk 7 widens the channel restriction and adds the
-// email + push recipient + content rules.
+// Validation rules — per-channel surface. The channel value selects
+// the recipient regex and content-length cap that apply; the file
+// covers SMS, email, and push.
 //
-// Hand-written per docs/phases/00-phases.md §Library stack ("No
-// validator library"). Regex is stdlib and counts as hand-written;
-// this file holds every rule (no third-party schema layer).
+// Rules are hand-written against stdlib regex; the file holds every
+// rule and the package depends on no third-party schema library.
 
 const (
 	// channelSMS / channelEmail / channelPush are the three channel
-	// values the api accepts in Phase 3 per
-	// docs/design/01-schema.md §Domain values for notifications.channel.
+	// values the api accepts.
 	channelSMS   = "sms"
 	channelEmail = "email"
 	channelPush  = "push"
 
-	// content_<channel>_max constants from docs/design/07-constants.md §G.
+	// Per-channel content-length caps measured in runes.
 	// SMS = 1600 (10 GSM-7 concatenated segments); email = 100000
 	// (~100 KB plaintext body); push = 4000 (FCM ~4 KB / APNs 4–5 KB).
 	contentSMSMax   = 1600
 	contentEmailMax = 100000
 	contentPushMax  = 4000
 
-	// recipient_email_max / recipient_push_min / recipient_push_max
-	// constants from docs/design/07-constants.md §G. Email cap is the
+	// Per-channel recipient length bounds. Email cap is the
 	// RFC 5321 §4.5.3.1.3 maximum. Push tokens are opaque per
 	// provider; the bounds bracket Apple device tokens (64 hex chars),
 	// FCM tokens (~152 chars typical), and VAPID web push (longer).
@@ -50,28 +45,22 @@ const (
 	priorityNormal = "normal"
 	priorityHigh   = "high"
 
-	// statusPending is the only status the api ever writes (T1) per
-	// docs/design/02-state-machine.md §State-driving components.
+	// statusPending is the only status the api ever writes (T1).
 	statusPending = "PENDING"
 
-	// listDefaultLimit / listMaxLimit are inlined from
-	// docs/design/07-constants.md §G (list_default_limit = 50,
-	// list_max_limit = 200). Inlining is permitted per
-	// docs/phases/00-phases.md §Phase doc conventions ("Inline small
-	// constants when friction-reducing").
+	// Pagination bounds for GET /v1/notifications: default limit 50,
+	// maximum 200.
 	listDefaultLimit = 50
 	listMaxLimit     = 200
 
 	// batchMax is the cap on POST /v1/notifications/batch.Notifications
-	// length per docs/design/07-constants.md §G (batch_max = 1000).
-	// Inlined here so the validator and handler can reference one name;
-	// the OpenAPI spec mirrors the value in Phase 4 Chunk 4.
+	// length. Inlined here so the validator and handler can reference
+	// one name; the OpenAPI spec mirrors the value.
 	batchMax = 1000
 )
 
 // validStatuses is the set of values GET /v1/notifications accepts for
-// the `status` query param per docs/design/01-schema.md §Domain values
-// for notifications.status.
+// the `status` query param.
 var validStatuses = map[string]struct{}{
 	"PENDING":    {},
 	"DISPATCHED": {},
@@ -80,59 +69,44 @@ var validStatuses = map[string]struct{}{
 	"CANCELLED":  {},
 }
 
-// e164Re matches E.164 phone numbers per docs/design/03-api.md
-// §Validation rules: a leading +, a non-zero first digit, then 1–14 more
-// digits (total 2–15 digits after the +).
+// e164Re matches E.164 phone numbers: a leading +, a non-zero first
+// digit, then 1–14 more digits (total 2–15 digits after the +).
 var e164Re = regexp.MustCompile(`^\+[1-9]\d{1,14}$`)
 
-// emailRe is the intentionally permissive email regex from
-// docs/design/03-api.md §Validation rules row `email`: <local>@<domain>
-// with at least one `.` in <domain>. Full RFC 5322 is explicitly NOT
-// enforced; the rule's job is to reject obvious typos and route
-// per-channel formatting downstream, not to validate deliverability.
+// emailRe is the intentionally permissive email regex used for the
+// email channel: <local>@<domain> with at least one `.` in <domain>.
+// Full RFC 5322 is explicitly NOT enforced; the rule's job is to
+// reject obvious typos and route per-channel formatting downstream,
+// not to validate deliverability.
 var emailRe = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
 
-// uuidV4Re enforces the canonical lowercase UUIDv4 string per
-// docs/design/03-api.md §Validation rules and the inline expansion in
-// docs/phases/02-walking-skeleton.md §5: 36 chars, hyphens at positions
-// 8/13/18/23, hex lowercase, position 14 = '4' (the version), position 19
-// in {8,9,a,b} (the RFC 4122 variant). Compact (32-hex) form and
-// uppercase hex are rejected.
+// uuidV4Re enforces the canonical lowercase UUIDv4 string: 36 chars,
+// hyphens at positions 8/13/18/23, hex lowercase, position 14 = '4'
+// (the version), position 19 in {8,9,a,b} (the RFC 4122 variant).
+// Compact (32-hex) form and uppercase hex are rejected.
 var uuidV4Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
-// ValidateCreate runs every rule from docs/design/03-api.md §Validation
-// rules and returns one FieldIssue per failing rule. Rules do NOT
-// short-circuit — the caller's response surfaces every issue at once
-// so a single round trip is enough for the client to fix everything.
+// ValidateCreate runs every validation rule and returns one FieldIssue
+// per failing rule. Rules do NOT short-circuit — the caller's response
+// surfaces every issue at once so a single round trip is enough for
+// the client to fix everything.
 //
 // `now` is the server-side clock used for the scheduled_at >= now() check.
 // The handler injects it via Deps.Clock so tests can pin time without
 // monkey-patching.
 //
-// Phase 3 Chunk 7 widens the per-channel rules: the channel value
-// determines which recipient regex + content cap applies. Phase 4
-// Chunk 2 factors the per-field rules into validateCreateItem so the
-// batch validator can rerun them with prefixed paths.
+// The per-channel rules read the channel value to select the recipient
+// regex and content cap that apply. The per-field rules are factored
+// into validateCreateItem so the batch validator can rerun them with
+// prefixed paths.
 func ValidateCreate(req CreateRequest, now time.Time) []FieldIssue {
-	return validateCreateItem(BatchItem{
-		Channel:        req.Channel,
-		Recipient:      req.Recipient,
-		Content:        req.Content,
-		Template:       req.Template,
-		TemplateData:   req.TemplateData,
-		Priority:       req.Priority,
-		ScheduledAt:    req.ScheduledAt,
-		IdempotencyKey: req.IdempotencyKey,
-	}, now)
+	return validateCreateItem(BatchItem(req), now)
 }
 
 // validateCreateItem runs the per-item rules shared by ValidateCreate
 // (single create) and ValidateBatchCreate (batch create, with paths
-// prefixed by notifications[i]. in the caller). Every rule is the same
-// as docs/design/03-api.md §Validation rules; rules do NOT short-circuit
-// so every issue surfaces in one round trip.
-//
-// docs/phases/04-api-completeness.md §3.1.
+// prefixed by notifications[i]. in the caller). Rules do NOT
+// short-circuit so every issue surfaces in one round trip.
 func validateCreateItem(item BatchItem, now time.Time) []FieldIssue {
 	var issues []FieldIssue
 
@@ -170,10 +144,10 @@ func validateCreateItem(item BatchItem, now time.Time) []FieldIssue {
 	}
 
 	if item.Template != "" {
-		issues = append(issues, FieldIssue{Path: "template", Issue: "templates are not supported in phase 3"})
+		issues = append(issues, FieldIssue{Path: "template", Issue: "templates are not supported"})
 	}
 	if len(item.TemplateData) > 0 {
-		issues = append(issues, FieldIssue{Path: "template_data", Issue: "templates are not supported in phase 3"})
+		issues = append(issues, FieldIssue{Path: "template_data", Issue: "templates are not supported"})
 	}
 
 	if item.Priority != "" {
@@ -200,10 +174,9 @@ func validateCreateItem(item BatchItem, now time.Time) []FieldIssue {
 	return issues
 }
 
-// ValidateBatchCreate runs every rule from docs/design/03-api.md
-// §Validation rules against every item in the batch, with paths
-// rewritten to "notifications[i].<field>". It also enforces the
-// batch-only rules:
+// ValidateBatchCreate runs every per-item rule against every item in
+// the batch, with paths rewritten to "notifications[i].<field>". It
+// also enforces the batch-only rules:
 //
 //   - len(req.Notifications) >= 1 (empty batch is validation_failed,
 //     not 201 — the contract requires at least one item).
@@ -211,8 +184,7 @@ func validateCreateItem(item BatchItem, now time.Time) []FieldIssue {
 //     returns 413 payload_too_large, NOT 400; the handler discriminates
 //     by inspecting the issue path + text).
 //   - All idempotency_key values pairwise distinct (intra-batch
-//     duplicates per docs/design/06-idempotency.md §Intra-batch
-//     duplicates).
+//     duplicates are validation_failed).
 //
 // Returns one FieldIssue per failing rule. Rules do not short-circuit
 // — every item's failures and the batch-level failures all surface in
@@ -223,8 +195,6 @@ func validateCreateItem(item BatchItem, now time.Time) []FieldIssue {
 // 413 without surfacing per-item issues against a 50,000-item input
 // (wasted work; the client must shrink before any other feedback is
 // actionable).
-//
-// docs/phases/04-api-completeness.md §3.1.
 func ValidateBatchCreate(req BatchCreateRequest, now time.Time) []FieldIssue {
 	if len(req.Notifications) == 0 {
 		return []FieldIssue{{Path: "notifications", Issue: "at least one item required"}}
@@ -265,8 +235,7 @@ func ValidateBatchCreate(req BatchCreateRequest, now time.Time) []FieldIssue {
 	return issues
 }
 
-// validateRecipient enforces the per-channel recipient rules from
-// docs/design/03-api.md §Validation rules row `recipient`. Returns
+// validateRecipient enforces the per-channel recipient rules. Returns
 // nil on success.
 func validateRecipient(channel, recipient string) *FieldIssue {
 	switch channel {
@@ -290,8 +259,7 @@ func validateRecipient(channel, recipient string) *FieldIssue {
 	return nil
 }
 
-// validateContent enforces the per-channel content cap from
-// docs/design/03-api.md §Validation rules row `content`. Returns nil
+// validateContent enforces the per-channel content cap. Returns nil
 // on success. Length is measured in runes (not bytes) so emoji /
 // multibyte characters count once each, matching the SMS-segment
 // semantics that originally drove the cap.
@@ -320,9 +288,9 @@ func isCanonicalUUIDv4Lower(s string) bool {
 }
 
 // priorityToInt translates the string priority to its int16 storage value
-// per docs/design/01-schema.md §1 (Domain values: 0=low, 1=normal, 2=high).
-// Returns ok=false for unknown strings; callers may treat that as a
-// validation failure or a programmer error depending on context.
+// (0=low, 1=normal, 2=high). Returns ok=false for unknown strings;
+// callers may treat that as a validation failure or a programmer error
+// depending on context.
 func priorityToInt(s string) (int16, bool) {
 	switch s {
 	case priorityLow:
@@ -354,8 +322,6 @@ func priorityFromInt(v int16) string {
 // parameters. Filters embed the store-layer ListFilters since the api
 // layer's job here is purely translation: parse string → typed value,
 // then hand off to the store query.
-//
-// docs/phases/04-api-completeness.md §3.2.
 type ListRequest struct {
 	Offset  int
 	Limit   int
@@ -367,14 +333,11 @@ type ListRequest struct {
 // offset=0, limit=listDefaultLimit. Bounds: offset >= 0,
 // 1 <= limit <= listMaxLimit.
 //
-// Unknown query parameters are ignored, matching the
-// docs/design/03-api.md §Conventions rule for unknown body fields
-// applied symmetrically to the query string.
+// Unknown query parameters are ignored, matching the unknown-body-field
+// posture applied symmetrically to the query string.
 //
 // The function does not enforce `created_after <= created_before`; an
 // empty range is a legitimate query that produces an empty list.
-//
-// docs/phases/04-api-completeness.md §3.2.
 func parseListRequest(r *http.Request) (ListRequest, []FieldIssue) {
 	out := ListRequest{
 		Offset: 0,

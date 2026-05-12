@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -22,6 +22,7 @@ import (
 
 	"github.com/tarkandikmen/notifications/internal/api"
 	"github.com/tarkandikmen/notifications/internal/dispatcher"
+	"github.com/tarkandikmen/notifications/internal/health"
 	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/reaper"
 	"github.com/tarkandikmen/notifications/internal/relay"
@@ -49,18 +50,18 @@ func (itestZeroLag) MaxLag(context.Context, string, string) (int64, error) {
 	return 0, nil
 }
 
-// TestIntegration_Metrics_RegistryCoversLockedNames is Phase 5 Chunk 6's
+// TestIntegration_Metrics_RegistryCoversLockedNames is the
 // cross-component metrics check: every loop runs in-process against
 // metrics.Registry(), matching what Prometheus scrapes from each
 // production binary.
-//
-// docs/phases/05-observability.md §11 (internal/itest/metrics_test.go row).
 func TestIntegration_Metrics_RegistryCoversLockedNames(t *testing.T) {
 	pool, _ := testsupport.StartPostgres(t)
 	brokers := testsupport.StartKafka(t)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger))
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	var webhookHits int32
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -87,7 +88,9 @@ func TestIntegration_Metrics_RegistryCoversLockedNames(t *testing.T) {
 		Registry: reg,
 		Logger:   logger,
 		Clock:    time.Now,
-		Pinger:   pool.Ping,
+		Healthz: health.Handler(map[string]health.ProbeFunc{
+			"postgres": pool.Ping,
+		}),
 	})
 	apiServer := httptest.NewServer(mux)
 	t.Cleanup(apiServer.Close)
@@ -229,7 +232,7 @@ func scrapeMetrics(t *testing.T, base string) string {
 	t.Helper()
 	resp, err := http.Get(base + "/metrics")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	return string(b)

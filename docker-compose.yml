@@ -1,7 +1,8 @@
-# docker-compose.yml - Phase 1 topology.
-# Locked by docs/phases/01-foundation.md §9. Subsequent phases inherit this
-# service set without modification (the stub services already declare the
-# kafka and redis health dependencies they will use in Phase 2+).
+# docker-compose.yml — local-development topology for the notifications
+# service. Boots Postgres, Redis, Kafka (KRaft single-node), and Jaeger,
+# runs the migration and Kafka topic-bootstrap one-shot containers, then
+# starts the api, dispatcher, per-channel workers, relay, and reaper
+# binaries with their dependency health-checks wired up.
 
 services:
   db:
@@ -80,8 +81,7 @@ services:
   # to complete before starting, so the dispatcher's lag-aware ticks
   # don't fire against topics that don't exist yet (which would surface
   # as fail-open UNKNOWN_TOPIC_OR_PARTITION warnings on every tick
-  # until franz-go's metadata refresh catches up). Phase 3 resilience
-  # cold-start fix.
+  # until franz-go's metadata refresh catches up).
   kafka-bootstrap:
     build: .
     restart: "no"

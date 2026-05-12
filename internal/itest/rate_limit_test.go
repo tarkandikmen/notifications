@@ -1,13 +1,13 @@
 package itest
 
-// Phase 3 Chunk 8 full-stack rate-limit cap test.
+// Full-stack rate-limit cap test.
 //
 // Boots Postgres + Kafka + Redis testcontainers, runs api + dispatcher
 // + relay + worker + reaper. The worker's rate-limit bucket is built
 // via ratelimit.NewWithLimits(client, 10, 10, 100ms) — a 10-token
 // burst, 10 tokens/second refill — so a 30-message run completes in
-// the ~3 s the spec calls out (vs. production 100/100's 0.3 s, which
-// is too short for the test to observe throttling).
+// ~3 s (vs. production 100/100's 0.3 s, which is too short for the
+// test to observe throttling).
 //
 // Posts 30 SMS notifications via the api and asserts the webhook hits
 // land in the bucket-shaped pattern: the first 10 hits are bursty
@@ -18,8 +18,6 @@ package itest
 // substantially shorter would mean the bucket failed to throttle, and
 // anything substantially longer would mean the bucket throttled at a
 // lower rate than configured.
-//
-// docs/phases/03-resilience.md §13 + §Chunk 8.
 
 import (
 	"context"
@@ -52,11 +50,10 @@ import (
 	"github.com/tarkandikmen/notifications/internal/worker"
 )
 
-// Rate-limit test parameters. The bucket constants match the spec's
-// §13 row "rate-limit bucket capacity overridden to 10 ... refill rate
-// to 10 tokens/s." 30 notifications = 10 burst + 20 throttled, which
-// produces the cleanest two-window assertion (burst spread short,
-// throttled spread ≥ 1.5 s).
+// Rate-limit test parameters. Bucket capacity is overridden to 10 and
+// the refill rate to 10 tokens/s. 30 notifications = 10 burst + 20
+// throttled, which produces the cleanest two-window assertion (burst
+// spread short, throttled spread ≥ 1.5 s).
 const (
 	rlBucketRate     = 10
 	rlBucketCapacity = 10
@@ -74,10 +71,9 @@ type rateLimitWebhookHit struct {
 	at time.Time
 }
 
-// TestRateLimit_BucketHoldsCap is the Phase 3 Chunk 8 rate-limit
-// acceptance test from docs/phases/03-resilience.md §13. The
-// assertion shape verifies (a) the bucket allows the burst (first 10
-// hits land tight), (b) the bucket throttles after the burst (next
+// TestRateLimit_BucketHoldsCap is the rate-limit acceptance test.
+// The assertion shape verifies (a) the bucket allows the burst (first
+// 10 hits land tight), (b) the bucket throttles after the burst (next
 // 20 hits at ~10/s), and (c) the throttled rate matches the
 // configured 10 tokens/s within CI scheduler noise.
 func TestRateLimit_BucketHoldsCap(t *testing.T) {
@@ -87,8 +83,9 @@ func TestRateLimit_BucketHoldsCap(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	// Webhook timestamps every hit; we read the slice after all
 	// records reach DELIVERED to assert the bucket-shaped timing.
@@ -121,8 +118,8 @@ func TestRateLimit_BucketHoldsCap(t *testing.T) {
 
 	// Dispatcher + reaper share one *kafkaadmin.LagClient; the lag
 	// query is real here (no fake) since the bucket is what's under
-	// test. Phase 3 Chunk 8's lag_aware_test.go covers the lag-fake
-	// branches independently.
+	// test. lag_aware_test.go covers the lag-fake branches
+	// independently.
 	lagClient, err := kafkaadmin.New(brokers)
 	require.NoError(t, err, "build kafkaadmin lag client")
 	t.Cleanup(lagClient.Close)
@@ -135,10 +132,10 @@ func TestRateLimit_BucketHoldsCap(t *testing.T) {
 
 	flushTestRedis(t, redisClient)
 
-	// Tiny bucket: 10 tokens/s, capacity 10. Per docs/phases/03-
-	// resilience.md §13 + §Chunk 8 notes, the test-only constructor
-	// keeps production pinned at 100/100 while letting this test
-	// observe throttling within a few-second wall-time budget.
+	// Tiny bucket: 10 tokens/s, capacity 10. The test-only
+	// constructor keeps production pinned at 100/100 while letting
+	// this test observe throttling within a few-second wall-time
+	// budget.
 	//
 	// The 200 ms request timeout (vs. production's 100 ms) absorbs
 	// CI Redis latency without changing the bucket's algorithm.

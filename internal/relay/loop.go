@@ -17,9 +17,8 @@ import (
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
-// Phase 2 relay tunables. Values inlined from
-// docs/design/07-constants.md §A; named constants live here so the loop
-// reads declaratively. Tests override via Deps fields.
+// Relay tunables. Named constants live here so the loop reads
+// declaratively; tests override via Deps fields.
 const (
 	defaultPollInterval = 50 * time.Millisecond
 	defaultBatchSize    = 500
@@ -27,11 +26,10 @@ const (
 
 // Producer is the slim subset of *kgo.Client that the relay loop needs.
 // Defining it as an interface lets cmd.go own the kgo lifecycle while
-// keeping the loop independently testable; phase 2's loop_test.go drives
-// the loop against the real *kgo.Client running against a Kafka
-// testcontainer (per docs/phases/02-walking-skeleton.md §13), so the
-// interface is here primarily for clean dependency direction rather than
-// fake-injection.
+// keeping the loop independently testable; loop_test.go drives the loop
+// against the real *kgo.Client running against a Kafka testcontainer,
+// so the interface is here primarily for clean dependency direction
+// rather than fake-injection.
 type Producer interface {
 	ProduceSync(ctx context.Context, rs ...*kgo.Record) kgo.ProduceResults
 }
@@ -41,13 +39,13 @@ type Producer interface {
 // logger + injectable knobs + the channel-to-kafka client.
 //
 // The loop holds *store.Store and the Producer interface directly rather
-// than wrapping them — phase 2's only loop-level test (loop_test.go) is
-// the integration test that exercises both the real Postgres and Kafka
+// than wrapping them — the only loop-level test (loop_test.go) is the
+// integration test that exercises both the real Postgres and Kafka
 // containers.
 //
-// Phase 5 adds Tracer for the per-tick relay.tick span; the field is
-// required and applyDefaults panics when nil to mirror the
-// dispatcher / reaper convention.
+// Tracer is the OpenTelemetry tracer used to open the per-tick
+// relay.tick span; the field is required and applyDefaults panics when
+// nil to mirror the dispatcher / reaper convention.
 type Deps struct {
 	Store        *store.Store
 	Producer     Producer
@@ -60,24 +58,17 @@ type Deps struct {
 	// Production (cmd.go) injects otel.Tracer(serviceName) backed
 	// by the global tracer provider; tests inject a noop tracer or
 	// an in-memory tracetest provider.
-	//
-	// docs/phases/05-observability.md §7.
 	Tracer trace.Tracer
 }
 
 // Loop drives the outbox-to-Kafka cycle until ctx is cancelled. Returns
-// nil on graceful shutdown; never returns an error in phase 2 — per-tick
-// failures are logged at warn and the next tick retries (the rolled-back
-// claim leaves the rows unpublished).
+// nil on graceful shutdown; never returns an error — per-tick failures
+// are logged at warn and the next tick retries (the rolled-back claim
+// leaves the rows unpublished).
 //
-// The loop name avoids colliding with the package's cobra-bound Run from
-// cmd.go. The spec writes "loop.Run(ctx, deps)" in
-// docs/phases/02-walking-skeleton.md §Repo layout, but loop.go and cmd.go
-// share a package; renaming the loop entry to Loop preserves the cobra
-// convention without splitting the package. Same shape as
+// The entry point is named Loop (not Run) because loop.go and cmd.go
+// share a package and cmd.go owns the cobra-bound Run. Same shape as
 // internal/dispatcher/loop.go.
-//
-// docs/phases/02-walking-skeleton.md §8.
 func Loop(ctx context.Context, deps Deps) error {
 	deps = applyDefaults(deps)
 
@@ -110,16 +101,16 @@ func Loop(ctx context.Context, deps Deps) error {
 // deps.BatchSize unpublished outbox rows, publish them all to Kafka in
 // one ProduceSync call, mark them published, commit. On any error the
 // deferred rollback fires — the rows stay published_at IS NULL and the
-// next tick re-publishes (at-least-once delivery per
-// docs/design/04-kafka.md §5; consumers handle dupes via the
-// (notification_id, attempt) ON CONFLICT in the worker's Tx B).
+// next tick re-publishes (at-least-once delivery; consumers handle
+// dupes via the (notification_id, attempt) ON CONFLICT in the worker's
+// Tx B).
 //
-// Phase 5 layers per-tick observability:
-//   - One relay.tick span per call, attributed with row count + outcome
-//     (docs/phases/05-observability.md §7). Each claimed outbox row also
-//     opens a short relay.row child with kafka.topic, outbox.id, and
-//     notification.id when partition_key is a UUID, so Jaeger tag search
-//     finds the publish hop for a notification.
+// Per-tick observability layered on top:
+//   - One relay.tick span per call, attributed with row count +
+//     outcome. Each claimed outbox row also opens a short relay.row
+//     child with kafka.topic, outbox.id, and notification.id when
+//     partition_key is a UUID, so Jaeger tag search finds the publish
+//     hop for a notification.
 //   - relay_ticks_total{outcome} counter on every branch (published,
 //     empty, error).
 //   - relay_published_rows_per_tick histogram on the successful-claim
@@ -191,11 +182,10 @@ func runOnce(ctx context.Context, deps Deps) error {
 		perTopic[row.Topic]++
 	}
 
-	// Publish-then-mark ordering per docs/phases/02-walking-skeleton.md §8.
-	// ProduceSync writes the whole batch at once (franz-go batches over
-	// the wire) and waits for broker acks. Any per-record error fails
-	// the whole batch — the deferred rollback fires and the rows stay
-	// unpublished for the next tick.
+	// Publish-then-mark ordering: ProduceSync writes the whole batch at
+	// once (franz-go batches over the wire) and waits for broker acks.
+	// Any per-record error fails the whole batch — the deferred
+	// rollback fires and the rows stay unpublished for the next tick.
 	if err := deps.Producer.ProduceSync(ctx, records...).FirstErr(); err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("relay: produce sync: %w", err)
@@ -224,9 +214,9 @@ func runOnce(ctx context.Context, deps Deps) error {
 
 // keyFrom converts the optional outbox partition_key into Kafka's []byte
 // key format. A nil partition_key produces a nil byte slice, which kgo
-// treats as no key — Kafka assigns a partition round-robin. Phase 2
-// always sets partition_key to the notification ID (dispatcher §7,
-// worker §9, reaper §11) so this nil branch is defensive only.
+// treats as no key — Kafka assigns a partition round-robin. The
+// dispatcher / worker / reaper always set partition_key to the
+// notification ID, so this nil branch is defensive only.
 func keyFrom(s *string) []byte {
 	if s == nil {
 		return nil
@@ -234,15 +224,15 @@ func keyFrom(s *string) []byte {
 	return []byte(*s)
 }
 
-// applyDefaults fills in zero-valued Deps fields with the locked Phase 2
-// defaults so callers (cmd.go in production, loop_test.go in tests) only
-// need to set what they're customizing.
+// applyDefaults fills in zero-valued Deps fields with the locked
+// defaults so callers (cmd.go in production, loop_test.go in tests)
+// only need to set what they're customizing.
 //
 // Tracer is required: a nil Tracer panics here so production wiring
 // (cmd.go) and tests that exercise runOnce must inject one. An
-// alternative (treat nil as "no spans") would silently regress the
-// §7 trace behavior under a future cmd.go that forgets to wire the
-// global tracer provider.
+// alternative (treat nil as "no spans") would silently regress
+// per-tick trace behavior under a future cmd.go that forgets to wire
+// the global tracer provider.
 func applyDefaults(d Deps) Deps {
 	if d.PollInterval <= 0 {
 		d.PollInterval = defaultPollInterval

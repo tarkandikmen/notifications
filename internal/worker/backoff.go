@@ -9,18 +9,16 @@ import (
 	"time"
 )
 
-// backoffBase is the deterministic exponential base from
-// docs/design/07-constants.md §D ("backoff_base = 1 s"). Both
+// backoffBase is the deterministic exponential base (1 s). Both
 // TransientBackoff and ReaperBackoff use it as the seed of the
 // 2^attempt exponential growth before the equal-jitter draw.
 const backoffBase = 1 * time.Second
 
-// reaperBackoffCap is the exponent ceiling for ReaperBackoff per
-// docs/design/07-constants.md §D ("reaper_backoff_cap = 8"). The
+// reaperBackoffCap is the exponent ceiling for ReaperBackoff. The
 // reaper applies this cap so a row trapped in a stuck-row reset
 // cycle does not wait literal hours between resets; the worker's
-// TransientBackoff is uncapped because docs/design/05-retry.md §3
-// notes max_attempts caps the chain implicitly there.
+// TransientBackoff is uncapped because max_attempts caps the chain
+// implicitly there.
 const reaperBackoffCap = 8
 
 // rng is the package-level PRNG used by TransientBackoff and
@@ -59,8 +57,7 @@ func newSeededRand() *rand.Rand {
 }
 
 // TransientBackoff returns the worker's per-attempt retry delay for a
-// transient outcome per docs/design/05-retry.md §3
-// ("transient_backoff(attempt)"). The shape is equal jitter:
+// transient outcome. The shape is equal jitter:
 //
 //	deterministic(attempt)     = backoff_base * 2^attempt
 //	transient_backoff(attempt) = deterministic/2 + uniform(0, deterministic/2)
@@ -68,32 +65,27 @@ func newSeededRand() *rand.Rand {
 // Result range: [deterministic/2, deterministic].
 //
 // `attempt` is the just-completed attempt number — notifications.attempt
-// at outcome time per docs/design/02-state-machine.md §Counter
-// discipline. attempt < 1 is clamped to 1 defensively; production never
-// produces a sub-1 attempt because the dispatcher always increments to
-// >= 1 at T2.
+// at outcome time. attempt < 1 is clamped to 1 defensively; production
+// never produces a sub-1 attempt because the dispatcher always
+// increments to >= 1 at T2.
 //
-// No upper bound on the exponent — max_attempts (docs/design/07-constants.md
-// §D) caps the chain implicitly: after attempt = max_attempts the
-// worker switches from T5 (retry) to T7 (terminal-fail) and no further
-// backoff calls fire for this row.
+// No upper bound on the exponent — max_attempts caps the chain
+// implicitly: after attempt = max_attempts the worker switches from T5
+// (retry) to T7 (terminal-fail) and no further backoff calls fire for
+// this row.
 func TransientBackoff(attempt int) time.Duration {
 	return jittered(deterministic(attempt))
 }
 
-// ReaperBackoff returns the reaper's per-row reset delay per
-// docs/design/05-retry.md §3 ("reaper_backoff(attempt)"). Same equal
+// ReaperBackoff returns the reaper's per-row reset delay. Same equal
 // jitter as TransientBackoff but the exponent is capped at
-// reaper_backoff_cap = 8 (docs/design/07-constants.md §D) so a row
-// trapped in a long reaper-driven cycle does not wait days between
-// resets.
+// reaperBackoffCap = 8 so a row trapped in a long reaper-driven cycle
+// does not wait days between resets.
 //
 // Result range: [deterministic_capped/2, deterministic_capped] where
-// deterministic_capped = backoff_base * 2^min(attempt, reaper_backoff_cap).
+// deterministic_capped = backoff_base * 2^min(attempt, reaperBackoffCap).
 //
-// Reserved for the reaper loop's post-pass jitter step in
-// docs/phases/03-resilience.md §6 (Chunk 6 wires it; Chunk 3 ships
-// the function so the chunks merge in any order).
+// Used by the reaper loop's post-pass jitter step.
 func ReaperBackoff(attempt int) time.Duration {
 	return jittered(deterministicCapped(attempt))
 }
@@ -106,8 +98,6 @@ func ReaperBackoff(attempt int) time.Duration {
 //
 //	prev := worker.SetRand(rand.New(rand.NewPCG(42, 0)))
 //	t.Cleanup(func() { worker.SetRand(prev) })
-//
-// docs/phases/03-resilience.md §5.
 func SetRand(r *rand.Rand) (previous *rand.Rand) {
 	rngMu.Lock()
 	defer rngMu.Unlock()
@@ -117,7 +107,7 @@ func SetRand(r *rand.Rand) (previous *rand.Rand) {
 }
 
 // deterministic computes backoff_base * 2^attempt — the unjittered
-// growth curve from docs/design/05-retry.md §3.
+// growth curve.
 //
 // attempt is clamped to >= 1 so a stray zero from an upstream bug does
 // not produce a sub-second backoff (math.Pow(2, 0) = 1, which would
@@ -131,10 +121,10 @@ func deterministic(attempt int) time.Duration {
 	return time.Duration(float64(backoffBase) * exp)
 }
 
-// deterministicCapped computes backoff_base * 2^min(attempt, reaper_backoff_cap).
-// The cap protects the reaper's chain length per docs/design/05-retry.md
-// §3 — without it, a row that bounces through 12 reaper resets would
-// otherwise wait 2^12 s ≈ 68 min per cycle.
+// deterministicCapped computes backoff_base * 2^min(attempt, reaperBackoffCap).
+// The cap protects the reaper's chain length — without it, a row that
+// bounces through 12 reaper resets would otherwise wait 2^12 s ≈ 68 min
+// per cycle.
 func deterministicCapped(attempt int) time.Duration {
 	if attempt > reaperBackoffCap {
 		attempt = reaperBackoffCap
@@ -142,8 +132,7 @@ func deterministicCapped(attempt int) time.Duration {
 	return deterministic(attempt)
 }
 
-// jittered turns a deterministic duration into the equal-jitter form
-// from docs/design/05-retry.md §3:
+// jittered turns a deterministic duration into the equal-jitter form:
 //
 //	floor + uniform(0, floor)  where floor = det/2
 //

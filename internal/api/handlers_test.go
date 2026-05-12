@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,14 +21,8 @@ import (
 )
 
 // fakeStore is the in-memory Store the handler tests substitute for the
-// real *store.Store per docs/phases/02-walking-skeleton.md §13. Each test
-// wires its own per-call behavior via the function fields so the assertions
-// stay near the test that needs them.
-//
-// Phase 4 Chunk 1 adds the list / get-batch fields per
-// docs/phases/04-api-completeness.md §10 (handler unit-test rows).
-// Phase 4 Chunk 2 adds the batch-insert fields.
-// Phase 4 Chunk 3 adds the cancel fields.
+// real *store.Store. Each test wires its own per-call behavior via the
+// function fields so the assertions stay near the test that needs them.
 type fakeStore struct {
 	insertCalled int
 	insertArg    store.Notification
@@ -121,10 +116,11 @@ func newTestServer(t *testing.T, fs *fakeStore) *httptest.Server {
 }
 
 // newTestServerWithDeps is the override-friendly variant of
-// newTestServer for tests that need to wire a custom Pinger or other
-// non-default dependency. The default Pinger remains nil — handleHealthz
-// preserves the Phase 1 byte-exact 200 path when no pinger is supplied,
-// so existing tests that call newTestServer continue to work unchanged.
+// newTestServer for tests that need to wire a custom Healthz handler
+// or other non-default dependency. The default Healthz remains nil —
+// RegisterRoutes substitutes a byte-exact 200 fallback when Healthz is
+// unset, so existing tests that call newTestServer continue to work
+// unchanged.
 func newTestServerWithDeps(t *testing.T, deps Deps) *httptest.Server {
 	t.Helper()
 	if deps.Registry == nil {
@@ -135,141 +131,65 @@ func newTestServerWithDeps(t *testing.T, deps Deps) *httptest.Server {
 	}
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, deps)
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewServer(envelopeMiddleware(mux))
 	t.Cleanup(srv.Close)
 	return srv
 }
 
-// TestHandleHealthz_ExactBody is the byte-match assertion that lived in
-// internal/server/server_test.go through Phase 1; per
-// docs/phases/02-walking-skeleton.md §6 it relocates here when handleHealthz
-// moves into the api package. The body must be exactly `{"status":"ok"}`
-// with no trailing newline so json.Encode is intentionally avoided.
+// TestHandleHealthz_NilHealthz_200ExactBody locks the byte-exact 200
+// contract on the api package's /healthz route when Deps.Healthz is
+// unset. Production cmd.go always supplies a real handler built via
+// internal/health.Handler, but every fakeStore-only test that calls
+// newTestServer relies on this fallback to stay green without wiring
+// a probe map.
 //
-// Phase 5 §3: the Pinger-nil branch preserves the byte-exact contract
-// so this test stays green; the rich body shape only fires on the 503
-// path (covered by TestHandleHealthz_PingerFails_503_RichBody below).
-func TestHandleHealthz_ExactBody(t *testing.T) {
-	rr := httptest.NewRecorder()
-	handleHealthz(Deps{})(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-
-	resp := rr.Result()
-	defer resp.Body.Close()
-
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
-
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	assert.Equal(t, `{"status":"ok"}`, string(body))
-}
-
-// TestHandleHealthz_PingerNil_200_ExactBytes asserts the Pinger-nil
-// path (default for tests that don't care about the dep probe)
-// returns the byte-exact 200 body. Mirrors TestHandleHealthz_ExactBody
-// at the route level rather than the handler-direct level.
-func TestHandleHealthz_PingerNil_200_ExactBytes(t *testing.T) {
+// Multi-component success / failure / timeout coverage lives in
+// internal/health/handler_test.go.
+func TestHandleHealthz_NilHealthz_200ExactBody(t *testing.T) {
 	srv := newTestServerWithDeps(t, Deps{Store: &fakeStore{}})
 
 	resp, err := http.Get(srv.URL + "/healthz")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	assert.Equal(t, `{"status":"ok"}`, string(body))
+	assert.Equal(t, `{"status":"ok"}`, string(body),
+		"nil Deps.Healthz must fall back to byte-exact 200 (no trailing newline)")
 }
 
-// TestHandleHealthz_PingerSucceeds_200_ExactBytes asserts a Pinger
-// that returns nil produces the same byte-exact 200 body. Without
-// this assertion a regression that always hit json.Encode (and added
-// a trailing newline) on the 200 path would slip through.
-func TestHandleHealthz_PingerSucceeds_200_ExactBytes(t *testing.T) {
-	srv := newTestServerWithDeps(t, Deps{
-		Store:  &fakeStore{},
-		Pinger: func(_ context.Context) error { return nil },
-	})
-
-	resp, err := http.Get(srv.URL + "/healthz")
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	assert.Equal(t, `{"status":"ok"}`, string(body))
-}
-
-// TestHandleHealthz_PingerFails_503_RichBody asserts a Pinger that
-// returns an error produces a 503 with the locked rich body shape
-// from docs/design/03-api.md §`GET /healthz`:
-// {"status":"unhealthy","components":{"postgres":"<error>"}}.
-func TestHandleHealthz_PingerFails_503_RichBody(t *testing.T) {
-	pingErr := errors.New("connection refused")
-	srv := newTestServerWithDeps(t, Deps{
-		Store:  &fakeStore{},
-		Pinger: func(_ context.Context) error { return pingErr },
-	})
-
-	resp, err := http.Get(srv.URL + "/healthz")
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
-	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
-
-	var body map[string]any
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	assert.Equal(t, "unhealthy", body["status"])
-
-	components, ok := body["components"].(map[string]any)
-	require.True(t, ok, "components must be a JSON object")
-	assert.Equal(t, "connection refused", components["postgres"], "postgres component carries the ping error message verbatim")
-}
-
-// TestHandleHealthz_PingerTimeout_503 asserts the per-request 2 s
-// context deadline kicks in: a Pinger that blocks longer than the
-// timeout returns context.DeadlineExceeded, and the 503 body
-// surfaces it. Uses a short test deadline (200 ms) via a Pinger that
-// respects ctx.Done so the test stays fast.
-func TestHandleHealthz_PingerTimeout_503(t *testing.T) {
-	srv := newTestServerWithDeps(t, Deps{
-		Store: &fakeStore{},
-		Pinger: func(ctx context.Context) error {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(5 * time.Second):
-				return nil
-			}
-		},
-	})
-
-	// Override the request to use a short timeout that wraps the
-	// Pinger's wait — the handler's 2 s ctx is the upper bound; this
-	// test asserts the wiring respects ctx cancellation, not the
-	// exact 2 s budget (which would slow the test).
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/healthz", nil)
-	require.NoError(t, err)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		// The client may abort before the server responds when the
-		// outer ctx fires before the inner 2 s deadline — that's
-		// equally valid evidence that ctx cancellation is wired.
-		// The test asserts no panic / no hang; an early client abort
-		// is acceptable.
-		return
+// TestHandleHealthz_InjectedHandler_IsInvoked asserts an injected
+// Healthz handler runs verbatim through the metrics.Middleware
+// wrapping in RegisterRoutes — the api package's only role on
+// /healthz is to wire whatever cmd.go supplies. The custom 503 body
+// below is intentionally distinct from the production multi-component
+// shape so a regression that swallows the injected handler would
+// surface as a 200 with the byte-exact fallback body.
+func TestHandleHealthz_InjectedHandler_IsInvoked(t *testing.T) {
+	var calls atomic.Int32
+	custom := func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"injected"}`))
 	}
-	defer resp.Body.Close()
+	srv := newTestServerWithDeps(t, Deps{
+		Store:   &fakeStore{},
+		Healthz: custom,
+	})
 
-	// If the server did respond, it must be 503 (the inner 2 s
-	// deadline expired before the 5 s sleep finished).
-	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	resp, err := http.Get(srv.URL + "/healthz")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.EqualValues(t, 1, calls.Load(), "injected Healthz must be called by RegisterRoutes")
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, `{"status":"injected"}`, string(body),
+		"RegisterRoutes must serve the injected handler verbatim")
 }
 
 func TestHandleCreate_HappyPath(t *testing.T) {
@@ -279,12 +199,12 @@ func TestHandleCreate_HappyPath(t *testing.T) {
 	body := `{
 		"channel": "sms",
 		"recipient": "+905551234567",
-		"content": "phase 2 happy",
+		"content": "happy",
 		"idempotency_key": "00000000-0000-4000-8000-000000000001"
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
@@ -303,7 +223,7 @@ func TestHandleCreate_HappyPath(t *testing.T) {
 	assert.Equal(t, "+905551234567", stored.Recipient)
 	assert.Equal(t, int16(1), stored.Priority, "default priority is normal=1")
 	require.NotNil(t, stored.Content)
-	assert.Equal(t, "phase 2 happy", *stored.Content)
+	assert.Equal(t, "happy", *stored.Content)
 	assert.Equal(t, "PENDING", stored.Status)
 	assert.Equal(t, 0, stored.Attempt)
 	assert.True(t, stored.EligibleAt.Equal(fixedNow), "eligible_at defaults to clock now")
@@ -324,7 +244,7 @@ func TestHandleCreate_ScheduledAtSetsEligibleAt(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
@@ -347,7 +267,7 @@ func TestHandleCreate_PriorityHigh(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 	assert.Equal(t, int16(2), fs.insertArg.Priority)
@@ -358,7 +278,7 @@ func TestHandleCreate_MalformedJSON(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	resp := postJSON(t, srv, "/v1/notifications", `{not valid json`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 
@@ -371,12 +291,9 @@ func TestHandleCreate_MalformedJSON(t *testing.T) {
 	assert.Zero(t, fs.insertCalled, "store must not be called for malformed JSON")
 }
 
-// TestHandleCreate_EmailChannel_201Lands is the Phase 3 Chunk 7
-// counterpart of Phase 2's channel-restriction test. Per
-// docs/phases/03-resilience.md §10 the channel restriction widens to
-// {sms, email, push}; an email POST that satisfies the email
-// recipient + content rules from docs/design/03-api.md §Validation
-// rules now lands a 201 with a freshly minted UUIDv7.
+// TestHandleCreate_EmailChannel_201Lands locks the email-channel happy
+// path: an email POST that satisfies the email recipient + content
+// rules lands a 201 with a freshly minted UUIDv7.
 func TestHandleCreate_EmailChannel_201Lands(t *testing.T) {
 	fs := &fakeStore{}
 	srv := newTestServer(t, fs)
@@ -384,12 +301,12 @@ func TestHandleCreate_EmailChannel_201Lands(t *testing.T) {
 	body := `{
 		"channel": "email",
 		"recipient": "u@example.com",
-		"content": "phase 3 email",
+		"content": "email body",
 		"idempotency_key": "00000000-0000-4000-8000-000000000010"
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
@@ -404,13 +321,12 @@ func TestHandleCreate_EmailChannel_201Lands(t *testing.T) {
 	assert.Equal(t, "email", stored.Channel)
 	assert.Equal(t, "u@example.com", stored.Recipient)
 	require.NotNil(t, stored.Content)
-	assert.Equal(t, "phase 3 email", *stored.Content)
+	assert.Equal(t, "email body", *stored.Content)
 }
 
 // TestHandleCreate_PushChannel_201Lands mirrors the email test for
 // the push channel: an opaque token of length recipientPushMin..max
-// + content within content_push_max passes validation and lands a
-// 201 per docs/design/03-api.md §Validation rules row `push`.
+// + content within content_push_max passes validation and lands a 201.
 func TestHandleCreate_PushChannel_201Lands(t *testing.T) {
 	fs := &fakeStore{}
 	srv := newTestServer(t, fs)
@@ -418,12 +334,12 @@ func TestHandleCreate_PushChannel_201Lands(t *testing.T) {
 	body := `{
 		"channel": "push",
 		"recipient": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		"content": "phase 3 push",
+		"content": "push body",
 		"idempotency_key": "00000000-0000-4000-8000-000000000011"
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
@@ -440,9 +356,7 @@ func TestHandleCreate_PushChannel_201Lands(t *testing.T) {
 }
 
 // TestHandleCreate_UnknownChannel_400 keeps the negative coverage
-// for an unknown channel value: only sms / email / push are accepted
-// in Phase 3 per docs/design/01-schema.md §Domain values for
-// notifications.channel.
+// for an unknown channel value: only sms / email / push are accepted.
 func TestHandleCreate_UnknownChannel_400(t *testing.T) {
 	fs := &fakeStore{}
 	srv := newTestServer(t, fs)
@@ -455,7 +369,7 @@ func TestHandleCreate_UnknownChannel_400(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -474,7 +388,7 @@ func TestHandleCreate_AllValidationsCollectedAtOnce(t *testing.T) {
 	// Empty body: every required rule fails. The handler must surface
 	// channel + recipient + content + idempotency_key in one response.
 	resp := postJSON(t, srv, "/v1/notifications", `{}`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -509,7 +423,7 @@ func TestHandleCreate_IdempotencyConflict(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusConflict, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -537,7 +451,7 @@ func TestHandleCreate_StoreErrorIsInternal(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -550,7 +464,7 @@ func TestHandleGet_NotFound_MissingRow(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications/00000000-0000-4000-8000-000000000099")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -563,7 +477,7 @@ func TestHandleGet_NotFound_MalformedUUID(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications/not-a-uuid")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
@@ -595,7 +509,7 @@ func TestHandleGet_HappyPath_OmitsNullableFields(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications/" + id.String())
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -665,7 +579,7 @@ func TestHandleGet_HappyPath_PopulatedNullableFields(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/v1/notifications/" + id.String())
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -706,12 +620,12 @@ func TestRegisterRoutes_HealthzAndMetrics(t *testing.T) {
 
 	resp, err := http.Get(srv.URL + "/healthz")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
 	resp2, err := http.Get(srv.URL + "/metrics")
 	require.NoError(t, err)
-	defer resp2.Body.Close()
+	defer func() { _ = resp2.Body.Close() }()
 	assert.Equal(t, http.StatusOK, resp2.StatusCode)
 }
 

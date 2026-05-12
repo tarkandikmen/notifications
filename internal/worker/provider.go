@@ -14,18 +14,17 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// providerRequestTimeout caps a single provider HTTP call per
-// docs/design/07-constants.md §H (provider_request_timeout = 30 s). A
+// providerRequestTimeout caps a single provider HTTP call at 30 s. A
 // timeout firing here surfaces to Classify as RequestErr and routes to
 // the transient branch (T5 or T7 depending on attempt).
 const providerRequestTimeout = 30 * time.Second
 
 // providerResponseBodyMaxBytes caps how much of the provider's response
 // body the worker reads. delivery_attempts.response is a JSONB column
-// (docs/design/01-schema.md §2) and a webhook returning a multi-MB body
-// would otherwise blow up the row. 64 KiB matches the typical "small
-// JSON response" envelope and tolerates the assessment provider
-// (webhook.site returns ~few-hundred bytes).
+// and a webhook returning a multi-MB body would otherwise blow up the
+// row. 64 KiB matches the typical "small JSON response" envelope and
+// tolerates the assessment provider (webhook.site returns ~few-hundred
+// bytes).
 const providerResponseBodyMaxBytes int64 = 64 * 1024
 
 // HTTPDoer is the slim subset of *http.Client the provider uses.
@@ -51,16 +50,15 @@ type Provider struct {
 // provider.
 //
 // webhookURL is the absolute URL passed via cfg.WebhookURL; the
-// provider posts every SMS to this single URL (Phase 2 has no
+// provider posts every notification to this single URL (no
 // per-recipient routing).
 //
-// Phase 5 wraps the transport with otelhttp.NewTransport so the
-// provider call automatically opens an `HTTP POST` span as a child of
-// the active span on the request's context. The worker's
+// The transport is wrapped with otelhttp.NewTransport so the provider
+// call automatically opens an `HTTP POST` span as a child of the
+// active span on the request's context. The worker's
 // `provider.Send(ctx, ...)` already passes ctx from handleRecord, so
-// the span chains under worker.handleRecord per
-// docs/phases/05-observability.md §6. No metric duplication — the
-// otelhttp span lives in the trace; the
+// the span chains under worker.handleRecord. No metric duplication —
+// the otelhttp span lives in the trace; the
 // worker_provider_request_duration_seconds histogram is what
 // dashboards graph.
 //
@@ -105,18 +103,17 @@ func NewProviderWithClient(client HTTPDoer, webhookURL string) *Provider {
 	return &Provider{client: client, webhookURL: webhookURL}
 }
 
-// providerRequest is the JSON body the worker POSTs to the webhook per
-// docs/phases/02-walking-skeleton.md §9 step 2.2. The fields are
-// exactly those documented; the Phase 6 template path adds rendered
-// content under the same `content` key.
+// providerRequest is the JSON body the worker POSTs to the webhook.
+// Future template rendering would supply the rendered string under the
+// same `content` key.
 type providerRequest struct {
 	To      string `json:"to"`
 	Channel string `json:"channel"`
 	Content string `json:"content"`
 }
 
-// Send posts the SMS message to the configured webhook URL and returns
-// a ProviderResult shaped for Classify. Behavior:
+// Send posts the message to the configured webhook URL and returns a
+// ProviderResult shaped for Classify. Behavior:
 //
 //   - HTTP response received (any status code): result.HTTPStatus is
 //     the response code; result.Body holds up to

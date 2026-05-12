@@ -20,10 +20,9 @@ import (
 // fields drive ReadStateForGuard's return; the captured args field lets
 // tests assert the function was invoked with the expected id.
 //
-// Phase 5 widened the return shape with createdAt; tests that don't
-// care supply the zero time.Time and the worker handles it
-// gracefully (the latency observation fires only on the GuardProceed
-// branch when CreatedAt is non-zero).
+// Tests that don't care about createdAt supply the zero time.Time and
+// the worker handles it gracefully (the latency observation fires only
+// on the GuardProceed branch when CreatedAt is non-zero).
 type fakeGuardReader struct {
 	status     string
 	attempt    int
@@ -37,10 +36,10 @@ func (f *fakeGuardReader) ReadStateForGuard(_ context.Context, id uuid.UUID) (st
 	return f.status, f.attempt, f.createdAt, f.err
 }
 
-// TestCheckStateGuard_BranchTable exercises every row in the
-// docs/phases/03-resilience.md §2.1 decision table. Each case pairs a
-// (status, attempt) Postgres-side reading with the message's attempt
-// and asserts the resulting GuardOutcome.
+// TestCheckStateGuard_BranchTable exercises every row in the state
+// guard's decision table. Each case pairs a (status, attempt)
+// Postgres-side reading with the message's attempt and asserts the
+// resulting GuardOutcome.
 func TestCheckStateGuard_BranchTable(t *testing.T) {
 	id := uuid.MustParse("01927000-0000-7000-8000-000000000001")
 
@@ -118,10 +117,9 @@ func TestCheckStateGuard_BranchTable(t *testing.T) {
 	}
 }
 
-// TestCheckStateGuard_ProceedCarriesCreatedAt locks the Phase 5
-// widening: GuardProceed surfaces the row's created_at so the worker
-// can observe notification_delivery_latency_seconds without a second
-// round trip per docs/phases/05-observability.md §1.1 worker rows.
+// TestCheckStateGuard_ProceedCarriesCreatedAt locks the contract that
+// GuardProceed surfaces the row's created_at so the worker can observe
+// notification_delivery_latency_seconds without a second round trip.
 // Non-Proceed outcomes leave CreatedAt as the zero time.Time; the
 // worker's latency observation guards on IsZero defensively.
 func TestCheckStateGuard_ProceedCarriesCreatedAt(t *testing.T) {
@@ -245,8 +243,7 @@ func makeKafkaRecord(topic string, key, value []byte) *kgo.Record {
 // `assert.Nil(t, dlq.OriginalMessage)` would fail even though the
 // wire payload was `"original_message": null`. This helper accepts
 // either shape — nil OR the literal bytes `null` — both of which
-// indicate that the producer set the field to JSON null per
-// docs/design/04-kafka.md §3.
+// indicate that the producer set the field to JSON null.
 func assertOriginalMessageNull(t *testing.T, raw json.RawMessage, msgAndArgs ...interface{}) {
 	t.Helper()
 	if len(raw) == 0 {
@@ -364,8 +361,8 @@ func TestBuildUnprocessable_Targeted_AllFieldsValid(t *testing.T) {
 		"targeted branch must not double-store the payload as base64")
 	assert.Equal(t, "missing_field", dlq.Error)
 
-	// Verify the events payload shape matches docs/design/04-kafka.md §2
-	// with the locked T8 discriminator values.
+	// Verify the events payload shape matches the events.notification
+	// schema with the locked T8 discriminator values.
 	var ev eventPayload
 	require.NoError(t, json.Unmarshal(in.EventPayload, &ev))
 	assert.Equal(t, eventPayloadVersion, ev.Version)
@@ -383,8 +380,7 @@ func TestBuildUnprocessable_Targeted_AllFieldsValid(t *testing.T) {
 }
 
 // TestBuildUnprocessable_NoTarget_MsgWithBadID asserts the
-// "msg != nil but msg.ID fails uuid.Parse" sub-branch from
-// docs/phases/03-resilience.md §4 BuildUnprocessable notes. The DLQ
+// "msg != nil but msg.ID fails uuid.Parse" sub-branch. The DLQ
 // payload uses original_message (decoded JSON), but
 // NotificationID + Attempt stay nil because the layer-3 guard needs
 // a real id. EventPayload stays empty.
@@ -492,10 +488,9 @@ func TestBuildUnprocessable_ChannelOverridesMsgChannel(t *testing.T) {
 }
 
 // TestBuildUnprocessable_EveryErrCode confirms every documented
-// error code per docs/design/04-kafka.md §3 + docs/design/05-retry.md §2
-// makes it through to the DLQ payload's error field unchanged. Acts
-// as a smoke test against a future refactor that introduces a code
-// translation step.
+// error code makes it through to the DLQ payload's error field
+// unchanged. Acts as a smoke test against a future refactor that
+// introduces a code translation step.
 func TestBuildUnprocessable_EveryErrCode(t *testing.T) {
 	rec := makeKafkaRecord("send.sms", nil, []byte(`x`))
 

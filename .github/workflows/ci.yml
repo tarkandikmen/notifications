@@ -7,42 +7,52 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: { go-version: '1.25' }
-      # Phase 4 §9 / §Chunk 4: Node 20 backs the spectral lint step
-      # below. Ubuntu-latest already ships Node, but the explicit
-      # actions/setup-node keeps the toolchain version pinned across
-      # runner image refreshes.
+      # Node 20 backs the spectral lint step below. Ubuntu-latest
+      # already ships Node, but the explicit actions/setup-node keeps
+      # the toolchain version pinned across runner image refreshes.
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - run: go mod download
       - run: gofmt -l . | tee /dev/stderr | (! read)
+      # Conservative bug-finding ruleset (govet, errcheck, staticcheck,
+      # ineffassign, unused, bodyclose) configured via .golangci.yml at
+      # the repo root. Pinned to v2.12.2 in lockstep with the
+      # `version:` comment in .golangci.yml — bump both sites together.
+      # Action v8 is the major that targets the golangci-lint v2
+      # toolchain. The 3 m --timeout matches the run.timeout pinned in
+      # the config; the integration step's 14 m budget below is
+      # unaffected because golangci-lint runs as its own step.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          args: --timeout=3m
       - run: go vet ./...
       - run: go test ./...
       - run: go build ./...
-      # Phase 4 §9 / §Chunk 4: lint docs/openapi.yaml against the
-      # built-in @stoplight/spectral OAS ruleset. The ruleset is loaded
-      # via .spectral.yaml at the repo root (Spectral CLI v6 dropped
-      # the `--ruleset spectral:oas` shorthand —
-      # https://github.com/stoplightio/spectral/issues/1893 — so a
-      # ruleset config file is the supported invocation form). Default
-      # `-F error` exits non-zero only on errors; warnings are allowed
-      # but should be reviewed per docs/phases/04-api-completeness.md
-      # §9.
+      # Lint docs/openapi.yaml against the built-in @stoplight/spectral
+      # OAS ruleset. The ruleset is loaded via .spectral.yaml at the
+      # repo root (Spectral CLI v6 dropped the `--ruleset spectral:oas`
+      # shorthand — https://github.com/stoplightio/spectral/issues/1893
+      # — so a ruleset config file is the supported invocation form).
+      # Default `-F error` exits non-zero only on errors; warnings are
+      # allowed but should be reviewed.
       - run: npx --yes @stoplight/spectral-cli@^6 lint docs/openapi.yaml
-      # Phase 2 §13 / §Chunk 7: gate the testcontainer-backed tests behind
-      # TEST_INTEGRATION=1 so `go test ./...` stays fast for unit-only
-      # contributors. ubuntu-latest ships Docker preinstalled, so
-      # testcontainers-go boots Postgres + Kafka + Redis without extra
-      # setup.
+      # Gate the testcontainer-backed tests behind TEST_INTEGRATION=1
+      # so `go test ./...` stays fast for unit-only contributors.
+      # ubuntu-latest ships Docker preinstalled, so testcontainers-go
+      # boots Postgres + Kafka + Redis without extra setup.
       #
-      # Phase 3 §13 / §Chunk 8: package list extends to ./internal/ratelimit/...
-      # (Redis testcontainer + Lua-script integration tests) and
-      # ./internal/kafkaadmin/... (Kafka testcontainer + lag-query
-      # integration tests). Timeout doubled from Phase 2's 5 m to 10 m
-      # to absorb the multichannel + rate-limit + lag-aware itest
-      # tests' ~2 min wall time on a clean checkout.
-      #
-      # Phase 4 §9 / §Chunk 4: timeout bumps from 10 m to 12 m to
-      # absorb the three new ./internal/itest/* files that ship with
-      # Phase 4 Chunk 5 (each adds 10–20 s of wall time against the
-      # cached container images).
-      - run: TEST_INTEGRATION=1 go test -timeout 14m ./internal/itest/... ./internal/store/... ./internal/dispatcher/... ./internal/relay/... ./internal/worker/... ./internal/reaper/... ./internal/ratelimit/... ./internal/kafkaadmin/... ./internal/metrics/... ./internal/observability/... ./internal/metricsserver/...
+      # The package list spans every internal package whose tests boot
+      # a testcontainer or rely on one indirectly: itest (end-to-end
+      # smoke tests), store / dispatcher / relay / worker / reaper
+      # (Postgres + Kafka), ratelimit (Redis + Lua script),
+      # kafkaadmin (Kafka lag query), metrics / observability /
+      # metricsserver, and health (the per-binary /healthz handler
+      # whose wiring smoke test in internal/itest/healthz_test.go
+      # boots Postgres / Kafka / Redis testcontainers and asserts each
+      # binary's handler returns 200 + byte-exact {"status":"ok"}
+      # against real deps). The 14 m timeout is calibrated to absorb
+      # the multichannel, rate-limit, lag-aware, and healthz itest
+      # suites against cached container images.
+      - run: TEST_INTEGRATION=1 go test -timeout 14m ./internal/itest/... ./internal/store/... ./internal/dispatcher/... ./internal/relay/... ./internal/worker/... ./internal/reaper/... ./internal/ratelimit/... ./internal/kafkaadmin/... ./internal/metrics/... ./internal/observability/... ./internal/metricsserver/... ./internal/health/...

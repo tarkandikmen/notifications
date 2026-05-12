@@ -5,12 +5,12 @@
 //
 // The script is loaded once per Redis server (via redis.Script) and
 // invoked through Script.Run, which transparently issues EVALSHA and
-// falls back to EVAL on a NOSCRIPT response — the standard go-redis/v9
-// pattern, see docs/phases/03-resilience.md §1.
+// falls back to EVAL on a NOSCRIPT response — the standard
+// go-redis/v9 pattern.
 //
 // Failure mode: on a Redis call failure (network error, EVAL failure,
 // per-call timeout) Acquire returns ErrRedisDown. The worker pauses
-// processing per ARCHITECTURE_v3.md §6.6 ("Failure mode (Redis down)")
+// processing per docs/ARCHITECTURE.md §6.6 ("Failure mode (Redis down)")
 // — Kafka redelivers the record on the next poll, the worker's outer
 // loop hits the same Acquire, and the cycle continues until Redis
 // recovers.
@@ -33,25 +33,25 @@ import (
 //go:embed script.lua
 var rateLimitLuaScript string
 
-// Inlined constants per docs/design/07-constants.md.
+// Rate-limit configuration constants.
 const (
-	// §E rate_limit_per_channel_per_second.
+	// Default token-bucket refill rate: 100 tokens per channel per second.
 	defaultRate = 100
-	// §E rate_limit_burst.
+	// Default token-bucket capacity; matches defaultRate so a fresh
+	// bucket can absorb one second of burst traffic.
 	defaultCapacity = 100
-	// §H redis_request_timeout. Per-call ceiling on the Lua invocation;
-	// firing it returns ErrRedisDown so the worker pauses processing
-	// per ARCHITECTURE_v3.md §6.6 rather than blocking on a stuck Redis.
+	// Per-call ceiling on the Lua invocation; firing it returns
+	// ErrRedisDown so the worker pauses processing per
+	// docs/ARCHITECTURE.md §6.6 rather than blocking on a stuck Redis.
 	defaultRequestTimeout = 100 * time.Millisecond
 
 	// keyPrefix prefixes every bucket key. Final key shape is
-	// "rate:<channel>" per ARCHITECTURE_v3.md §6.6.
+	// "rate:<channel>" per docs/ARCHITECTURE.md §6.6.
 	keyPrefix = "rate:"
 
-	// minSleep / maxSleep clamp the wait_ms returned by the Lua script
-	// per docs/phases/03-resilience.md §1 (Acquire body): a clock-skew
-	// bug must not freeze the worker indefinitely, and a one-token
-	// wait should not undershoot the per-call Redis cost.
+	// minSleep / maxSleep clamp the wait_ms returned by the Lua script:
+	// a clock-skew bug must not freeze the worker indefinitely, and a
+	// one-token wait should not undershoot the per-call Redis cost.
 	minSleep = 1 * time.Millisecond
 	maxSleep = 1000 * time.Millisecond
 
@@ -63,9 +63,8 @@ const (
 
 // ErrRedisDown is returned by Acquire when the underlying Redis call
 // itself failed — a network error, a EVAL/EVALSHA failure, or the
-// per-call deadline expiring. The caller pauses processing
-// (Kafka-redelivers the message; see worker handleRecord step 5 in
-// docs/phases/03-resilience.md §2.4).
+// per-call deadline expiring. The caller pauses processing so Kafka
+// redelivers the message on the next poll.
 //
 // redis.Nil is intentionally NOT mapped to this error: the Lua script
 // handles the "first call for this channel" case by treating an empty
@@ -94,8 +93,7 @@ type Bucket struct {
 }
 
 // New returns a Bucket pinned to the production rate / capacity /
-// timeout per docs/design/07-constants.md §E + §H (100 tokens/s,
-// burst 100, 100 ms Redis request timeout).
+// timeout: 100 tokens/s, burst 100, 100 ms Redis request timeout.
 //
 // The cmd.go in every worker binary calls this exactly once at startup
 // and shares the returned *Bucket across the worker's goroutines.
@@ -105,7 +103,7 @@ func New(client *redis.Client) *Bucket {
 
 // NewWithLimits constructs a Bucket with caller-chosen rate, capacity,
 // and per-call Redis timeout. Used by tests that want a deterministic,
-// throttle-able fixture; the Phase 3 rate-limit integration test in
+// throttle-able fixture; the rate-limit integration test in
 // internal/itest/rate_limit_test.go uses a 10/10 bucket so a 30-message
 // run completes in ~3 s rather than the production 100/100's 0.3 s
 // (which is too short for the test to observe throttling).
@@ -129,7 +127,7 @@ func NewWithLimits(client *redis.Client, rate, capacity int, requestTimeout time
 //   - ctx.Err() on cancellation (graceful shutdown; caller returns
 //     without committing the Kafka offset).
 //   - ErrRedisDown on a Redis call failure (caller pauses processing
-//     per ARCHITECTURE_v3.md §6.6 — Kafka redelivers).
+//     per docs/ARCHITECTURE.md §6.6 — Kafka redelivers).
 //
 // The loop body issues one Lua script call per iteration. On a deny
 // response the worker sleeps for the script-returned wait_ms (clamped
@@ -137,8 +135,7 @@ func NewWithLimits(client *redis.Client, rate, capacity int, requestTimeout time
 // and re-issues. The clamp + jitter live in Go rather than the script
 // so a future tuning change doesn't need a Redis-side script update.
 //
-// Phase 5 layers per-Acquire metric increments per
-// docs/phases/05-observability.md §1.1 (Rate limiter metrics row):
+// Per-Acquire metric increments:
 //   - rate_limit_acquires_total{channel, outcome} counter on every
 //     terminal disposition. outcome ∈ {granted,
 //     throttled_then_granted, redis_error, ctx_canceled}.
@@ -208,8 +205,7 @@ func (b *Bucket) Acquire(ctx context.Context, channel string) error {
 
 // Sample reads the current token count from Redis without consuming a
 // token. Used by the worker's metrics goroutine to publish the
-// rate_limit_tokens_available gauge per channel per
-// docs/phases/05-observability.md §8.3.
+// rate_limit_tokens_available gauge per channel.
 //
 // HGET against rate:<channel>'s tokens field returns the post-Acquire
 // token count (the Lua script writes it as a float). On a missing

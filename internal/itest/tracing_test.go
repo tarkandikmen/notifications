@@ -23,6 +23,7 @@ import (
 	"github.com/tarkandikmen/notifications/internal/api"
 	"github.com/tarkandikmen/notifications/internal/db"
 	"github.com/tarkandikmen/notifications/internal/dispatcher"
+	"github.com/tarkandikmen/notifications/internal/health"
 	"github.com/tarkandikmen/notifications/internal/kafkaadmin"
 	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/reaper"
@@ -34,8 +35,7 @@ import (
 
 // TestIntegration_Tracing_SpanChain boots the walking skeleton with an
 // in-memory OTLP exporter (no Jaeger container) and asserts the
-// dispatcher.row → worker.handleRecord parent linkage per
-// docs/phases/05-observability.md §11 (tracing_test.go row).
+// dispatcher.row → worker.handleRecord parent linkage.
 func TestIntegration_Tracing_SpanChain(t *testing.T) {
 	exp := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
@@ -56,7 +56,9 @@ func TestIntegration_Tracing_SpanChain(t *testing.T) {
 
 	brokers := testsupport.StartKafka(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger))
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -85,7 +87,9 @@ func TestIntegration_Tracing_SpanChain(t *testing.T) {
 		Registry: reg,
 		Logger:   logger,
 		Clock:    time.Now,
-		Pinger:   otelPool.Ping,
+		Healthz: health.Handler(map[string]health.ProbeFunc{
+			"postgres": otelPool.Ping,
+		}),
 	})
 	apiServer := httptest.NewServer(otelhttp.NewHandler(mux, "api"))
 	t.Cleanup(apiServer.Close)

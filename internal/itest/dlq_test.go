@@ -1,15 +1,14 @@
 package itest
 
-// Phase 3 Chunk 4 full-stack DLQ + T8 unprocessable disposition test.
+// Full-stack DLQ + T8 unprocessable disposition test.
 // Boots the same Postgres + Kafka + Redis + api + dispatcher + relay +
-// worker + reaper stack the Phase 2 end-to-end test runs, then drives
-// two T8 scenarios on top of a baseline notification:
+// worker + reaper stack the end-to-end test runs, then drives two T8
+// scenarios on top of a baseline notification:
 //
 //  1. Targeted T8 — produces a corrupt send.sms record whose payload
 //     decodes but fails validation (recipient is empty), keyed on a
 //     pre-inserted DISPATCHED notification's id at the row's current
-//     attempt. The full T8 transaction fires (statements 1–4 of
-//     docs/design/06-idempotency.md §T8): the row terminal-fails,
+//     attempt. The full T8 transaction fires: the row terminal-fails,
 //     a delivery_attempts row with classification='unprocessable' is
 //     inserted, the DLQ outbox row goes to send.sms.dlq with the row's
 //     id as partition_key, and an events.notification row is emitted.
@@ -23,9 +22,7 @@ package itest
 //
 // Both scenarios run as subtests under one parent test that owns the
 // expensive testcontainer setup, the full loop wiring, and the baseline
-// notification post per docs/phases/03-resilience.md §13.
-//
-// docs/phases/03-resilience.md §13 + §Chunk 4.
+// notification post.
 
 import (
 	"context"
@@ -62,7 +59,7 @@ import (
 )
 
 // dlqTestEnv bundles the resources every dlq_test scenario needs. The
-// fields mirror the Phase 2 end-to-end test's local variables but are
+// fields mirror the end-to-end test's local variables but are
 // captured in a struct so the subtests below can reach them without
 // closing over twenty t.Helper-style parameters.
 type dlqTestEnv struct {
@@ -97,8 +94,9 @@ func startDLQTestStack(t *testing.T) *dlqTestEnv {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	require.NoError(t, relay.Bootstrap(context.Background(), brokers, logger),
-		"bootstrap topics on the testcontainer broker (incl. send.sms.dlq)")
+	testsupport.BootstrapWithRetry(t, func() error {
+		return relay.Bootstrap(context.Background(), brokers, logger)
+	})
 
 	hits := &atomic.Int32{}
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -121,8 +119,8 @@ func startDLQTestStack(t *testing.T) *dlqTestEnv {
 
 	provider := worker.NewProvider(webhook.URL)
 
-	// Phase 3 Chunk 5: dispatcher + reaper read consumer-group lag via
-	// a kafkaadmin.LagClient before each tick. Build it against the
+	// Dispatcher + reaper read consumer-group lag via a
+	// kafkaadmin.LagClient before each tick. Build it against the
 	// same broker the producer / consumer use; both are wired into the
 	// loops' Deps below.
 	lagClient, err := kafkaadmin.New(brokers)
@@ -204,8 +202,8 @@ func startDLQTestStack(t *testing.T) *dlqTestEnv {
 			Interval:       60 * time.Second,
 			StuckThreshold: 120 * time.Second,
 			MaxAttempts:    7,
-			// Phase 3 Chunk 6: the reaper reads consumer-group lag via
-			// a kafkaadmin.LagClient before each cycle and skips on
+			// The reaper reads consumer-group lag via a
+			// kafkaadmin.LagClient before each cycle and skips on
 			// fail-closed disposition. Channels narrowed to {"sms"} to
 			// match the DLQ test's single-channel scope; the lag
 			// client itself is shared with the dispatcher.
@@ -249,12 +247,9 @@ func flushTestRedis(t *testing.T, c *redis.Client) {
 	require.NoError(t, c.FlushDB(ctx).Err(), "flush redis testdb")
 }
 
-// TestDLQ_T8_TargetedAndNoTarget is the Phase 3 Chunk 4 full-stack
-// acceptance test. The shared baseline confirms the system is alive
-// end-to-end before the corrupt-message scenarios drive the T8
-// branches.
-//
-// docs/phases/03-resilience.md §13 + §Chunk 4.
+// TestDLQ_T8_TargetedAndNoTarget is the full-stack DLQ acceptance
+// test. The shared baseline confirms the system is alive end-to-end
+// before the corrupt-message scenarios drive the T8 branches.
 func TestDLQ_T8_TargetedAndNoTarget(t *testing.T) {
 	env := startDLQTestStack(t)
 
@@ -265,7 +260,7 @@ func TestDLQ_T8_TargetedAndNoTarget(t *testing.T) {
 	baselineID := postNotification(t, env.apiURL, `{
 		"channel": "sms",
 		"recipient": "+905551234567",
-		"content": "phase 3 dlq baseline",
+		"content": "dlq baseline",
 		"idempotency_key": "00000000-0000-4000-8000-000000000500"
 	}`)
 	awaitNotificationStatus(t, env.apiURL, baselineID, "DELIVERED", 30*time.Second)
@@ -286,8 +281,7 @@ func TestDLQ_T8_TargetedAndNoTarget(t *testing.T) {
 	})
 }
 
-// runTargetedT8 drives the targeted T8 scenario per
-// docs/phases/03-resilience.md §13:
+// runTargetedT8 drives the targeted T8 scenario:
 //
 //   - Pre-insert a notification at DISPATCHED, attempt=N (mimicking
 //     the dispatcher's claim-and-publish without going through the
@@ -300,8 +294,7 @@ func TestDLQ_T8_TargetedAndNoTarget(t *testing.T) {
 //   - Wait for the worker's T8 disposition: the row reaches FAILED
 //     with failure_reason='unprocessable_message', a delivery_attempts
 //     row with classification='unprocessable' lands, and the DLQ +
-//     events.notification outbox rows are emitted per
-//     docs/design/06-idempotency.md §T8.
+//     events.notification outbox rows are emitted.
 //
 // The webhook hit count stays at 1 (baseline only) — T8 never calls
 // the provider.
@@ -314,7 +307,7 @@ func runTargetedT8(t *testing.T, env *dlqTestEnv) {
 		"attempt":   2,
 		"channel":   "sms",
 		"recipient": "", // invalid: triggers missing_field branch
-		"content":   "phase 3 targeted t8 payload",
+		"content":   "targeted t8 payload",
 		"priority":  1,
 	}
 	payload, err := json.Marshal(body)
@@ -354,9 +347,9 @@ func runTargetedT8(t *testing.T, env *dlqTestEnv) {
 
 	// Inspect the DLQ outbox row's raw payload + partition_key
 	// directly. The row must key on the targeted notification id and
-	// the payload must match docs/design/04-kafka.md §3 for a
-	// targeted (decoded) message: original_message holds the decoded
-	// JSON, original_message_raw stays null.
+	// the payload must match the targeted (decoded) shape:
+	// original_message holds the decoded JSON, original_message_raw
+	// stays null.
 	var partitionKey *string
 	var dlqPayloadBytes []byte
 	require.NoError(t, env.pool.QueryRow(context.Background(),
@@ -388,7 +381,7 @@ func runTargetedT8(t *testing.T, env *dlqTestEnv) {
 	assert.NoError(t, err, "failed_at must be RFC 3339: %q", dlq.FailedAt)
 
 	// events.notification outbox row for this scenario carries the
-	// locked T8 discriminators per docs/design/04-kafka.md §2.
+	// locked T8 discriminators.
 	var eventPayloadBytes []byte
 	require.NoError(t, env.pool.QueryRow(context.Background(),
 		`SELECT payload FROM outbox WHERE topic = 'events.notification' AND partition_key = $1`,
@@ -408,16 +401,13 @@ func runTargetedT8(t *testing.T, env *dlqTestEnv) {
 	assert.Equal(t, "unprocessable_message", *ev.FailureReason)
 
 	// Webhook hit count is still 1: only the baseline called the
-	// provider. The targeted T8 path skips steps 4–6 of handleRecord
-	// per docs/phases/03-resilience.md §2.4.
+	// provider. The targeted T8 path skips steps 4–6 of handleRecord.
 	assert.Equal(t, int32(1), env.webhookHits.Load(),
 		"targeted T8 must not call the provider")
 
 	// The DLQ + events.notification outbox rows both queue up for
 	// the relay's drain. Verify the DLQ topic actually sees the
-	// record on Kafka — the spec calls out that the relay keeps the
-	// dlq messages in a 30-day retention topic per
-	// docs/design/04-kafka.md §3 + docs/design/07-constants.md §F.
+	// record on Kafka.
 	dlqRecords := drainTopic(t, env.brokers, "send.sms.dlq", 15*time.Second, 500*time.Millisecond)
 	require.NotEmpty(t, dlqRecords,
 		"send.sms.dlq must receive at least the targeted T8 record")
@@ -432,8 +422,7 @@ func runTargetedT8(t *testing.T, env *dlqTestEnv) {
 		"DLQ topic must carry a record keyed on the targeted notification id; saw %d records", len(dlqRecords))
 }
 
-// runNoTargetT8 drives the no-target T8 scenario per
-// docs/phases/03-resilience.md §13:
+// runNoTargetT8 drives the no-target T8 scenario:
 //
 //   - Snapshot the baseline row counts (notifications, delivery_-
 //     attempts, events.notification outbox, send.sms.dlq outbox) so
@@ -444,8 +433,8 @@ func runTargetedT8(t *testing.T, env *dlqTestEnv) {
 //   - Assert the DLQ row has notification_id=null + error="decode_failed",
 //     and no other table mutated.
 //
-// docs/design/06-idempotency.md §T8 edge case "no decoded msg": the
-// no-target branch skips statements 1, 2, and 4 — the only side
+// The no-target branch (no decoded message available) skips
+// statements 1, 2, and 4 of the T8 transaction — the only side
 // effect is the DLQ outbox row.
 func runNoTargetT8(t *testing.T, env *dlqTestEnv) {
 	beforeNotifications := countRows(t, env.pool, "notifications")
@@ -564,7 +553,7 @@ func insertDispatchedRow(t *testing.T, st *store.Store, idempKey string, attempt
 
 	id, err := store.NewID()
 	require.NoError(t, err)
-	content := "phase 3 dlq targeted t8"
+	content := "dlq targeted t8"
 	row := store.Notification{
 		ID:             id,
 		Channel:        "sms",
@@ -592,9 +581,8 @@ func insertDispatchedRow(t *testing.T, st *store.Store, idempKey string, attempt
 // key + value. Used by the T8 scenarios to inject corrupt messages
 // into the worker's consume loop without going through the api +
 // dispatcher path. A nil key produces a record that hashes to a
-// partition without any caller-controlled stickiness — which is the
-// shape acceptance test 10 in docs/phases/03-resilience.md §Acceptance
-// expects (kafka-console-producer.sh produces no key by default).
+// partition without any caller-controlled stickiness — the shape
+// kafka-console-producer.sh produces by default.
 func produceCorruptSMS(t *testing.T, brokers []string, key, value []byte) {
 	t.Helper()
 

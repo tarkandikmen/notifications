@@ -15,17 +15,15 @@ import (
 )
 
 // Init bootstraps OpenTelemetry tracing. When endpoint is empty the SDK
-// writes spans to stdout (Phase 1 default); when set, spans are exported via
-// OTLP/gRPC. Production docker-compose sets OTEL_EXPORTER_OTLP_ENDPOINT to
-// jaeger:4317 (Jaeger all-in-one OTLP receiver) per
-// docs/phases/05-observability.md §9–§10. The W3C trace-context propagator is installed globally so
-// outgoing HTTP, Kafka, and DB spans link cleanly to incoming traces.
+// writes spans to stdout; when set, spans are exported via OTLP/gRPC.
+// Production docker-compose sets OTEL_EXPORTER_OTLP_ENDPOINT to
+// jaeger:4317 (Jaeger all-in-one OTLP receiver). The W3C trace-context
+// propagator is installed globally so outgoing HTTP, Kafka, and DB spans
+// link cleanly to incoming traces. The sampler is configured with a 1.0
+// ratio so every trace is exported.
 //
 // The returned shutdown function flushes the exporter and must be deferred
 // by the caller.
-//
-// docs/phases/01-foundation.md §7. otel_sampling_rate locked at 1.0 in
-// docs/design/07-constants.md §I.
 func Init(ctx context.Context, serviceName string, endpoint string) (func(context.Context) error, error) {
 	exporter, err := newExporter(ctx, endpoint)
 	if err != nil {

@@ -6,9 +6,7 @@ import (
 	"github.com/tarkandikmen/notifications/internal/metrics"
 )
 
-// handleList implements GET /v1/notifications per
-// docs/design/03-api.md §GET /v1/notifications and
-// docs/phases/04-api-completeness.md §5.
+// handleList implements GET /v1/notifications.
 //
 // Behavior:
 //
@@ -36,8 +34,7 @@ func handleList(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		// docs/phases/05-observability.md §1.1
-		// (api_list_result_size_items row): observe the
+		// Observe the api_list_result_size_items histogram with the
 		// post-pagination result size, NOT the requested limit. The
 		// observation reflects what the handler actually rendered, so
 		// dashboards can graph "page-fill ratio" against

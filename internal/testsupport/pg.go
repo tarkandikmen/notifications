@@ -2,8 +2,6 @@
 // need real Postgres or Kafka containers. Every helper here is tagged with
 // the gating env var TEST_INTEGRATION=1 — callers that forget to skip
 // without it will hang trying to start a container.
-//
-// docs/phases/02-walking-skeleton.md §13 (CI integration step).
 package testsupport
 
 import (

@@ -1,9 +1,7 @@
 // Package store is the only place in the codebase that writes raw SQL.
-// Every other package goes through *Store. The Phase 2 surface ships the
+// Every other package goes through *Store. The package ships the
 // Notification, DeliveryAttempt, OutboxRow, and OutcomeInput value types
 // plus query functions for the api, dispatcher, relay, worker, and reaper.
-//
-// docs/phases/02-walking-skeleton.md §1 locks this package's shape.
 package store
 
 import (
@@ -17,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Store wraps a *pgxpool.Pool and exposes the Phase 2 query set as methods.
+// Store wraps a *pgxpool.Pool and exposes the package query set as methods.
 // One value per process; safe for concurrent use because *pgxpool.Pool is.
 type Store struct {
 	pool *pgxpool.Pool
@@ -67,10 +65,7 @@ func (e *IdempotencyConflictError) Error() string {
 
 // IdempotencyConflictEntry is one row in a batch-create conflict. The api
 // layer iterates over BatchIdempotencyConflictError.Entries to populate
-// the 409 duplicate_idempotency_keys details[] body per
-// docs/design/03-api.md §Error model.
-//
-// docs/phases/04-api-completeness.md §1.1 + §1.5.
+// the 409 duplicate_idempotency_keys details[] body.
 type IdempotencyConflictEntry struct {
 	Key            string
 	ExistingID     uuid.UUID
@@ -80,14 +75,11 @@ type IdempotencyConflictEntry struct {
 // BatchIdempotencyConflictError is returned by InsertBatch when one or
 // more items' idempotency_key collides with an existing notifications
 // row. The transaction has been rolled back, so no rows from the batch
-// are persisted (all-or-nothing per docs/design/03-api.md
-// §POST /v1/notifications/batch).
+// are persisted (all-or-nothing).
 //
 // Entries is ordered by the input slice so the api response surfaces
 // conflicts in request order. The api layer extracts the slice via
 // errors.As and renders one IdempotencyConflictDetail per entry.
-//
-// docs/phases/04-api-completeness.md §1.1 + §1.5.
 type BatchIdempotencyConflictError struct {
 	Entries []IdempotencyConflictEntry
 }
@@ -100,9 +92,7 @@ func (e *BatchIdempotencyConflictError) Error() string {
 // current status is one of the hard-terminal values (DELIVERED or
 // FAILED) and a cancel transition is therefore impossible. The api layer
 // extracts CurrentStatus via errors.As and renders it into the 409
-// terminal_state details body per docs/design/03-api.md §Error model.
-//
-// docs/phases/04-api-completeness.md §1.5.
+// terminal_state details body.
 type TerminalStateError struct {
 	CurrentStatus string
 }
@@ -114,22 +104,20 @@ func (e *TerminalStateError) Error() string {
 // CancelTransition discriminates the three cancel success branches so
 // the api handler can label the api_cancellations_total counter
 // without re-deriving the BEFORE-state heuristically. The string
-// values match the metric label vocabulary locked by
-// docs/phases/05-observability.md §1.1 (api_cancellations_total row).
+// values match the metric label vocabulary on api_cancellations_total.
 type CancelTransition string
 
 const (
 	// CancelTransitionT3Pending is returned by CancelNotification on a
-	// successful PENDING → CANCELLED transition (T3 in
-	// docs/design/02-state-machine.md). The events.notification outbox
-	// row is emitted as part of the same transaction.
+	// successful PENDING → CANCELLED transition (T3). The
+	// events.notification outbox row is emitted as part of the same
+	// transaction.
 	CancelTransitionT3Pending CancelTransition = "t3_pending"
 
 	// CancelTransitionT11Dispatched is returned on a successful
 	// DISPATCHED → CANCELLED transition (T11). No events.notification
-	// emit (per docs/design/04-kafka.md §2 — the realized state, if
-	// any, is communicated by T4–T8 when the worker resolves the
-	// in-flight attempt).
+	// emit — the realized state, if any, is communicated by T4–T8 when
+	// the worker resolves the in-flight attempt.
 	CancelTransitionT11Dispatched CancelTransition = "t11_dispatched"
 
 	// CancelTransitionIdempotentNoOp is returned when the row was

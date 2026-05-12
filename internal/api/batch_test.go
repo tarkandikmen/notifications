@@ -39,7 +39,7 @@ func TestHandleBatchCreate_HappyPath(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications/batch", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
@@ -83,8 +83,7 @@ func TestHandleBatchCreate_HappyPath(t *testing.T) {
 
 // TestHandleBatchCreate_OversizedBatch_413 builds a batch one larger
 // than batchMax and asserts the response is 413 payload_too_large with
-// no details[] (per docs/design/03-api.md §Error model). The store must
-// not be called.
+// no details[]. The store must not be called.
 func TestHandleBatchCreate_OversizedBatch_413(t *testing.T) {
 	fs := &fakeStore{}
 	srv := newTestServer(t, fs)
@@ -99,7 +98,7 @@ func TestHandleBatchCreate_OversizedBatch_413(t *testing.T) {
 	body := `{"notifications":[` + strings.Join(items, ",") + `]}`
 
 	resp := postJSON(t, srv, "/v1/notifications/batch", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -117,7 +116,7 @@ func TestHandleBatchCreate_EmptyBatch_400(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	resp := postJSON(t, srv, "/v1/notifications/batch", `{"notifications": []}`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -146,7 +145,7 @@ func TestHandleBatchCreate_IntraBatchDuplicate_400(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications/batch", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -180,7 +179,7 @@ func TestHandleBatchCreate_PerItemValidationFailure_400(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications/batch", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -221,7 +220,7 @@ func TestHandleBatchCreate_IdempotencyConflict_409(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications/batch", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusConflict, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -247,7 +246,7 @@ func TestHandleBatchCreate_MalformedJSON_400(t *testing.T) {
 	srv := newTestServer(t, fs)
 
 	resp := postJSON(t, srv, "/v1/notifications/batch", `{not valid json`)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -277,7 +276,7 @@ func TestHandleBatchCreate_ScheduledAtSetsEligibleAt(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications/batch", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 	require.Equal(t, 1, fs.insertBatchCalled)
@@ -305,7 +304,7 @@ func TestHandleBatchCreate_StoreErrorIsInternal(t *testing.T) {
 	}`
 
 	resp := postJSON(t, srv, "/v1/notifications/batch", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 	env := decodeErrorEnvelope(t, resp.Body)
@@ -327,9 +326,9 @@ func decodeConflictDetail(t *testing.T, raw any) IdempotencyConflictDetail {
 // TestHandleBatchCreate_ObservesBatchSize asserts the
 // api_batch_size_items histogram observation rises by 1 per
 // successful batch-create request, with the observed value matching
-// the input size. Per docs/phases/05-observability.md §1.1 the
-// observation fires only after ValidateBatchCreate returns clean —
-// oversized / malformed batches don't pollute the histogram.
+// the input size. The observation fires only after ValidateBatchCreate
+// returns clean — oversized / malformed batches don't pollute the
+// histogram.
 //
 // The endpoint label is the mux pattern ("POST
 // /v1/notifications/batch") — same as the api_requests_total label
@@ -350,7 +349,7 @@ func TestHandleBatchCreate_ObservesBatchSize(t *testing.T) {
 		]
 	}`
 	resp := postJSON(t, srv, "/v1/notifications/batch", body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
 	after := histogramObservation(t, metrics.APIBatchSize.WithLabelValues(endpoint))
@@ -378,7 +377,7 @@ func TestHandleBatchCreate_OversizedBatch_NoObservation(t *testing.T) {
 	}
 	body := `{"notifications":[` + strings.Join(items, ",") + `]}`
 	resp := postJSON(t, srv, "/v1/notifications/batch", body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	require.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
 
 	after := histogramObservation(t, metrics.APIBatchSize.WithLabelValues(endpoint))

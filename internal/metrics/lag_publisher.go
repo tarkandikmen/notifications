@@ -10,8 +10,6 @@ package metrics
 // The helper exists so dispatcher and reaper share one publishing
 // site; a future change to the gauge's semantic (e.g., "set to NaN
 // on error" vs. "leave untouched") lands in one place.
-//
-// docs/phases/05-observability.md §1.4.
 func PublishLagSample(group, topic string, lag int64, err error) {
 	if err != nil {
 		return

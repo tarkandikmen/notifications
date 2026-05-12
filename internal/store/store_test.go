@@ -33,7 +33,7 @@ func mustNewID(t *testing.T) uuid.UUID {
 
 func smsRow(t *testing.T, key string) store.Notification {
 	t.Helper()
-	content := "phase 2 sms"
+	content := "sms"
 	return store.Notification{
 		ID:        mustNewID(t),
 		Channel:   "sms",
@@ -216,10 +216,10 @@ func TestReadStateForGuard_EveryStatus(t *testing.T) {
 	row := smsRow(t, "00000000-0000-4000-8000-000000000035")
 	require.NoError(t, st.InsertNotification(ctx, row))
 
-	// Fresh INSERT lands at PENDING / attempt=0. Phase 5 widened the
-	// signature so the worker can compute end-to-end delivery latency
-	// from the row's created_at without a second round trip; verify
-	// the timestamp is populated and recent (Postgres NOW() at INSERT).
+	// Fresh INSERT lands at PENDING / attempt=0. The signature returns
+	// created_at so the worker can compute end-to-end delivery latency
+	// without a second round trip; verify the timestamp is populated
+	// and recent (Postgres NOW() at INSERT).
 	status, attempt, createdAt, err := st.ReadStateForGuard(ctx, row.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "PENDING", status)
@@ -230,8 +230,7 @@ func TestReadStateForGuard_EveryStatus(t *testing.T) {
 		"created_at should be recent (Postgres NOW() at INSERT)")
 
 	// Claim transitions to DISPATCHED / attempt=1. created_at is
-	// immutable across status transitions per
-	// docs/design/01-schema.md §Domain values.
+	// immutable across status transitions.
 	tx, err := st.Pool().Begin(ctx)
 	require.NoError(t, err)
 	_, err = st.ClaimDispatchable(ctx, tx, "sms", 1)
@@ -245,10 +244,9 @@ func TestReadStateForGuard_EveryStatus(t *testing.T) {
 	assert.True(t, gotCreatedAt.Equal(createdAt),
 		"created_at must be immutable across PENDING → DISPATCHED")
 
-	// Sweep through the terminal statuses. Each is a documented value
-	// from docs/design/01-schema.md §Domain values, so the read should
-	// surface them verbatim without needing a status whitelist on the
-	// reader side.
+	// Sweep through the terminal statuses. Each is a documented domain
+	// value, so the read should surface them verbatim without needing
+	// a status whitelist on the reader side.
 	for _, terminal := range []string{"DELIVERED", "FAILED", "CANCELLED"} {
 		_, err := st.Pool().Exec(ctx,
 			`UPDATE notifications SET status = $2 WHERE id = $1`, row.ID, terminal)
@@ -378,7 +376,7 @@ func TestBeginAttempt_ConcurrentInsertsRaceCleanly(t *testing.T) {
 	assert.Len(t, attempts, 1)
 }
 
-// TestRecordOutcome_DeliveredHappyPath now exercises the Phase 3 flow:
+// TestRecordOutcome_DeliveredHappyPath exercises the happy path:
 // BeginAttempt runs first (Layer 2), then RecordOutcome's first
 // statement UPDATEs the existing row rather than INSERTing a new one.
 func TestRecordOutcome_DeliveredHappyPath(t *testing.T) {
@@ -429,12 +427,10 @@ func TestRecordOutcome_DeliveredHappyPath(t *testing.T) {
 		"Layer 2's started_at must survive Tx B's UPDATE (Tx B does not touch started_at)")
 }
 
-// TestRecordOutcome_RedeliveryViaLayer2 documents the Phase 3
+// TestRecordOutcome_RedeliveryViaLayer2 documents the redelivery
 // posture: a Kafka redelivery is short-circuited at Layer 2
 // (BeginAttempt returns started=false on the second call), so
 // RecordOutcome runs at most once per (notification_id, attempt).
-// The Phase 2 "ON CONFLICT DO NOTHING inside Tx B" guard is gone;
-// this test pins the new protection.
 func TestRecordOutcome_RedeliveryViaLayer2(t *testing.T) {
 	st, ctx := newTestStore(t)
 
@@ -484,14 +480,13 @@ func TestRecordOutcome_RedeliveryViaLayer2(t *testing.T) {
 }
 
 // TestRecordOutcome_AttemptGuardSuppressesStaleUpdate exercises the
-// Layer 3 attempt guard under the Phase 3 posture: Layer 2 inserted
-// the delivery_attempts row for attempt=1, the dispatcher then claimed
-// the row again at attempt=2, and a slow worker for attempt=1 returns
-// to write Tx B. Statement 1 (UPDATE delivery_attempts) finds the row
-// and writes the forensic outcome; statement 2 (UPDATE notifications)
-// matches zero rows and leaves the authoritative state alone;
-// statement 3 (INSERT outbox) fires unconditionally per
-// docs/design/06-idempotency.md §Tx B.
+// Layer 3 attempt guard: Layer 2 inserted the delivery_attempts row
+// for attempt=1, the dispatcher then claimed the row again at
+// attempt=2, and a slow worker for attempt=1 returns to write Tx B.
+// Statement 1 (UPDATE delivery_attempts) finds the row and writes the
+// forensic outcome; statement 2 (UPDATE notifications) matches zero
+// rows and leaves the authoritative state alone; statement 3 (INSERT
+// outbox) fires unconditionally.
 func TestRecordOutcome_AttemptGuardSuppressesStaleUpdate(t *testing.T) {
 	st, ctx := newTestStore(t)
 
@@ -629,10 +624,10 @@ func TestReapStuck_ResetAndTerminalFail(t *testing.T) {
 	assert.Equal(t, 1, events)
 }
 
-// TestRecordUnprocessable_TargetedBranch_AllFourStatementsFire pins the
-// docs/design/06-idempotency.md §T8 transaction shape under the
-// targeted branch (in.NotificationID and in.Attempt non-nil): all four
-// statements land. The notification reaches FAILED with
+// TestRecordUnprocessable_TargetedBranch_AllFourStatementsFire pins
+// the T8 transaction shape under the targeted branch
+// (in.NotificationID and in.Attempt non-nil): all four statements
+// land. The notification reaches FAILED with
 // failure_reason='unprocessable_message'; one delivery_attempts row
 // classifies as 'unprocessable'; one outbox row goes to
 // send.<channel>.dlq with the payload verbatim; one outbox row goes
@@ -753,8 +748,7 @@ func TestRecordUnprocessable_NoTargetBranch_OnlyDLQRow(t *testing.T) {
 		ErrorDetails:   "invalid character '{' looking for beginning of object key string",
 		DLQPayload:     dlqPayload,
 		// EventPayload intentionally non-nil to confirm the no-target
-		// branch ignores it (statement 4 is skipped per
-		// docs/design/06-idempotency.md §T8 edge case).
+		// branch ignores it (statement 4 is skipped).
 		EventPayload: json.RawMessage(`{"this":"is_ignored_on_no_target"}`),
 	}))
 
@@ -799,7 +793,7 @@ func TestRecordUnprocessable_NoTargetBranch_OnlyDLQRow(t *testing.T) {
 // `WHERE id=$1 AND attempt=$2` UPDATE matches zero rows and the row's
 // authoritative state stays put. The DLQ + delivery_attempts +
 // events.notification side effects still fire (forensic destination is
-// independent per docs/design/06-idempotency.md §T8 row 3 + 4).
+// independent of the row's authoritative state).
 func TestRecordUnprocessable_AttemptGuardSuppressesUpdate(t *testing.T) {
 	st, ctx := newTestStore(t)
 
@@ -842,8 +836,8 @@ func TestRecordUnprocessable_AttemptGuardSuppressesUpdate(t *testing.T) {
 	require.NotNil(t, attempts[0].Classification)
 	assert.Equal(t, "unprocessable", *attempts[0].Classification)
 
-	// DLQ + events.notification outbox rows still fired (row 3 + 4 of
-	// the §T8 transaction are unconditional).
+	// DLQ + events.notification outbox rows still fired (rows 3 + 4 of
+	// the T8 transaction are unconditional).
 	var dlqCount, eventCount int
 	require.NoError(t, st.Pool().QueryRow(ctx,
 		`SELECT count(*) FROM outbox WHERE topic = 'send.sms.dlq'`).Scan(&dlqCount))
@@ -854,13 +848,12 @@ func TestRecordUnprocessable_AttemptGuardSuppressesUpdate(t *testing.T) {
 }
 
 // TestRecordUnprocessable_RedeliveryIsHarmless pins the
-// docs/phases/03-resilience.md §Chunk 4 note "wrap the INSERT in
-// ON CONFLICT (notification_id, attempt) DO NOTHING so the redelivery
-// is harmless." The first call inserts the delivery_attempts row;
-// the second call (mimicking Kafka redelivering the same corrupt
-// message) hits ON CONFLICT and the row is unchanged. The
-// outbox rows accumulate (DLQ + events emit on every call) — the
-// downstream replay tool dedupes by (notification_id, attempt).
+// ON CONFLICT (notification_id, attempt) DO NOTHING wrap on the
+// delivery_attempts INSERT: the first call inserts the row; the
+// second call (mimicking Kafka redelivering the same corrupt message)
+// hits ON CONFLICT and the row is unchanged. The outbox rows
+// accumulate (DLQ + events emit on every call) — the downstream
+// replay tool dedupes by (notification_id, attempt).
 func TestRecordUnprocessable_RedeliveryIsHarmless(t *testing.T) {
 	st, ctx := newTestStore(t)
 
@@ -900,8 +893,7 @@ func TestRecordUnprocessable_RedeliveryIsHarmless(t *testing.T) {
 		"started_at must keep the original value, not the redelivered one")
 
 	// Both calls emit outbox rows; the replay tool dedupes by
-	// (notification_id, attempt) per docs/design/04-kafka.md §3
-	// commentary.
+	// (notification_id, attempt).
 	var dlqCount int
 	require.NoError(t, st.Pool().QueryRow(ctx,
 		`SELECT count(*) FROM outbox WHERE topic = 'send.sms.dlq'`).Scan(&dlqCount))
@@ -909,9 +901,9 @@ func TestRecordUnprocessable_RedeliveryIsHarmless(t *testing.T) {
 }
 
 // TestApplyResetEligibleAt_OverwritesPerRow pins the post-pass jitter
-// helper from docs/phases/03-resilience.md §6: the reaper loop computes
-// equal-jitter eligible_at values per reset row in Go, then runs the
-// batched UPDATE that overwrites each row's deterministic SQL stamp.
+// helper: the reaper loop computes equal-jitter eligible_at values
+// per reset row in Go, then runs the batched UPDATE that overwrites
+// each row's deterministic SQL stamp.
 //
 // The test inserts three PENDING rows, calls ApplyResetEligibleAt with
 // distinct eligible_at values per row, and asserts each row received
@@ -951,10 +943,10 @@ func TestApplyResetEligibleAt_OverwritesPerRow(t *testing.T) {
 }
 
 // TestApplyResetEligibleAt_PendingGuard pins the status='PENDING' guard
-// on the helper's UPDATE per docs/phases/03-resilience.md §6: a row the
-// dispatcher claimed (status -> DISPATCHED) in the microsecond gap
-// between ReapStuck's commit and the post-pass UPDATE must keep its
-// dispatcher-stamped eligible_at — the post-pass must not stomp on it.
+// on the helper's UPDATE: a row the dispatcher claimed (status ->
+// DISPATCHED) in the microsecond gap between ReapStuck's commit and
+// the post-pass UPDATE must keep its dispatcher-stamped eligible_at —
+// the post-pass must not stomp on it.
 func TestApplyResetEligibleAt_PendingGuard(t *testing.T) {
 	st, ctx := newTestStore(t)
 
@@ -1262,8 +1254,8 @@ func batchRow(t *testing.T, key string) store.Notification {
 }
 
 // TestInsertBatch_HappyPath inserts a 50-item batch and asserts every
-// row is visible afterwards with the matching batch_id. One transaction
-// per docs/phases/04-api-completeness.md §1.1.
+// row is visible afterwards with the matching batch_id. The insert
+// runs in one transaction.
 func TestInsertBatch_HappyPath(t *testing.T) {
 	st, ctx := newTestStore(t)
 	batchID := uuid.MustParse("11110000-0000-7000-8000-000000000500")
@@ -1481,7 +1473,7 @@ func countEventsForID(t *testing.T, st *store.Store, ctx context.Context, id uui
 
 // fetchOneEventPayload returns the (decoded) payload of the single
 // events.notification outbox row for id. Used by the T3 emission test
-// to assert payload shape against docs/design/04-kafka.md §2.
+// to assert the payload shape.
 func fetchOneEventPayload(t *testing.T, st *store.Store, ctx context.Context, id uuid.UUID) map[string]any {
 	t.Helper()
 	var raw []byte
@@ -1499,11 +1491,8 @@ func fetchOneEventPayload(t *testing.T, st *store.Store, ctx context.Context, id
 // TestCancelNotification_PendingEmitsEvent runs T3: a PENDING row is
 // cancelled in one transaction; the cancel CTE refreshes the row to
 // CANCELLED and inserts an events.notification outbox row with
-// previous_status=PENDING. Asserts both halves of the §2 emission
-// policy row T3.
-//
-// docs/design/02-state-machine.md §Transitions T3 +
-// docs/design/04-kafka.md §2.
+// previous_status=PENDING. Asserts both halves of the T3 emission
+// policy (status flip + outbox row).
 func TestCancelNotification_PendingEmitsEvent(t *testing.T) {
 	st, ctx := newTestStore(t)
 
@@ -1515,7 +1504,7 @@ func TestCancelNotification_PendingEmitsEvent(t *testing.T) {
 	assert.Equal(t, "CANCELLED", got.Status)
 	assert.Equal(t, row.ID, got.ID)
 	assert.Equal(t, store.CancelTransitionT3Pending, transition,
-		"PENDING → CANCELLED is T3 per docs/design/02-state-machine.md")
+		"PENDING → CANCELLED is T3")
 
 	// Row in DB is CANCELLED (the returned row matches the persisted state).
 	persisted, _, err := st.GetNotification(ctx, row.ID)
@@ -1532,7 +1521,7 @@ func TestCancelNotification_PendingEmitsEvent(t *testing.T) {
 		"T3 must emit exactly one events.notification outbox row")
 
 	payload := fetchOneEventPayload(t, st, ctx, row.ID)
-	assert.Equal(t, float64(1), payload["version"], "version=1 per docs/design/04-kafka.md §2")
+	assert.Equal(t, float64(1), payload["version"], "version=1 on every events.notification payload")
 	assert.Equal(t, row.ID.String(), payload["id"])
 	assert.Equal(t, "sms", payload["channel"])
 	assert.Equal(t, "PENDING", payload["previous_status"])
@@ -1544,8 +1533,8 @@ func TestCancelNotification_PendingEmitsEvent(t *testing.T) {
 
 // TestCancelNotification_DispatchedNoEmit runs T11: a DISPATCHED row
 // is cancelled. The row transitions to CANCELLED but NO
-// events.notification outbox row is emitted per docs/design/04-kafka.md
-// §2 (the cancel may be silently overwritten by T4–T8).
+// events.notification outbox row is emitted (the cancel may be
+// silently overwritten by T4–T8).
 func TestCancelNotification_DispatchedNoEmit(t *testing.T) {
 	st, ctx := newTestStore(t)
 
@@ -1566,7 +1555,7 @@ func TestCancelNotification_DispatchedNoEmit(t *testing.T) {
 	assert.Equal(t, "CANCELLED", got.Status)
 	assert.Equal(t, 1, got.Attempt, "T11 preserves the in-flight attempt; cancel did not bump it")
 	assert.Equal(t, store.CancelTransitionT11Dispatched, transition,
-		"DISPATCHED → CANCELLED is T11 per docs/design/02-state-machine.md")
+		"DISPATCHED → CANCELLED is T11")
 
 	persisted, _, err := st.GetNotification(ctx, row.ID)
 	require.NoError(t, err)
@@ -1574,7 +1563,7 @@ func TestCancelNotification_DispatchedNoEmit(t *testing.T) {
 	assert.Equal(t, 1, persisted.Attempt)
 
 	// Zero events.notification outbox rows for this id — T11 does NOT
-	// emit per docs/design/04-kafka.md §2.
+	// emit.
 	assert.Equal(t, 0, countEventsForID(t, st, ctx, row.ID),
 		"T11 must NOT emit events.notification")
 }
@@ -1677,17 +1666,14 @@ func TestCancelNotification_NotFound(t *testing.T) {
 }
 
 // TestCancelNotification_ConcurrentDispatcherClaim_DispatcherFirst
-// pins the §7 Concurrency note path where a dispatcher claim commits
-// before the cancel reads. The dispatcher locks the row with
-// `FOR UPDATE SKIP LOCKED` and transitions it to DISPATCHED; the
-// cancel goroutine's `SELECT ... FOR UPDATE` (no SKIP LOCKED) blocks
-// until the dispatcher commits, then reads DISPATCHED and runs T11.
+// pins the path where a dispatcher claim commits before the cancel
+// reads. The dispatcher locks the row with `FOR UPDATE SKIP LOCKED`
+// and transitions it to DISPATCHED; the cancel goroutine's
+// `SELECT ... FOR UPDATE` (no SKIP LOCKED) blocks until the dispatcher
+// commits, then reads DISPATCHED and runs T11.
 //
 // Post-condition: row is CANCELLED at attempt=1, no orphaned
 // DISPATCHED state, both transactions completed without error.
-//
-// docs/phases/04-api-completeness.md §7 Concurrency note ("Dispatcher
-// wins (commits first)").
 func TestCancelNotification_ConcurrentDispatcherClaim_DispatcherFirst(t *testing.T) {
 	st, ctx := newTestStore(t)
 
@@ -1752,15 +1738,12 @@ func TestCancelNotification_ConcurrentDispatcherClaim_DispatcherFirst(t *testing
 }
 
 // TestCancelNotification_ConcurrentDispatcherClaim_CancelFirst pins
-// the §7 Concurrency note path where the cancel commits before the
-// dispatcher claim. The dispatcher's `WHERE status='PENDING'` filter
-// excludes the now-CANCELLED row, so the claim returns empty.
+// the path where the cancel commits before the dispatcher claim. The
+// dispatcher's `WHERE status='PENDING'` filter excludes the
+// now-CANCELLED row, so the claim returns empty.
 //
 // Post-condition: row is CANCELLED, dispatcher claimed zero rows,
 // both transactions completed without error.
-//
-// docs/phases/04-api-completeness.md §7 Concurrency note ("Cancel
-// wins (commits first)").
 func TestCancelNotification_ConcurrentDispatcherClaim_CancelFirst(t *testing.T) {
 	st, ctx := newTestStore(t)
 

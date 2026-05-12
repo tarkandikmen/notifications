@@ -2,21 +2,17 @@ package worker
 
 import "time"
 
-// maxAttempts caps the worker's retry chain
-// (docs/design/07-constants.md §D, max_attempts = 7). On a transient
+// maxAttempts caps the worker's retry chain at 7. On a transient
 // outcome with attempt >= maxAttempts the worker terminal-fails the
 // row (T7) instead of scheduling another T5 retry. The reaper applies
 // the same cap at T9 / T10.
 const maxAttempts = 7
 
-// Classification labels per docs/design/01-schema.md §Domain values for
-// delivery_attempts.classification. Phase 3 ships the full four-value
-// taxonomy from docs/design/05-retry.md §1; Phase 2 used only the first
-// two of these (success / transient).
-//
-// classificationUnprocessable is wired by the T8 path
-// (docs/design/06-idempotency.md §T8) which lands in Chunk 4. Defining
-// the constant here keeps every classification literal in one place.
+// Classification labels for delivery_attempts.classification. The full
+// four-value taxonomy is success / transient / permanent /
+// unprocessable; classificationUnprocessable is the T8 disposition.
+// Defining every constant here keeps every classification literal in
+// one place.
 const (
 	classificationSuccess       = "success"
 	classificationTransient     = "transient"
@@ -24,11 +20,11 @@ const (
 	classificationUnprocessable = "unprocessable"
 )
 
-// notifications.status values per docs/design/01-schema.md §Domain values.
-// Inlined here rather than imported from the api package so the worker
-// has no dependency on api (the worker is a downstream consumer of the
-// rows api creates, not a peer). statusDispatched + statusCancelled
-// are read by the Layer 1 state guard in idempotency.go.
+// notifications.status values. Inlined here rather than imported from
+// the api package so the worker has no dependency on api (the worker
+// is a downstream consumer of the rows api creates, not a peer).
+// statusDispatched + statusCancelled are read by the Layer 1 state
+// guard in idempotency.go.
 const (
 	statusPending    = "PENDING"
 	statusDispatched = "DISPATCHED"
@@ -37,8 +33,8 @@ const (
 	statusCancelled  = "CANCELLED"
 )
 
-// notifications.failure_reason values per docs/design/01-schema.md §Domain
-// values. max_attempts_exceeded is shared across:
+// notifications.failure_reason values. max_attempts_exceeded is shared
+// across:
 //
 //   - worker T7 (transient outcome on the final attempt);
 //   - reaper T10 (stuck-row sweep on the final attempt; written by the
@@ -46,7 +42,7 @@ const (
 //
 // permanent_error is worker T6 only (4xx-other from the provider).
 // unprocessable_message is worker T8 only (pre-INSERT validation
-// failure → DLQ); wired by Chunk 4.
+// failure → DLQ).
 const (
 	failureReasonMaxAttempts   = "max_attempts_exceeded"
 	failureReasonPermanent     = "permanent_error"
@@ -82,7 +78,7 @@ type ProviderResult struct {
 // NotificationID/Attempt/StartedAt/FinishedAt/EventPayload to build the
 // full RecordOutcome input.
 //
-// NewEligibleAt semantics per docs/design/05-retry.md §5 + §3:
+// NewEligibleAt semantics:
 //
 //   - T4 (success / DELIVERED): "eligible_at unchanged". The store's
 //     UPDATE always rewrites the column, so we pass `now`. Terminal
@@ -90,8 +86,7 @@ type ProviderResult struct {
 //     PENDING) or the reaper (status filter on DISPATCHED), so the
 //     stored value is forensic only.
 //   - T5 (transient / PENDING): now + TransientBackoff(attempt). The
-//     dispatcher re-claims at this time per docs/design/02-state-machine.md
-//     §Counter discipline.
+//     dispatcher re-claims at this time.
 //   - T6 (permanent / FAILED): same as T4 — terminal row.
 //   - T7 (transient terminal / FAILED): same as T4 — terminal row.
 type Outcome struct {
@@ -103,9 +98,8 @@ type Outcome struct {
 	ErrorMessage   *string
 }
 
-// Classify maps a ProviderResult to the four-value Outcome taxonomy
-// per docs/design/05-retry.md §1. Branches in evaluation order; the
-// first matching row wins:
+// Classify maps a ProviderResult to the four-value Outcome taxonomy.
+// Branches in evaluation order; the first matching row wins:
 //
 //	RequestErr != nil                  → transient (T5 / T7)
 //	HTTP 2xx                           → success   (T4)
@@ -158,7 +152,7 @@ func classifySuccess(result ProviderResult, now time.Time) Outcome {
 // 408 / 425 / 429, HTTP 5xx, no-HTTP-response request errors, and the
 // defensive default. The branching on attempt count picks T5 (retry,
 // PENDING with TransientBackoff) vs T7 (terminal FAILED with
-// max_attempts_exceeded) per docs/design/05-retry.md §4.
+// max_attempts_exceeded).
 //
 // The transient path is the only one that consults TransientBackoff;
 // success and permanent are terminal so the eligible_at they emit is
@@ -187,11 +181,11 @@ func classifyTransient(result ProviderResult, attempt int, now time.Time) Outcom
 	}
 }
 
-// classifyPermanent handles the HTTP 4xx-other branch — T6 per
-// docs/design/05-retry.md §1. Terminal-fail the row regardless of
-// attempt count; a 400 / 401 / 403 / 404 / 410 / 422 etc. will fail
-// identically on every retry, so retrying wastes provider quota and
-// per-channel rate-limit budget without making progress.
+// classifyPermanent handles the HTTP 4xx-other branch — T6.
+// Terminal-fail the row regardless of attempt count; a
+// 400 / 401 / 403 / 404 / 410 / 422 etc. will fail identically on every
+// retry, so retrying wastes provider quota and per-channel rate-limit
+// budget without making progress.
 //
 // The provider response body is retained on delivery_attempts.response
 // so an operator inspecting "why did this row terminal-fail at attempt
@@ -214,11 +208,11 @@ func isSuccessStatus(code int) bool {
 }
 
 // isTransientStatus is the predicate for HTTP statuses that classify
-// as transient per docs/design/05-retry.md §1: 408 (Request Timeout),
-// 425 (Too Early), 429 (Too Many Requests), and the entire 5xx range
-// ("server having a bad day"). Order in Classify matters — this check
-// runs before isPermanentStatus so a 408 / 425 / 429 routes to the
-// transient branch even though it is technically a 4xx code.
+// as transient: 408 (Request Timeout), 425 (Too Early), 429 (Too Many
+// Requests), and the entire 5xx range ("server having a bad day").
+// Order in Classify matters — this check runs before isPermanentStatus
+// so a 408 / 425 / 429 routes to the transient branch even though it
+// is technically a 4xx code.
 func isTransientStatus(code int) bool {
 	if code >= 500 && code < 600 {
 		return true

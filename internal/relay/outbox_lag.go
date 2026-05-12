@@ -10,25 +10,23 @@ import (
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
-// outboxLagSampleInterval matches docs/phases/05-observability.md §8.1 (5 s)
-// and internal/worker/cmd.go's rateLimitSampleInterval for a consistent
-// sampling cadence across periodic gauges.
+// outboxLagSampleInterval matches internal/worker/cmd.go's
+// rateLimitSampleInterval for a consistent sampling cadence across
+// periodic gauges.
 const outboxLagSampleInterval = 5 * time.Second
 
-// outboxLagQueryTimeout is kafka_admin_lag_query_timeout from
-// docs/design/07-constants.md §H — caps each sampler tick so a stalled
-// pool cannot block shutdown indefinitely.
+// outboxLagQueryTimeout caps each sampler tick so a stalled pool
+// cannot block shutdown indefinitely.
 const outboxLagQueryTimeout = 5 * time.Second
 
 // PublishOutboxLag loops until ctx is done, sampling unpublished outbox
-// statistics every outboxLagSampleInterval and publishing to
-// outbox_unpublished_rows and outbox_oldest_unpublished_age per
-// docs/phases/05-observability.md §8.1.
+// statistics every outboxLagSampleInterval and publishing to the
+// outbox_unpublished_rows and outbox_oldest_unpublished_age gauges.
 //
 // When a topic disappears from the GROUP BY result (backlog cleared),
 // prior label values are deleted from both gauge vectors so scrapes
-// omit stale series — matching the §8.1 "absence means no backlog"
-// alerting pattern.
+// omit stale series — the alerting pattern is "absence means no
+// backlog."
 //
 // ctx is bound to the binary's main lifecycle; cancellation ends the
 // loop without a final sampling round.
@@ -52,11 +50,11 @@ func PublishOutboxLag(ctx context.Context, st *store.Store, logger *slog.Logger)
 	}
 }
 
-// SampleOutboxLagOnce performs one §8.1 sampling round — the same query,
+// SampleOutboxLagOnce performs one sampling round — the same query,
 // gauge updates, and stale-label deletion as the periodic publisher.
-// prevTopics is the prior tick's topic set (nil treated as empty); it is
-// mutated and returned so callers can chain ticks. Tests use this for
-// deterministic assertions without a time.Ticker; production uses
+// prevTopics is the prior tick's topic set (nil treated as empty); it
+// is mutated and returned so callers can chain ticks. Tests use this
+// for deterministic assertions without a time.Ticker; production uses
 // PublishOutboxLag.
 func SampleOutboxLagOnce(ctx context.Context, st *store.Store, logger *slog.Logger, prevTopics map[string]struct{}) map[string]struct{} {
 	if logger == nil {

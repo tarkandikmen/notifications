@@ -58,9 +58,9 @@ func TestParseScriptResult(t *testing.T) {
 }
 
 // TestThrottledSleep_BoundsWaitMs verifies the [minSleep, maxSleep]
-// clamp from docs/phases/03-resilience.md §1 fires for negative,
-// extreme, and in-range script returns. Each call also receives up to
-// maxJitter, so the upper bound on the assertion budgets for it.
+// clamp fires for negative, extreme, and in-range script returns.
+// Each call also receives up to maxJitter, so the upper bound on the
+// assertion budgets for it.
 func TestThrottledSleep_BoundsWaitMs(t *testing.T) {
 	tests := []struct {
 		name string
@@ -83,9 +83,9 @@ func TestThrottledSleep_BoundsWaitMs(t *testing.T) {
 }
 
 // TestNew_AppliesProductionDefaults pins the production constructor
-// against the locked constants from docs/design/07-constants.md §E + §H
-// so a tuning change on one side without the other surfaces as a test
-// failure rather than a silent rollout.
+// against the locked constants so a tuning change on one side
+// without the other surfaces as a test failure rather than a silent
+// rollout.
 func TestNew_AppliesProductionDefaults(t *testing.T) {
 	b := New(nil)
 	assert.Equal(t, defaultRate, b.rate)
@@ -113,6 +113,33 @@ func newBucket(t *testing.T, rate, capacity int) (*Bucket, context.Context) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	return NewWithLimits(client, rate, capacity, defaultRequestTimeout), ctx
+}
+
+// pinClockForBurstDrain rigs the bucket so its burst-drain-then-throttle
+// path is deterministic regardless of testcontainer Redis call latency.
+// At the production rate of 10 tokens/s the Lua script refills
+// elapsed_ms*10/1000 tokens per call, so any iteration whose
+// wall-clock cost exceeds ~10 ms shifts refill above the 1 token/call
+// consumption and a 10/10 bucket never drains. Under Docker Desktop
+// load (full integration suite running multiple testcontainers) Redis
+// roundtrip latency routinely spikes past that threshold, the
+// "burst → next Acquire throttles" contract breaks, and tests that
+// assert the throttle branch fire produce false negatives.
+//
+// The fix uses the nowMillis seam documented at bucket.go:88-93 (kept
+// package-internal for exactly this case): the first (capacity+1) Lua
+// calls observe elapsed_ms=0 (the drain plus the deny attempt see no
+// refill) and every Lua call thereafter observes elapsed=100 ms (one
+// full token at rate=10/s) so the throttled retry grants on the next
+// pass.
+func pinClockForBurstDrain(b *Bucket, capacity int) {
+	var calls atomic.Int64
+	b.nowMillis = func() int64 {
+		if calls.Add(1) <= int64(capacity+1) {
+			return 1000
+		}
+		return 1100
+	}
 }
 
 // TestBucket_BurstFitsWithinCapacity confirms that a fresh bucket lets
@@ -244,7 +271,7 @@ func TestBucket_ChannelsAreIndependent(t *testing.T) {
 
 // TestBucket_RespectsContextCancellation ensures a cancelled parent
 // context returns immediately with ctx.Err — the worker's graceful
-// shutdown contract from docs/phases/03-resilience.md §2.4 step 5.
+// shutdown contract.
 func TestBucket_RespectsContextCancellation(t *testing.T) {
 	bucket, ctx := newBucket(t, 10, 10)
 
@@ -268,7 +295,7 @@ func TestBucket_RespectsContextCancellation(t *testing.T) {
 // TestBucket_RedisDown_SurfacesAsErrRedisDown closes the underlying
 // client, then verifies Acquire returns ErrRedisDown — the disposition
 // that drives the worker's "pause and let Kafka redeliver" branch per
-// ARCHITECTURE_v3.md §6.6.
+// docs/ARCHITECTURE.md §6.6.
 func TestBucket_RedisDown_SurfacesAsErrRedisDown(t *testing.T) {
 	url := testsupport.StartRedis(t)
 
@@ -314,11 +341,10 @@ func TestBucket_BurstThenSustainedThroughput(t *testing.T) {
 		"steady-state drain should be ~20/s ± 30%%; got %.2f/s over %s", rate, elapsed)
 }
 
-// TestSample_ReadsCurrentTokens verifies the Phase 5 Sample helper
-// (added per docs/phases/05-observability.md §8.3): after the worker
-// drains N tokens via Acquire, Sample reports a count between
-// capacity-N and capacity (the Lua refill may produce a fractional
-// recovery during the test window).
+// TestSample_ReadsCurrentTokens verifies the Sample helper: after
+// the worker drains N tokens via Acquire, Sample reports a count
+// between capacity-N and capacity (the Lua refill may produce a
+// fractional recovery during the test window).
 func TestSample_ReadsCurrentTokens(t *testing.T) {
 	const capacity = 10
 	const acquired = 4
@@ -342,11 +368,10 @@ func TestSample_ReadsCurrentTokens(t *testing.T) {
 		"Sample must never exceed capacity; got %.4f", tokens)
 }
 
-// TestSample_MissingKey_ReturnsCapacity locks the spec contract from
-// docs/phases/05-observability.md §8.3: an uninitialized bucket key
-// (no Acquire has run yet for that channel) is treated as full
-// capacity so the operator's gauge reads "no contention" rather than
-// a misleading 0.
+// TestSample_MissingKey_ReturnsCapacity locks Sample's missing-key
+// behavior: an uninitialized bucket key (no Acquire has run yet for
+// that channel) is treated as full capacity so the operator's gauge
+// reads "no contention" rather than a misleading 0.
 func TestSample_MissingKey_ReturnsCapacity(t *testing.T) {
 	const capacity = 10
 	bucket, ctx := newBucket(t, capacity, capacity)
@@ -354,7 +379,7 @@ func TestSample_MissingKey_ReturnsCapacity(t *testing.T) {
 	tokens, err := bucket.Sample(ctx, "untouched-channel")
 	require.NoError(t, err)
 	assert.Equal(t, float64(capacity), tokens,
-		"missing key must surface as full capacity, not 0 (spec §8.3)")
+		"missing key must surface as full capacity, not 0")
 }
 
 // TestSample_RedisDown_SurfacesAsErrRedisDown closes the underlying
@@ -378,9 +403,8 @@ func TestSample_RedisDown_SurfacesAsErrRedisDown(t *testing.T) {
 		"closed client must surface as ErrRedisDown, not as a raw redis error")
 }
 
-// TestAcquire_IncrementsRateLimitAcquires_Granted verifies the Phase
-// 5 hot-path counter increment for the first-call-success branch per
-// docs/phases/05-observability.md §1.1 rate-limiter row's locked enum
+// TestAcquire_IncrementsRateLimitAcquires_Granted verifies the
+// hot-path counter increment for the first-call-success branch
 // (granted = first-call-success; throttled_then_granted = after at
 // least one wait_ms cycle).
 func TestAcquire_IncrementsRateLimitAcquires_Granted(t *testing.T) {
@@ -401,6 +425,7 @@ func TestAcquire_IncrementsRateLimitAcquires_Granted(t *testing.T) {
 // least once and surfaces as throttled_then_granted on success.
 func TestAcquire_IncrementsRateLimitAcquires_ThrottledThenGranted(t *testing.T) {
 	bucket, ctx := newBucket(t, 10, 10)
+	pinClockForBurstDrain(bucket, 10)
 	const channel = "sms-acquire-throttled"
 
 	for i := 0; i < 10; i++ {
@@ -458,9 +483,9 @@ func TestAcquire_IncrementsRateLimitAcquires_CtxCanceled(t *testing.T) {
 		"ctx_canceled counter must increment on a pre-cancelled Acquire")
 }
 
-// TestAcquire_WaitDuration_FirstSuccess_ObservesZero locks §1.1: the
-// wait-duration histogram measures throttle sleep only; first-call
-// success observes zero seconds (one sample at 0).
+// TestAcquire_WaitDuration_FirstSuccess_ObservesZero locks the
+// wait-duration histogram contract: it measures throttle sleep only;
+// first-call success observes zero seconds (one sample at 0).
 func TestAcquire_WaitDuration_FirstSuccess_ObservesZero(t *testing.T) {
 	bucket, ctx := newBucket(t, 10, 10)
 	const channel = "sms-wait-first-zero"
@@ -476,11 +501,13 @@ func TestAcquire_WaitDuration_FirstSuccess_ObservesZero(t *testing.T) {
 		"no throttle sleep → histogram sum must stay at 0")
 }
 
-// TestAcquire_WaitDuration_Throttled_AddsSleepTime locks §1.1: after
-// at least one deny→sleep cycle, the observation includes
-// accumulated sleep duration (not Redis/Lua latency on the grant call).
+// TestAcquire_WaitDuration_Throttled_AddsSleepTime locks the
+// throttled-then-granted observation: after at least one deny→sleep
+// cycle, the observation includes accumulated sleep duration (not
+// Redis/Lua latency on the grant call).
 func TestAcquire_WaitDuration_Throttled_AddsSleepTime(t *testing.T) {
 	bucket, ctx := newBucket(t, 10, 10)
+	pinClockForBurstDrain(bucket, 10)
 	const channel = "sms-wait-throttled-hist"
 
 	for i := 0; i < 10; i++ {

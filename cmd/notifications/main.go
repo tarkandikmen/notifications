@@ -1,7 +1,6 @@
 // Command notifications is the single binary that powers every run mode of
 // the system: api, dispatcher, worker, relay, reaper, and the migrate
-// helper. See ARCHITECTURE_v3.md §3 for the rationale and
-// docs/phases/01-foundation.md §3 for the wiring.
+// helper. See docs/ARCHITECTURE.md §3 for the rationale.
 package main
 
 import (
@@ -27,7 +26,7 @@ const defaultMigrationsSourceURL = "file://migrations"
 
 func main() {
 	// godotenv.Load() is best-effort; a missing .env is not an error. Pre-existing
-	// env vars are not overwritten. docs/phases/00-phases.md §Cross-cutting decisions.
+	// env vars are not overwritten.
 	_ = godotenv.Load()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -62,7 +61,7 @@ func newRootCmd() *cobra.Command {
 func newAPICmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "api",
-		Short: "Serve the HTTP API (Phase 1: /healthz and /metrics)",
+		Short: "Serve the HTTP API",
 		RunE:  api.Run,
 	}
 }
@@ -107,8 +106,7 @@ func newReaperCmd() *cobra.Command {
 // relay.Bootstrap (idempotent) and exits; downstream services
 // (dispatcher, workers, reaper, relay) gate on
 // service_completed_successfully so they never query Kafka admin for
-// topics that haven't been created yet. docs/phases/03-resilience.md
-// §9 + Path A startup-ordering fix from this conversation.
+// topics that haven't been created yet.
 func newKafkaBootstrapCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "kafka-bootstrap",
@@ -118,7 +116,7 @@ func newKafkaBootstrapCmd() *cobra.Command {
 }
 
 // newMigrateCmd wires `migrate up` and `migrate down` inline rather than
-// behind another package. docs/phases/01-foundation.md §3 locks this.
+// behind another package.
 func newMigrateCmd() *cobra.Command {
 	migrateCmd := &cobra.Command{
 		Use:   "migrate",

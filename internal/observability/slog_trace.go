@@ -24,10 +24,8 @@ import (
 //     another traceHandler so the attribute / group propagates
 //     without losing the trace-context behavior.
 //
-// docs/phases/00-phases.md §Cross-cutting decisions: trace_id is the
-// correlation ID required by the assessment brief's "Structured
-// logging with correlation IDs" line. This handler is the
-// implementation; docs/phases/05-observability.md §5 locks the surface.
+// trace_id is the correlation ID that ties structured log records to
+// their originating span; this handler is the binding point.
 func NewTraceHandler(next slog.Handler) slog.Handler {
 	return &traceHandler{next: next}
 }

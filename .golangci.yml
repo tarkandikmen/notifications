@@ -1,0 +1,49 @@
+# golangci-lint v2 schema. Pinned by .github/workflows/ci.yml +
+# Makefile to v2.12.2 (the toolchain stays in lockstep with the CI
+# action's `version:` input; bump the action input and this comment
+# together).
+version: "2"
+
+run:
+  # v2 defaults to no timeout (run.timeout=0 disables); pin one
+  # explicitly so a runaway lint pass surfaces as a CI failure
+  # instead of a 14 m integration-step timeout co-opt.
+  timeout: 3m
+  # Mirror go.mod's go directive so linter rules that key on the
+  # language version (govet/printf/etc.) target Go 1.25 stdlib.
+  go: "1.25"
+  modules-download-mode: readonly
+
+linters:
+  # v2 replacement for v1's `disable-all: true`.
+  default: none
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - unused
+    - bodyclose
+  settings:
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+      exclude-functions:
+        - fmt.Fprintln
+        - fmt.Fprintf
+        - (*github.com/jackc/pgx/v5.Tx).Rollback
+    staticcheck:
+      checks:
+        - "all"
+        - "-SA1019"
+  # v2 default already opts OUT of v1's legacy exclusion presets
+  # (`comments`, `common-false-positives`, `legacy`,
+  # `std-error-handling`) — the v1 `issues.exclude-use-default: false`
+  # behavior. Leave `linters.exclusions.presets` unset so test-file
+  # findings are reported the same as production-file findings; the
+  # test suite ships in CI and test-only code quality matters
+  # operationally.
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

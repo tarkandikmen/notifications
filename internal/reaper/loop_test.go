@@ -31,15 +31,15 @@ import (
 // fakeLag is the LagQuery fake the reaper tests inject in place of the
 // real *kafkaadmin.LagClient. Tests that don't care about the lag-aware
 // branching use the zero-valued fakeLag (returns lag = 0, err = nil),
-// which keeps every Phase 2 test's runOnce call below the threshold and
+// which keeps every test's runOnce call below the threshold and
 // exercises the normal reap path.
 //
 // Tests that drive the lag-aware branches set Lag / Err explicitly per
 // case (default applies to every channel) or call Set(group, lag, err)
 // to override per channel — important for the "any one channel above
-// threshold pauses the whole cycle" test (docs/phases/03-resilience.md
-// §8). The recorded calls slice lets tests assert the lag query fired
-// once per channel per tick with the right (group, topic) pair.
+// threshold pauses the whole cycle" semantic. The recorded calls slice
+// lets tests assert the lag query fired once per channel per tick with
+// the right (group, topic) pair.
 type fakeLag struct {
 	mu    sync.Mutex
 	Lag   int64
@@ -95,12 +95,12 @@ func (f *fakeLag) Calls() []fakeLagCall {
 // the lag fake only needs to answer one call per tick for the happy
 // paths; tests that exercise the multi-channel iteration override
 // deps.Channels explicitly. Lag is wired to a zero-valued fakeLag
-// (always reports lag = 0, err = nil) so existing Phase 2 tests
-// exercise the normal reap path without paying any attention to
-// Phase 3's lag-aware branching. Lag-aware tests build their own
-// fakeLag and replace deps.Lag before calling runOnce. The fake is
-// returned alongside Deps + Store so the lag-aware tests can both
-// replace it and inspect its recorded calls.
+// (always reports lag = 0, err = nil) so non-lag-aware tests exercise
+// the normal reap path without paying any attention to the lag-aware
+// branching. Lag-aware tests build their own fakeLag and replace
+// deps.Lag before calling runOnce. The fake is returned alongside
+// Deps + Store so the lag-aware tests can both replace it and inspect
+// its recorded calls.
 //
 // Same convention as internal/dispatcher/loop_test.go's newTestDeps.
 func newTestDeps(t *testing.T) (Deps, *store.Store, *fakeLag) {
@@ -126,10 +126,10 @@ func newTestDeps(t *testing.T) (Deps, *store.Store, *fakeLag) {
 		// Tests that need a deterministic clock for the post-pass
 		// jitter range override this field after construction.
 		Now: func() time.Time { return time.Now().UTC() },
-		// Phase 5: a noop tracer satisfies Deps.Tracer for unit tests
-		// so the per-cycle reaper.cycle span is opened (and ended)
-		// without any exporter wiring. Tests that need to assert on
-		// span shape build an in-memory tracetest provider in-line.
+		// A noop tracer satisfies Deps.Tracer for unit tests so the
+		// per-cycle reaper.cycle span is opened (and ended) without
+		// any exporter wiring. Tests that need to assert on span shape
+		// build an in-memory tracetest provider in-line.
 		Tracer: noop.NewTracerProvider().Tracer("test"),
 	}, st, lag
 }
@@ -143,7 +143,7 @@ func insertPendingSMS(t *testing.T, st *store.Store, idempKey string) store.Noti
 	t.Helper()
 	id, err := store.NewID()
 	require.NoError(t, err)
-	c := "phase 2 reaper test"
+	c := "reaper test"
 	row := store.Notification{
 		ID:             id,
 		Channel:        "sms",
@@ -164,9 +164,7 @@ func insertPendingSMS(t *testing.T, st *store.Store, idempKey string) store.Noti
 // updated_at values that the trigger would otherwise clobber. Registers
 // a t.Cleanup that re-enables the trigger when the test ends.
 //
-// Pattern documented in internal/store/store_test.go's TestReapStuck and
-// called out in docs/phases/02-walking-skeleton.md §Chunk 1 notes ("Use
-// the Chunk 1 trigger-disable pattern when faking stuck rows").
+// Pattern shared with internal/store/store_test.go's TestReapStuck.
 func disableUpdatedAtTrigger(t *testing.T, st *store.Store) {
 	t.Helper()
 	_, err := st.Pool().Exec(context.Background(),
@@ -180,9 +178,9 @@ func disableUpdatedAtTrigger(t *testing.T, st *store.Store) {
 
 // forceStuck transitions a notification row into DISPATCHED at the
 // given attempt and back-dates updated_at by 5 minutes — well past the
-// 120 s reaper_stuck_threshold (docs/design/07-constants.md §B).
-// Caller must invoke disableUpdatedAtTrigger first so the trigger
-// doesn't clobber the explicit updated_at write.
+// reaper's 120 s stuck-row threshold. Caller must invoke
+// disableUpdatedAtTrigger first so the trigger doesn't clobber the
+// explicit updated_at write.
 func forceStuck(t *testing.T, st *store.Store, id uuid.UUID, attempt int) {
 	t.Helper()
 	_, err := st.Pool().Exec(context.Background(), `
@@ -208,7 +206,7 @@ func forceFreshDispatched(t *testing.T, st *store.Store, id uuid.UUID, attempt i
 // selectEventsOutboxPayloads returns every events.notification outbox
 // row payload in insert order. The reaper's T10 CTE emits one outbox
 // row per affected notification; the tests assert the count and the
-// payload shape against docs/design/04-kafka.md §2.
+// payload shape.
 func selectEventsOutboxPayloads(t *testing.T, st *store.Store) [][]byte {
 	t.Helper()
 	rows, err := st.Pool().Query(context.Background(),
@@ -239,9 +237,7 @@ func pinTestRand(t *testing.T, seed1, seed2 uint64) {
 	t.Cleanup(func() { worker.SetRand(prev) })
 }
 
-// TestRunOnce_ResetsAndTerminalFails is the primary test required by
-// docs/phases/02-walking-skeleton.md §Chunk 6 and updated by
-// docs/phases/03-resilience.md §Chunk 6 to assert the post-pass jitter:
+// TestRunOnce_ResetsAndTerminalFails is the primary reaper test:
 //
 //   - A stuck row with attempt < max_attempts resets to PENDING (T9)
 //     with eligible_at moved into the future via the Go-side
@@ -251,9 +247,8 @@ func pinTestRand(t *testing.T, seed1, seed2 uint64) {
 //     (T10) with failure_reason='max_attempts_exceeded' and emits
 //     exactly one events.notification outbox row per affected row.
 //
-// Asserts the events.notification payload shape against
-// docs/design/04-kafka.md §2 so a regression in the SQL CTE's
-// jsonb_build_object call doesn't slip through silently.
+// Asserts the events.notification payload shape so a regression in the
+// SQL CTE's jsonb_build_object call doesn't slip through silently.
 func TestRunOnce_ResetsAndTerminalFails(t *testing.T) {
 	deps, st, _ := newTestDeps(t)
 	disableUpdatedAtTrigger(t, st)
@@ -272,11 +267,10 @@ func TestRunOnce_ResetsAndTerminalFails(t *testing.T) {
 
 	require.NoError(t, runOnce(context.Background(), deps))
 
-	// T9 reset: status back to PENDING, attempt unchanged (Counter
-	// discipline per docs/design/02-state-machine.md §Counter discipline),
-	// eligible_at advanced via the Go-side reaper_backoff(attempt) =
-	// equal-jitter draw in [det/2, det] where det = 2^1 = 2 s for
-	// attempt = 1.
+	// T9 reset: status back to PENDING, attempt unchanged (counter
+	// discipline keeps T9 from bumping attempt), eligible_at advanced
+	// via the Go-side reaper_backoff(attempt) = equal-jitter draw in
+	// [det/2, det] where det = 2^1 = 2 s for attempt = 1.
 	gotReset, _, err := st.GetNotification(context.Background(), reset.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "PENDING", gotReset.Status)
@@ -300,7 +294,7 @@ func TestRunOnce_ResetsAndTerminalFails(t *testing.T) {
 	assert.Equal(t, "max_attempts_exceeded", *gotFailed.FailureReason)
 
 	// Exactly one events.notification outbox row was emitted (for the
-	// T10 row only; T9 does not emit per docs/design/04-kafka.md §2).
+	// T10 row only; T9 does not emit).
 	payloads := selectEventsOutboxPayloads(t, st)
 	require.Len(t, payloads, 1, "T10 emits one events.notification row; T9 emits none")
 
@@ -319,13 +313,13 @@ func TestRunOnce_ResetsAndTerminalFails(t *testing.T) {
 	require.NoError(t, json.Unmarshal(payloads[0], &ev))
 	assert.Equal(t, 1, ev.Version)
 	assert.Equal(t, failed.ID.String(), ev.ID)
-	assert.Nil(t, ev.BatchID, "Phase 2 single-create has null batch_id")
+	assert.Nil(t, ev.BatchID, "single-create rows have null batch_id")
 	assert.Equal(t, "sms", ev.Channel)
 	assert.Equal(t, 7, ev.Attempt)
 	assert.Equal(t, "DISPATCHED", ev.PreviousStatus)
 	assert.Equal(t, "FAILED", ev.CurrentStatus)
 	assert.Nil(t, ev.Classification,
-		"T10 reaper emit has null classification per docs/design/04-kafka.md §2")
+		"T10 reaper emit has null classification (no provider call ran)")
 	require.NotNil(t, ev.FailureReason)
 	assert.Equal(t, "max_attempts_exceeded", *ev.FailureReason)
 	_, parseErr := time.Parse(time.RFC3339, ev.OccurredAt)
@@ -339,7 +333,7 @@ func TestRunOnce_ResetsAndTerminalFails(t *testing.T) {
 	assert.Equal(t, failed.ID.String(), *partitionKey)
 }
 
-// TestRunOnce_PopulatesT10OutboxHeaders documents Chunk 6: T10
+// TestRunOnce_PopulatesT10OutboxHeaders verifies T10
 // events.notification rows carry the reaper.cycle span's W3C headers.
 func TestRunOnce_PopulatesT10OutboxHeaders(t *testing.T) {
 	deps, st, _ := newTestDeps(t)
@@ -416,17 +410,16 @@ func TestRunOnce_NoStuckRows_NoOp(t *testing.T) {
 	assert.Empty(t, selectEventsOutboxPayloads(t, st))
 }
 
-// TestRunOnce_PostPassJitter_PerRowEligibleAt covers
-// docs/phases/03-resilience.md §13's reaper row "The post-pass jitter
-// UPDATE produces a per-row eligible_at in [now+det/2, now+det]." Five
-// rows at distinct attempts exercise the per-row arithmetic; each
+// TestRunOnce_PostPassJitter_PerRowEligibleAt verifies the post-pass
+// jitter UPDATE produces a per-row eligible_at in [now+det/2, now+det].
+// Five rows at distinct attempts exercise the per-row arithmetic; each
 // row's eligible_at must land in the attempt-specific jittered range.
 //
 // The PRNG is pinned via worker.SetRand so the test is hermetic; the
 // assertions are still range-based (not exact equality) because the
-// range is the doc-locked invariant — a future PRNG swap or jitter
-// rebalance shouldn't break the test as long as it stays inside the
-// equal-jitter bounds.
+// range is the invariant — a future PRNG swap or jitter rebalance
+// shouldn't break the test as long as it stays inside the equal-jitter
+// bounds.
 func TestRunOnce_PostPassJitter_PerRowEligibleAt(t *testing.T) {
 	deps, st, _ := newTestDeps(t)
 	disableUpdatedAtTrigger(t, st)
@@ -445,7 +438,7 @@ func TestRunOnce_PostPassJitter_PerRowEligibleAt(t *testing.T) {
 		key     string
 		attempt int
 		// detSeconds is backoff_base * 2^min(attempt, reaper_backoff_cap)
-		// per docs/design/05-retry.md §3 with the reaper cap = 8.
+		// with the reaper cap = 8.
 		detSeconds float64
 	}
 	cases := []case_{
@@ -526,10 +519,10 @@ func TestRunOnce_PostPassJitter_RespectsPendingGuard(t *testing.T) {
 		"dispatcher-stamped eligible_at must NOT be overwritten by the post-pass jitter")
 }
 
-// TestRunOnce_LagAboveThreshold_SkipsCycle covers the first reaper row
-// of docs/phases/03-resilience.md §13: "with Deps.Lag returning 1500 →
-// runOnce skips, no rows reset." A stuck row stays DISPATCHED through
-// the cycle because the lag check pre-empts the reap.
+// TestRunOnce_LagAboveThreshold_SkipsCycle verifies the lag-skip
+// branch: with Deps.Lag returning 1500 → runOnce skips, no rows reset.
+// A stuck row stays DISPATCHED through the cycle because the lag check
+// pre-empts the reap.
 func TestRunOnce_LagAboveThreshold_SkipsCycle(t *testing.T) {
 	deps, st, lag := newTestDeps(t)
 	disableUpdatedAtTrigger(t, st)
@@ -557,9 +550,8 @@ func TestRunOnce_LagAboveThreshold_SkipsCycle(t *testing.T) {
 }
 
 // TestRunOnce_LagAtThreshold_StillRuns locks the predicate edge
-// (`> threshold`, not `>= threshold`) per docs/phases/03-resilience.md
-// §8 pseudo-code. With the default threshold of 1000 and lag = 1000,
-// the cycle proceeds.
+// (`> threshold`, not `>= threshold`). With the default threshold of
+// 1000 and lag = 1000, the cycle proceeds.
 func TestRunOnce_LagAtThreshold_StillRuns(t *testing.T) {
 	deps, st, lag := newTestDeps(t)
 	disableUpdatedAtTrigger(t, st)
@@ -577,12 +569,9 @@ func TestRunOnce_LagAtThreshold_StillRuns(t *testing.T) {
 	assert.Equal(t, 1, got.Attempt)
 }
 
-// TestRunOnce_LagQueryError_FailsClosed covers the second reaper row
-// of docs/phases/03-resilience.md §13: "with Deps.Lag returning an
-// error → runOnce skips (fail-closed)." Per
-// docs/design/02-state-machine.md §Lag-query failure semantics rows
-// T9 / T10, the reaper fail-closes — opposite disposition from the
-// dispatcher, which fail-opens.
+// TestRunOnce_LagQueryError_FailsClosed verifies the reaper's
+// fail-closed semantic on T9 / T10: a lag-query error skips the cycle.
+// Opposite disposition from the dispatcher, which fail-opens.
 func TestRunOnce_LagQueryError_FailsClosed(t *testing.T) {
 	deps, st, lag := newTestDeps(t)
 	disableUpdatedAtTrigger(t, st)
@@ -631,10 +620,10 @@ func TestRunOnce_LagBelowThreshold_NormalPath(t *testing.T) {
 
 // TestRunOnce_OneChannelAboveThreshold_SkipsAll exercises the
 // conservative "any one channel above threshold pauses recovery for
-// every channel" semantics from docs/phases/03-resilience.md §8. With
-// the default Phase 3 channel set (sms / email / push), email returns
-// lag = 1500 (above threshold) while sms and push are at 0; the cycle
-// must be skipped even though sms's stuck row could safely be reset.
+// every channel" semantic. With the default channel set
+// (sms / email / push), email returns lag = 1500 (above threshold)
+// while sms and push are at 0; the cycle must be skipped even though
+// sms's stuck row could safely be reset.
 //
 // The check iterates channels in order; the test asserts the loop
 // short-circuits as soon as email fires, so push is never queried.
@@ -778,10 +767,9 @@ func TestApplyDefaults_PanicsOnNilLag(t *testing.T) {
 }
 
 // TestApplyDefaults_PanicsOnNilTracer mirrors the nil-lag panic for
-// the Phase 5 Tracer field per docs/phases/05-observability.md §7.
-// The interface keeps the loop testable; the panic ensures a future
-// cmd.go that forgets to wire otel.Tracer fails loudly at startup
-// rather than silently dropping every per-cycle span.
+// the Tracer field. The interface keeps the loop testable; the panic
+// ensures a future cmd.go that forgets to wire otel.Tracer fails
+// loudly at startup rather than silently dropping every per-cycle span.
 func TestApplyDefaults_PanicsOnNilTracer(t *testing.T) {
 	assert.PanicsWithValue(t,
 		"reaper: Deps.Tracer is required (otel.Tracer or noop)",
@@ -803,7 +791,7 @@ func counterValue(t *testing.T, c interface {
 	return *m.Counter.Value
 }
 
-// gaugeValue mirrors counterValue for Prometheus gauges (Chunk 5 §8.2).
+// gaugeValue mirrors counterValue for Prometheus gauges.
 func gaugeValue(t *testing.T, g interface {
 	Write(*dto.Metric) error
 }) float64 {
@@ -815,7 +803,7 @@ func gaugeValue(t *testing.T, g interface {
 	return *m.Gauge.Value
 }
 
-// TestRunOnce_StampsCycleCounter_PerOutcome locks Phase 5 §1.1's
+// TestRunOnce_StampsCycleCounter_PerOutcome locks the
 // reaper_cycles_total counter shape: every runOnce branch must
 // stamp exactly one outcome on the counter. Three outcomes
 // {ran, lag_skip, lag_query_error} together exhaust the runOnce
@@ -937,9 +925,8 @@ func TestRunOnce_PostPassJitterFailure_IncrementsCounter(t *testing.T) {
 }
 
 // TestRunOnce_OpensCycleSpan asserts the reaper.cycle span name +
-// outcome attribute per docs/phases/05-observability.md §7. Uses a
-// tracetest in-memory exporter so the span shape is inspectable
-// without a real OTLP pipeline.
+// outcome attribute. Uses a tracetest in-memory exporter so the span
+// shape is inspectable without a real OTLP pipeline.
 func TestRunOnce_OpensCycleSpan(t *testing.T) {
 	deps, st, _ := newTestDeps(t)
 	disableUpdatedAtTrigger(t, st)

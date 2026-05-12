@@ -14,18 +14,16 @@ import (
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
-// GuardOutcome is the result of the worker's Layer 1 state guard from
-// docs/design/06-idempotency.md §Layer 1. The guard reads
-// (status, attempt) for the message's notification id and decides
-// whether the worker should proceed to Layer 2 + the provider call or
-// short-circuit.
+// GuardOutcome is the result of the worker's Layer 1 state guard. The
+// guard reads (status, attempt) for the message's notification id and
+// decides whether the worker should proceed to Layer 2 + the provider
+// call or short-circuit.
 //
 // The four values are exhaustive — every (status, attempt) pair the
-// schema allows maps onto exactly one of them per the table in
-// docs/phases/03-resilience.md §2.1. New status values would require a
-// new GuardOutcome variant; the default branch in CheckStateGuard
-// surfaces unknown statuses as GuardSkipStale defensively rather than
-// panicking.
+// schema allows maps onto exactly one of them. New status values would
+// require a new GuardOutcome variant; the default branch in
+// CheckStateGuard surfaces unknown statuses as GuardSkipStale
+// defensively rather than panicking.
 type GuardOutcome int
 
 const (
@@ -56,9 +54,8 @@ const (
 
 	// GuardSkipMissing fires when ReadStateForGuard returns ErrNotFound.
 	// Should not occur in practice — notifications are not deleted at
-	// this scope per docs/design/06-idempotency.md §Layer 1. Defensive
-	// ack + skip so a pathological replay doesn't park the partition
-	// indefinitely.
+	// this scope. Defensive ack + skip so a pathological replay doesn't
+	// park the partition indefinitely.
 	GuardSkipMissing
 )
 
@@ -85,22 +82,20 @@ func (g GuardOutcome) String() string {
 // signature simple (*store.Store satisfies it transparently in
 // production) while letting the unit test drive every GuardOutcome
 // branch with a fake — no Postgres testcontainer required for the
-// branch table per docs/phases/03-resilience.md §Chunk 2 (Files to
-// create — internal/worker/idempotency_test.go).
+// branch table.
 //
-// Phase 5 widened the return shape with `createdAt` so the worker can
-// compute the end-to-end delivery latency without a second round
-// trip after T4. Tests that don't care about the latency observation
-// supply the zero time.Time and the worker handles it gracefully.
+// The return tuple includes `createdAt` so the worker can compute the
+// end-to-end delivery latency without a second round trip after T4.
+// Tests that don't care about the latency observation supply the zero
+// time.Time and the worker handles it gracefully.
 type guardReader interface {
 	ReadStateForGuard(ctx context.Context, id uuid.UUID) (status string, attempt int, createdAt time.Time, err error)
 }
 
 // GuardResult bundles the GuardOutcome with the created_at timestamp
 // the worker needs for the end-to-end delivery latency observation
-// (notification_delivery_latency_seconds histogram per
-// docs/phases/05-observability.md §1.1). CreatedAt is the zero
-// time.Time on every non-Proceed outcome (the latency observation
+// (notification_delivery_latency_seconds histogram). CreatedAt is the
+// zero time.Time on every non-Proceed outcome (the latency observation
 // fires only on T4); the worker checks for the zero value defensively.
 type GuardResult struct {
 	Outcome   GuardOutcome
@@ -108,18 +103,14 @@ type GuardResult struct {
 }
 
 // CheckStateGuard runs the Layer 1 state guard for a single Kafka
-// record per docs/design/06-idempotency.md §Layer 1. Reads the
-// (status, attempt, createdAt) tuple via st.ReadStateForGuard and
-// maps the result to a GuardOutcome per the locked table in
-// docs/phases/03-resilience.md §2.1.
+// record. Reads the (status, attempt, createdAt) tuple via
+// st.ReadStateForGuard and maps the result to a GuardOutcome.
 //
 // Returns a non-nil error only on a Postgres call failure — the
 // caller leaves the Kafka offset uncommitted so the next poll
 // retries. ErrNotFound surfaces as GuardSkipMissing (rather than an
 // error) so the caller's branch table reads uniformly without an
 // errors.Is check.
-//
-// docs/phases/03-resilience.md §2.1.
 func CheckStateGuard(ctx context.Context, st guardReader, id uuid.UUID, msgAttempt int) (GuardResult, error) {
 	status, attempt, createdAt, err := st.ReadStateForGuard(ctx, id)
 	if err != nil {
@@ -156,9 +147,8 @@ func CheckStateGuard(ctx context.Context, st guardReader, id uuid.UUID, msgAttem
 	}
 }
 
-// Unprocessable error codes per docs/design/04-kafka.md §3 + docs/design/05-retry.md §2.
-// Centralized so every code path uses the exact strings the DLQ
-// payload's `error` field expects.
+// Unprocessable error codes. Centralized so every code path uses the
+// exact strings the DLQ payload's `error` field expects.
 const (
 	errCodeDecodeFailed   = "decode_failed"
 	errCodeSchemaMismatch = "schema_mismatch"
@@ -166,13 +156,11 @@ const (
 	errCodePanic          = "panic"
 )
 
-// dlqPayload is the JSON shape the worker emits to send.<channel>.dlq
-// per docs/design/04-kafka.md §3. Built by BuildUnprocessable; the
-// store's RecordUnprocessable inserts the marshaled bytes verbatim
-// into the outbox row.
+// dlqPayload is the JSON shape the worker emits to send.<channel>.dlq.
+// Built by BuildUnprocessable; the store's RecordUnprocessable inserts
+// the marshaled bytes verbatim into the outbox row.
 //
-// Exactly one of OriginalMessage / OriginalMessageRaw is non-null per
-// docs/design/04-kafka.md §3:
+// Exactly one of OriginalMessage / OriginalMessageRaw is non-null:
 //
 //   - OriginalMessage is the decoded JSON payload (rec.Value passed
 //     through as json.RawMessage). Used when JSON decode succeeded
@@ -194,8 +182,7 @@ type dlqPayload struct {
 
 // dlqPayloadVersion is the schema version stamped into every dlqPayload.
 // Bumping this is a breaking change to send.<channel>.dlq consumers
-// (currently only the future replay tool per docs/design/04-kafka.md §3
-// and the assessment-time human investigator).
+// (currently only the future replay tool and the human investigator).
 const dlqPayloadVersion = 1
 
 // decodeAndValidatePanicHook is a test seam that lets internal tests
@@ -221,16 +208,13 @@ func SetDecodeAndValidatePanicHook(hook func()) (previous func()) {
 }
 
 // decodeAndValidate runs the worker's pre-INSERT decode + schema
-// validation per docs/phases/03-resilience.md §2.4 steps 1–2. The
-// helper is wrapped in a deferred recover so a panic during JSON
-// decoding (or in the test panic hook) surfaces as a normal
-// (errCode='panic', panicked=true) return rather than unwinding the
-// goroutine — head-of-line blocking on a corrupt Kafka message would
-// defeat the DLQ's purpose per docs/design/05-retry.md §2 +
-// ARCHITECTURE_v3.md §5.9.
+// validation. The helper is wrapped in a deferred recover so a panic
+// during JSON decoding (or in the test panic hook) surfaces as a
+// normal (errCode='panic', panicked=true) return rather than unwinding
+// the goroutine — head-of-line blocking on a corrupt Kafka message
+// would defeat the DLQ's purpose per docs/ARCHITECTURE.md §5.9.
 //
-// Returns (per docs/phases/03-resilience.md §4 BuildUnprocessable
-// notes):
+// Returns:
 //
 //   - msg=nil, errCode="decode_failed" — bytes failed json.Unmarshal;
 //     no decoded payload exists. BuildUnprocessable's no-target branch
@@ -255,18 +239,16 @@ func SetDecodeAndValidatePanicHook(hook func()) (previous func()) {
 //     Layer 1.
 //
 // Returning the parsed msg on validation failures lets the targeted
-// T8 path (docs/design/06-idempotency.md §T8) fire whenever the
-// corrupt message identifies a real notification, even when the
-// payload is otherwise invalid (e.g., a producer bug emits a payload
-// missing recipient but with a correct id + attempt — the row still
-// terminal-fails so the operator sees the failure in the
-// notifications table, not just buried in the DLQ).
+// T8 path fire whenever the corrupt message identifies a real
+// notification, even when the payload is otherwise invalid (e.g., a
+// producer bug emits a payload missing recipient but with a correct
+// id + attempt — the row still terminal-fails so the operator sees
+// the failure in the notifications table, not just buried in the
+// DLQ).
 //
-// Steps 3+ panics are NOT caught here — those operate on validated
+// Panics in steps 3+ are NOT caught here — those operate on validated
 // data and a panic indicates a programmer bug that should crash the
 // process loudly so monitoring catches it.
-//
-// docs/phases/03-resilience.md §2.4.
 func decodeAndValidate(value []byte) (msg *sendPayload, errCode, errDetails string, panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -319,13 +301,12 @@ func decodeAndValidate(value []byte) (msg *sendPayload, errCode, errDetails stri
 }
 
 // BuildUnprocessable constructs the store.UnprocessableInput for a
-// validation failure per docs/phases/03-resilience.md §4.
-// handleRecord calls decodeAndValidate, gets back (msg, errCode,
-// errDetails, panicked), and feeds the result here to package the T8
-// transaction's input.
+// validation failure. handleRecord calls decodeAndValidate, gets back
+// (msg, errCode, errDetails, panicked), and feeds the result here to
+// package the T8 transaction's input.
 //
-// Target extraction (the (NotificationID, Attempt) pair) follows the
-// rules in docs/phases/03-resilience.md §4 BuildUnprocessable notes:
+// Target extraction (the (NotificationID, Attempt) pair) follows
+// these rules:
 //
 //   - msg == nil (decode_failed or panic) → no target. The DLQ payload
 //     uses OriginalMessageRaw (base64 of rec.Value). NotificationID
@@ -342,13 +323,13 @@ func decodeAndValidate(value []byte) (msg *sendPayload, errCode, errDetails stri
 //   - All fields valid → targeted. NotificationID = &id, Attempt =
 //     &msg.Attempt.
 //
-// The Kafka record's key (rec.Key) is intentionally NOT consulted per
-// the locked spec: the key carries the notification ID by convention
-// (docs/design/04-kafka.md §1) but the same value lives in msg.id when
-// the payload is decodable, and we have no recovery path when the
-// payload is undecodable (we lack the attempt regardless of whether
-// the key is intact). Including key-based fallback is documented as a
-// Phase 7 polish item in docs/phases/03-resilience.md §Out of scope.
+// The Kafka record's key (rec.Key) is intentionally NOT consulted: the
+// key carries the notification ID by convention but the same value
+// lives in msg.id when the payload is decodable, and there is no
+// recovery path when the payload is undecodable (the attempt is
+// unknown regardless of whether the key is intact). Lifting the
+// record-key fallback into the DLQ payload is straightforward future
+// work.
 //
 // The channel argument is authoritative — passed by handleRecord from
 // deps.Channel rather than from msg.Channel. A corrupt msg.Channel
@@ -358,8 +339,6 @@ func decodeAndValidate(value []byte) (msg *sendPayload, errCode, errDetails stri
 // which shouldn't happen for a fixed-shape struct but the explicit
 // branch keeps the worker from silently producing a corrupt outbox
 // row if it ever does.
-//
-// docs/phases/03-resilience.md §4.
 func BuildUnprocessable(rec *kgo.Record, msg *sendPayload, errCode, errDetails string, channel string, now time.Time) (store.UnprocessableInput, error) {
 	failedAt := now.UTC().Format(occurredAtFormat)
 
@@ -377,12 +356,11 @@ func BuildUnprocessable(rec *kgo.Record, msg *sendPayload, errCode, errDetails s
 		ErrorCode:    errCode,
 		ErrorDetails: errDetails,
 		// EventPayload populated below only on the targeted branch
-		// (statement 4 is skipped on no-target per
-		// docs/design/06-idempotency.md §T8 edge case).
+		// (T8 statement 4 is skipped on the no-target edge case).
 	}
 
-	switch {
-	case msg == nil:
+	switch msg {
+	case nil:
 		// No-target: payload undecodable (decode_failed or panic).
 		// DLQ uses base64-encoded raw bytes. NotificationID +
 		// Attempt stay nil; in.NotificationID == nil triggers the
@@ -411,10 +389,9 @@ func BuildUnprocessable(rec *kgo.Record, msg *sendPayload, errCode, errDetails s
 		// Targeted branch is reachable only when every field the
 		// layer-3 guard needs is well-formed (valid uuid id,
 		// attempt > 0). Re-validate here rather than trusting that
-		// decodeAndValidate already filtered everything — the spec
-		// documents BuildUnprocessable as robust to either input
-		// shape (per docs/phases/03-resilience.md §4 BuildUnprocessable
-		// notes).
+		// decodeAndValidate already filtered everything —
+		// BuildUnprocessable is documented to be robust to either
+		// input shape.
 		notifID, idErr := uuid.Parse(msg.ID)
 		if idErr == nil && msg.Attempt > 0 {
 			in.NotificationID = &notifID
@@ -439,12 +416,12 @@ func BuildUnprocessable(rec *kgo.Record, msg *sendPayload, errCode, errDetails s
 	return in, nil
 }
 
-// buildUnprocessableEventPayload assembles the events.notification body
-// emitted by T8 statement 4 per docs/design/04-kafka.md §2. Every
-// targeted T8 transition lands the same shape: previous=DISPATCHED,
-// current=FAILED, classification=unprocessable, failure_reason=
-// unprocessable_message. Channel and attempt come from the message;
-// id is the parsed uuid the caller already validated.
+// buildUnprocessableEventPayload assembles the events.notification
+// body emitted by T8 statement 4. Every targeted T8 transition lands
+// the same shape: previous=DISPATCHED, current=FAILED,
+// classification=unprocessable, failure_reason=unprocessable_message.
+// Channel and attempt come from the message; id is the parsed uuid
+// the caller already validated.
 //
 // The shape mirrors loop.go's buildEventPayload but with the four
 // T8-locked discriminator values inlined — pulling them through a

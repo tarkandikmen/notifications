@@ -40,7 +40,7 @@ func TestRoundTrip_HeadersFromContext_ToContext(t *testing.T) {
 	require.NotNil(t, headers)
 
 	childCtx := observability.ContextFromTraceHeaders(context.Background(), headers)
-	childCtx, child := tr.Start(childCtx, "child")
+	_, child := tr.Start(childCtx, "child")
 	child.End()
 
 	stubs := exp.GetSpans()
@@ -93,7 +93,7 @@ func TestKafkaHeaders_RoundTrip(t *testing.T) {
 	require.NotEmpty(t, kh)
 
 	consumerCtx := observability.ContextFromKafkaHeaders(context.Background(), kh)
-	consumerCtx, cons := tr.Start(consumerCtx, "consumer")
+	_, cons := tr.Start(consumerCtx, "consumer")
 	cons.End()
 
 	stubs := exp.GetSpans()

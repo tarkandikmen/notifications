@@ -94,12 +94,12 @@ func commitOffset(t *testing.T, adm *kadm.Client, group, topic string, partition
 	require.NoError(t, resp.Error(), "commit offset response error")
 }
 
-// TestMaxLag_NoCommitsReportsTopicBacklog covers row 1 of
-// docs/phases/03-resilience.md §13's kafkaadmin test list: produce 100
-// records, never consume → MaxLag returns 100. The group has no
-// committed offsets, so MaxLag treats the per-partition committed
-// position as 0 (per lag.go's "consumer starts at log start offset"
-// branch) and the resulting lag equals the topic end offset.
+// TestMaxLag_NoCommitsReportsTopicBacklog covers the basic backlog
+// path: produce 100 records, never consume → MaxLag returns 100.
+// The group has no committed offsets, so MaxLag treats the
+// per-partition committed position as 0 (per lag.go's "consumer
+// starts at log start offset" branch) and the resulting lag equals
+// the topic end offset.
 func TestMaxLag_NoCommitsReportsTopicBacklog(t *testing.T) {
 	brokers := testsupport.StartKafka(t)
 
@@ -122,9 +122,9 @@ func TestMaxLag_NoCommitsReportsTopicBacklog(t *testing.T) {
 		"100 records produced + no consumer commits → lag = 100")
 }
 
-// TestMaxLag_CommitsReduceLag covers row 2 of §13: produce 100 records,
-// commit at offset 50, MaxLag returns 50. Exercises the
-// FetchOffsetsForTopics → committed-At path.
+// TestMaxLag_CommitsReduceLag covers the committed-offset path:
+// produce 100 records, commit at offset 50, MaxLag returns 50.
+// Exercises the FetchOffsetsForTopics → committed-At path.
 func TestMaxLag_CommitsReduceLag(t *testing.T) {
 	brokers := testsupport.StartKafka(t)
 
@@ -147,13 +147,9 @@ func TestMaxLag_CommitsReduceLag(t *testing.T) {
 	assert.EqualValues(t, 50, lag, "committed offset = 50, end offset = 100 → lag = 50")
 }
 
-// TestMaxLag_EmptyGroupAndEmptyTopicReturnsZero covers row 3 of §13:
-// "Empty group (no commits) → returns 0." The natural reading is a
-// fresh group on an empty topic — produce zero records, query lag,
-// expect 0. This is the case docs/phases/03-resilience.md §7 calls out
-// explicitly: "Empty groups (no committed offsets yet) return 0 lag —
-// a fresh worker with no work sees a low lag and does not pause the
-// dispatcher."
+// TestMaxLag_EmptyGroupAndEmptyTopicReturnsZero locks the empty-group
+// disposition: a fresh group on an empty topic returns 0 lag, so a
+// fresh worker with no work does not pause the dispatcher.
 func TestMaxLag_EmptyGroupAndEmptyTopicReturnsZero(t *testing.T) {
 	brokers := testsupport.StartKafka(t)
 
@@ -201,8 +197,8 @@ func TestMaxLag_OvercommittedCommitClampsToZero(t *testing.T) {
 		"committed offset past end → lag clamped to 0 (no negative reports)")
 }
 
-// TestMaxLag_UnreachableBrokerReturnsError covers row 4 of §13: a
-// LagClient pointing at a broker we cannot reach returns
+// TestMaxLag_UnreachableBrokerReturnsError covers the broker-down
+// path: a LagClient pointing at a broker we cannot reach returns
 // (-1, error) rather than blocking. Uses a short ctx deadline so the
 // franz-go client's internal retry loop surfaces context cancellation
 // quickly. No Kafka container required, but gated behind the
@@ -252,4 +248,38 @@ func TestNilReceiver_MethodsAreSafe(t *testing.T) {
 	})
 	assert.Equal(t, defaultLagQueryTimeout, l.Timeout(),
 		"nil receiver Timeout returns the package default")
+}
+
+// TestPing_HappyPath asserts the /healthz Kafka probe returns nil
+// against a healthy broker. Built on the same testsupport.StartKafka
+// scaffold as TestMaxLag_*; one sub-test is enough — the per-broker
+// loop inside *kgo.Client.Ping is exercised by franz-go's own tests,
+// and our Ping wrapper is a one-liner.
+func TestPing_HappyPath(t *testing.T) {
+	brokers := testsupport.StartKafka(t)
+
+	lagClient, err := New(brokers)
+	require.NoError(t, err)
+	defer lagClient.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	require.NoError(t, lagClient.Ping(ctx),
+		"Ping against a healthy testcontainer broker must return nil")
+}
+
+// TestPing_NilReceiver_ReturnsError locks the cmd.go-friendly
+// nil-receiver branch on Ping. A nil *LagClient (as could escape an
+// early constructor failure) returns a deterministic error rather
+// than nil-deref panicking inside the /healthz request goroutine.
+//
+// Pure unit test (no testcontainer) — runs on every `go test ./...`
+// so the nil guard cannot regress silently.
+func TestPing_NilReceiver_ReturnsError(t *testing.T) {
+	var l *LagClient
+	require.NotPanics(t, func() {
+		err := l.Ping(context.Background())
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "kafkaadmin: lag client not initialized")
+	})
 }
