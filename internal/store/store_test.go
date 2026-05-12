@@ -216,23 +216,34 @@ func TestReadStateForGuard_EveryStatus(t *testing.T) {
 	row := smsRow(t, "00000000-0000-4000-8000-000000000035")
 	require.NoError(t, st.InsertNotification(ctx, row))
 
-	// Fresh INSERT lands at PENDING / attempt=0.
-	status, attempt, err := st.ReadStateForGuard(ctx, row.ID)
+	// Fresh INSERT lands at PENDING / attempt=0. Phase 5 widened the
+	// signature so the worker can compute end-to-end delivery latency
+	// from the row's created_at without a second round trip; verify
+	// the timestamp is populated and recent (Postgres NOW() at INSERT).
+	status, attempt, createdAt, err := st.ReadStateForGuard(ctx, row.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "PENDING", status)
 	assert.Equal(t, 0, attempt)
+	assert.False(t, createdAt.IsZero(),
+		"created_at must be populated; the worker observes notification_delivery_latency_seconds from this value")
+	assert.WithinDuration(t, time.Now(), createdAt, 5*time.Second,
+		"created_at should be recent (Postgres NOW() at INSERT)")
 
-	// Claim transitions to DISPATCHED / attempt=1.
+	// Claim transitions to DISPATCHED / attempt=1. created_at is
+	// immutable across status transitions per
+	// docs/design/01-schema.md §Domain values.
 	tx, err := st.Pool().Begin(ctx)
 	require.NoError(t, err)
 	_, err = st.ClaimDispatchable(ctx, tx, "sms", 1)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 
-	status, attempt, err = st.ReadStateForGuard(ctx, row.ID)
+	gotStatus, gotAttempt, gotCreatedAt, err := st.ReadStateForGuard(ctx, row.ID)
 	require.NoError(t, err)
-	assert.Equal(t, "DISPATCHED", status)
-	assert.Equal(t, 1, attempt)
+	assert.Equal(t, "DISPATCHED", gotStatus)
+	assert.Equal(t, 1, gotAttempt)
+	assert.True(t, gotCreatedAt.Equal(createdAt),
+		"created_at must be immutable across PENDING → DISPATCHED")
 
 	// Sweep through the terminal statuses. Each is a documented value
 	// from docs/design/01-schema.md §Domain values, so the read should
@@ -243,15 +254,17 @@ func TestReadStateForGuard_EveryStatus(t *testing.T) {
 			`UPDATE notifications SET status = $2 WHERE id = $1`, row.ID, terminal)
 		require.NoError(t, err)
 
-		got, _, err := st.ReadStateForGuard(ctx, row.ID)
+		got, _, gotCreatedAt, err := st.ReadStateForGuard(ctx, row.ID)
 		require.NoError(t, err)
 		assert.Equal(t, terminal, got, "ReadStateForGuard must surface terminal status %q", terminal)
+		assert.True(t, gotCreatedAt.Equal(createdAt),
+			"created_at must be immutable across DISPATCHED → %s", terminal)
 	}
 }
 
 func TestReadStateForGuard_NotFound(t *testing.T) {
 	st, ctx := newTestStore(t)
-	_, _, err := st.ReadStateForGuard(ctx, mustNewID(t))
+	_, _, _, err := st.ReadStateForGuard(ctx, mustNewID(t))
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
@@ -586,7 +599,7 @@ func TestReapStuck_ResetAndTerminalFail(t *testing.T) {
 	`, r3.ID)
 	require.NoError(t, err)
 
-	reset, failed, err := st.ReapStuck(ctx, 7, 120*time.Second, 8)
+	reset, failed, err := st.ReapStuck(ctx, 7, 120*time.Second, 8, nil)
 	require.NoError(t, err)
 	require.Len(t, reset, 1, "exactly one row should be reset (the stuck attempt < max_attempts row)")
 	assert.Equal(t, r1.ID, reset[0].ID, "reset slice carries the (id, attempt) of every reset row")
@@ -1497,10 +1510,12 @@ func TestCancelNotification_PendingEmitsEvent(t *testing.T) {
 	row := smsRow(t, "00000000-0000-4000-8000-300000000001")
 	require.NoError(t, st.InsertNotification(ctx, row))
 
-	got, err := st.CancelNotification(ctx, row.ID)
+	got, transition, err := st.CancelNotification(ctx, row.ID, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "CANCELLED", got.Status)
 	assert.Equal(t, row.ID, got.ID)
+	assert.Equal(t, store.CancelTransitionT3Pending, transition,
+		"PENDING → CANCELLED is T3 per docs/design/02-state-machine.md")
 
 	// Row in DB is CANCELLED (the returned row matches the persisted state).
 	persisted, _, err := st.GetNotification(ctx, row.ID)
@@ -1546,10 +1561,12 @@ func TestCancelNotification_DispatchedNoEmit(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 
-	got, err := st.CancelNotification(ctx, row.ID)
+	got, transition, err := st.CancelNotification(ctx, row.ID, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "CANCELLED", got.Status)
 	assert.Equal(t, 1, got.Attempt, "T11 preserves the in-flight attempt; cancel did not bump it")
+	assert.Equal(t, store.CancelTransitionT11Dispatched, transition,
+		"DISPATCHED → CANCELLED is T11 per docs/design/02-state-machine.md")
 
 	persisted, _, err := st.GetNotification(ctx, row.ID)
 	require.NoError(t, err)
@@ -1573,9 +1590,10 @@ func TestCancelNotification_AlreadyCancelled_IdempotentNoOp(t *testing.T) {
 	require.NoError(t, st.InsertNotification(ctx, row))
 
 	// First cancel: T3, emits one event, updates updated_at.
-	first, err := st.CancelNotification(ctx, row.ID)
+	first, transition, err := st.CancelNotification(ctx, row.ID, nil)
 	require.NoError(t, err)
 	require.Equal(t, "CANCELLED", first.Status)
+	assert.Equal(t, store.CancelTransitionT3Pending, transition)
 
 	firstEvents := countEventsForID(t, st, ctx, row.ID)
 	require.Equal(t, 1, firstEvents)
@@ -1589,9 +1607,11 @@ func TestCancelNotification_AlreadyCancelled_IdempotentNoOp(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Second cancel: idempotent no-op.
-	second, err := st.CancelNotification(ctx, row.ID)
+	second, transition, err := st.CancelNotification(ctx, row.ID, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "CANCELLED", second.Status)
+	assert.Equal(t, store.CancelTransitionIdempotentNoOp, transition,
+		"second cancel of a CANCELLED row is idempotent_no_op")
 	assert.True(t, second.UpdatedAt.Equal(firstUpdatedAt),
 		"idempotent cancel must NOT fire an UPDATE; updated_at must stay put (got %v, want %v)",
 		second.UpdatedAt, firstUpdatedAt)
@@ -1617,7 +1637,7 @@ func TestCancelNotification_Delivered_TerminalStateError(t *testing.T) {
 	_, err := st.Pool().Exec(ctx, `UPDATE notifications SET status='DELIVERED' WHERE id=$1`, row.ID)
 	require.NoError(t, err)
 
-	_, err = st.CancelNotification(ctx, row.ID)
+	_, _, err = st.CancelNotification(ctx, row.ID, nil)
 	require.Error(t, err)
 
 	var terr *store.TerminalStateError
@@ -1640,7 +1660,7 @@ func TestCancelNotification_Failed_TerminalStateError(t *testing.T) {
 	_, err := st.Pool().Exec(ctx, `UPDATE notifications SET status='FAILED' WHERE id=$1`, row.ID)
 	require.NoError(t, err)
 
-	_, err = st.CancelNotification(ctx, row.ID)
+	_, _, err = st.CancelNotification(ctx, row.ID, nil)
 	require.Error(t, err)
 
 	var terr *store.TerminalStateError
@@ -1652,7 +1672,7 @@ func TestCancelNotification_Failed_TerminalStateError(t *testing.T) {
 // ErrNotFound is returned so the api layer renders 404.
 func TestCancelNotification_NotFound(t *testing.T) {
 	st, ctx := newTestStore(t)
-	_, err := st.CancelNotification(ctx, mustNewID(t))
+	_, _, err := st.CancelNotification(ctx, mustNewID(t), nil)
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
@@ -1686,15 +1706,16 @@ func TestCancelNotification_ConcurrentDispatcherClaim_DispatcherFirst(t *testing
 	// Spawn the cancel goroutine. Its FOR UPDATE will block until
 	// dispatcherTx commits.
 	var (
-		wg         sync.WaitGroup
-		cancelRow  store.Notification
-		cancelErr  error
-		cancelDone = make(chan struct{})
+		wg               sync.WaitGroup
+		cancelRow        store.Notification
+		cancelTransition store.CancelTransition
+		cancelErr        error
+		cancelDone       = make(chan struct{})
 	)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		cancelRow, cancelErr = st.CancelNotification(ctx, row.ID)
+		cancelRow, cancelTransition, cancelErr = st.CancelNotification(ctx, row.ID, nil)
 		close(cancelDone)
 	}()
 
@@ -1717,6 +1738,8 @@ func TestCancelNotification_ConcurrentDispatcherClaim_DispatcherFirst(t *testing
 	require.NoError(t, cancelErr)
 	assert.Equal(t, "CANCELLED", cancelRow.Status)
 	assert.Equal(t, 1, cancelRow.Attempt, "cancel saw the dispatcher-bumped attempt=1")
+	assert.Equal(t, store.CancelTransitionT11Dispatched, cancelTransition,
+		"cancel that observed the row at DISPATCHED runs T11")
 
 	persisted, _, err := st.GetNotification(ctx, row.ID)
 	require.NoError(t, err)

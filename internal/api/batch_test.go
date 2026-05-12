@@ -9,9 +9,12 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
@@ -319,4 +322,89 @@ func decodeConflictDetail(t *testing.T, raw any) IdempotencyConflictDetail {
 	var d IdempotencyConflictDetail
 	require.NoError(t, json.Unmarshal(bs, &d))
 	return d
+}
+
+// TestHandleBatchCreate_ObservesBatchSize asserts the
+// api_batch_size_items histogram observation rises by 1 per
+// successful batch-create request, with the observed value matching
+// the input size. Per docs/phases/05-observability.md §1.1 the
+// observation fires only after ValidateBatchCreate returns clean —
+// oversized / malformed batches don't pollute the histogram.
+//
+// The endpoint label is the mux pattern ("POST
+// /v1/notifications/batch") — same as the api_requests_total label
+// for that route.
+func TestHandleBatchCreate_ObservesBatchSize(t *testing.T) {
+	const endpoint = "POST /v1/notifications/batch"
+	const requestSize = 3
+	before := histogramObservation(t, metrics.APIBatchSize.WithLabelValues(endpoint))
+
+	fs := &fakeStore{}
+	srv := newTestServer(t, fs)
+
+	body := `{
+		"notifications": [
+			{"channel": "sms",   "recipient": "+905551234567", "content": "obs 1", "idempotency_key": "00000000-0000-4000-8000-000000000a01"},
+			{"channel": "email", "recipient": "u@example.com", "content": "obs 2", "idempotency_key": "00000000-0000-4000-8000-000000000a02"},
+			{"channel": "push",  "recipient": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "content": "obs 3", "idempotency_key": "00000000-0000-4000-8000-000000000a03"}
+		]
+	}`
+	resp := postJSON(t, srv, "/v1/notifications/batch", body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	after := histogramObservation(t, metrics.APIBatchSize.WithLabelValues(endpoint))
+	assert.Equal(t, before.SampleCount+1, after.SampleCount, "histogram sample count must rise by 1 per successful batch")
+	assert.Equal(t, before.SampleSum+float64(requestSize), after.SampleSum, "histogram sample sum must rise by the request size")
+}
+
+// TestHandleBatchCreate_OversizedBatch_NoObservation asserts the
+// histogram is NOT observed when ValidateBatchCreate rejects the
+// batch as oversized — the spec locks "observe only after validation
+// returns clean" so 413 / 400 paths must skip the observation.
+func TestHandleBatchCreate_OversizedBatch_NoObservation(t *testing.T) {
+	const endpoint = "POST /v1/notifications/batch"
+	before := histogramObservation(t, metrics.APIBatchSize.WithLabelValues(endpoint))
+
+	fs := &fakeStore{}
+	srv := newTestServer(t, fs)
+
+	items := make([]string, 0, batchMax+1)
+	for i := 0; i < batchMax+1; i++ {
+		items = append(items, fmt.Sprintf(
+			`{"channel":"sms","recipient":"+9055512%05d","content":"x","idempotency_key":"00000000-0000-4000-8000-%012d"}`,
+			i+10000, i+1,
+		))
+	}
+	body := `{"notifications":[` + strings.Join(items, ",") + `]}`
+	resp := postJSON(t, srv, "/v1/notifications/batch", body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
+
+	after := histogramObservation(t, metrics.APIBatchSize.WithLabelValues(endpoint))
+	assert.Equal(t, before.SampleCount, after.SampleCount, "oversized batch must not observe the histogram")
+}
+
+// histogramSnapshot captures the SampleCount + SampleSum at a point
+// in time so a subsequent observation can be asserted as a delta
+// rather than depending on the absolute total (the registry is
+// process-shared across tests).
+type histogramSnapshot struct {
+	SampleCount uint64
+	SampleSum   float64
+}
+
+func histogramObservation(t *testing.T, h prometheus.Observer) histogramSnapshot {
+	t.Helper()
+	collector, ok := h.(prometheus.Metric)
+	require.True(t, ok, "histogram Observer must satisfy prometheus.Metric")
+	var m dto.Metric
+	require.NoError(t, collector.Write(&m))
+	require.NotNil(t, m.Histogram, "metric must carry a Histogram payload")
+	require.NotNil(t, m.Histogram.SampleCount)
+	require.NotNil(t, m.Histogram.SampleSum)
+	return histogramSnapshot{
+		SampleCount: *m.Histogram.SampleCount,
+		SampleSum:   *m.Histogram.SampleSum,
+	}
 }

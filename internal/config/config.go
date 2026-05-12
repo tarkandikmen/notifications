@@ -15,7 +15,8 @@ import (
 )
 
 // Config holds every value the binary needs at startup. Sourced from the
-// environment by Load. The shape is locked by docs/phases/01-foundation.md §4.
+// environment by Load. The shape is locked by docs/phases/01-foundation.md §4;
+// docs/phases/05-observability.md §10 adds MetricsAddr.
 type Config struct {
 	HTTPAddr     string
 	DatabaseURL  string
@@ -24,6 +25,12 @@ type Config struct {
 	LogLevel     slog.Level
 	OTelEndpoint string
 	WebhookURL   string
+	// MetricsAddr binds the per-binary /metrics + /healthz endpoint
+	// served by internal/metricsserver. Defaults to :9090. The api
+	// binary additionally exposes /metrics on HTTPAddr (the Phase 1
+	// :8080 contract); MetricsAddr is the uniform per-binary
+	// Prometheus scrape target every binary exposes.
+	MetricsAddr string
 }
 
 // ErrMissingRequired is returned by Load when one or more required env vars
@@ -84,6 +91,7 @@ func Load() (*Config, error) {
 		LogLevel:     level,
 		OTelEndpoint: strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
 		WebhookURL:   webhookURL,
+		MetricsAddr:  stringDefault(os.Getenv("METRICS_ADDR"), ":9090"),
 	}
 
 	if len(cfg.KafkaBrokers) == 0 {

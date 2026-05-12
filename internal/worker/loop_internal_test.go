@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // TestBuildEventPayload_MatchesKafkaSchema is a unit-style test (no
@@ -135,20 +136,25 @@ func TestValidResponseJSON_KeepsValidDropsInvalid(t *testing.T) {
 // Phase 3 Chunk 7: applyDefaults panics when Deps.Channel is empty —
 // production wiring (cmd.go runForChannel) always sets it explicitly,
 // and silently defaulting to "sms" would route an email or push
-// worker through the wrong rate-limit key + log labels. Both panic
-// branches are covered by TestApplyDefaults_PanicsWhen*.
+// worker through the wrong rate-limit key + log labels.
+// Phase 5: applyDefaults panics when Deps.Tracer is nil — the
+// per-record worker.handleRecord span is opened from the tracer.
+// Each panic branch is covered by TestApplyDefaults_PanicsWhen*.
 func TestApplyDefaults(t *testing.T) {
-	d := applyDefaults(Deps{Limiter: stubLimiter{}, Channel: "sms"})
+	tracer := noop.NewTracerProvider().Tracer("test")
+	d := applyDefaults(Deps{Limiter: stubLimiter{}, Channel: "sms", Tracer: tracer})
 	assert.NotNil(t, d.Logger)
 	assert.NotNil(t, d.Clock)
 	assert.Equal(t, "sms", d.Channel)
 	assert.NotNil(t, d.Limiter)
+	assert.NotNil(t, d.Tracer)
 
 	for _, ch := range []string{"sms", "email", "push"} {
 		custom := applyDefaults(Deps{
 			Limiter: stubLimiter{},
 			Channel: ch,
 			Logger:  slog.Default(),
+			Tracer:  tracer,
 		})
 		assert.Equal(t, ch, custom.Channel,
 			"applyDefaults preserves the explicit channel value %q", ch)
@@ -163,8 +169,9 @@ func TestApplyDefaults(t *testing.T) {
 // catch the bug at the first call rather than silently nil-defaulting
 // to a different limiter.
 func TestApplyDefaults_PanicsWhenLimiterMissing(t *testing.T) {
+	tracer := noop.NewTracerProvider().Tracer("test")
 	assert.Panics(t, func() {
-		applyDefaults(Deps{Channel: "sms"})
+		applyDefaults(Deps{Channel: "sms", Tracer: tracer})
 	})
 }
 
@@ -174,9 +181,23 @@ func TestApplyDefaults_PanicsWhenLimiterMissing(t *testing.T) {
 // "sms" would route an email or push worker through the wrong
 // rate-limit key + log labels.
 func TestApplyDefaults_PanicsWhenChannelMissing(t *testing.T) {
+	tracer := noop.NewTracerProvider().Tracer("test")
 	assert.Panics(t, func() {
-		applyDefaults(Deps{Limiter: stubLimiter{}})
+		applyDefaults(Deps{Limiter: stubLimiter{}, Tracer: tracer})
 	})
+}
+
+// TestApplyDefaults_PanicsWhenTracerMissing pins the Phase 5
+// invariant: production wiring (cmd.go runForChannel) always
+// injects otel.Tracer(serviceName) into Deps.Tracer for the
+// per-record worker.handleRecord span. Tests that exercise Loop
+// must inject a tracer (typically a noop tracer or an in-memory
+// tracetest provider). docs/phases/05-observability.md §7.
+func TestApplyDefaults_PanicsWhenTracerMissing(t *testing.T) {
+	assert.Panics(t, func() {
+		applyDefaults(Deps{Limiter: stubLimiter{}, Channel: "sms"})
+	},
+		"a missing tracer is a programmer bug — production wiring always provides one")
 }
 
 // stubLimiter is the unit-test fixture for applyDefaults. Cannot reuse

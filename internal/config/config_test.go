@@ -33,6 +33,7 @@ func validEnv() map[string]string {
 func TestLoad_HappyPath(t *testing.T) {
 	setEnv(t, validEnv())
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("METRICS_ADDR", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -45,6 +46,7 @@ func TestLoad_HappyPath(t *testing.T) {
 	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
 	assert.Empty(t, cfg.OTelEndpoint)
 	assert.Equal(t, "https://webhook.site/abc", cfg.WebhookURL)
+	assert.Equal(t, ":9090", cfg.MetricsAddr, "MetricsAddr defaults to :9090 when METRICS_ADDR is unset")
 }
 
 func TestLoad_DefaultsWhenOptionalsUnset(t *testing.T) {
@@ -57,6 +59,7 @@ func TestLoad_DefaultsWhenOptionalsUnset(t *testing.T) {
 	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("LOG_LEVEL", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("METRICS_ADDR", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -64,6 +67,32 @@ func TestLoad_DefaultsWhenOptionalsUnset(t *testing.T) {
 	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
 	assert.Equal(t, "https://webhook.site/abc", cfg.WebhookURL)
 	assert.Empty(t, cfg.OTelEndpoint)
+	assert.Equal(t, ":9090", cfg.MetricsAddr)
+}
+
+// TestLoad_MetricsAddr_CustomValue locks the override path so a
+// deployer who sets METRICS_ADDR=:9100 gets that value through to
+// the metrics server's listener.
+func TestLoad_MetricsAddr_CustomValue(t *testing.T) {
+	setEnv(t, validEnv())
+	t.Setenv("METRICS_ADDR", ":9100")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, ":9100", cfg.MetricsAddr)
+}
+
+// TestLoad_MetricsAddr_WhitespaceFallsBackToDefault mirrors
+// HTTP_ADDR's posture: a whitespace-only env var trims to empty and
+// falls back to the default. Guards against a docker-compose typo
+// like METRICS_ADDR=" " silently producing an unbindable listener.
+func TestLoad_MetricsAddr_WhitespaceFallsBackToDefault(t *testing.T) {
+	setEnv(t, validEnv())
+	t.Setenv("METRICS_ADDR", "   ")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, ":9090", cfg.MetricsAddr)
 }
 
 func TestLoad_MissingRequired(t *testing.T) {

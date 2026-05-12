@@ -7,17 +7,22 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
 
 	"github.com/tarkandikmen/notifications/internal/config"
 	"github.com/tarkandikmen/notifications/internal/db"
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/metricsserver"
 	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/ratelimit"
 	"github.com/tarkandikmen/notifications/internal/redisx"
@@ -119,24 +124,120 @@ func runForChannel(ctx context.Context, channel string, cfg *config.Config, logg
 
 	provider := NewProvider(cfg.WebhookURL)
 
-	logger.Info("started", "mode", serviceName, "channel", channel)
+	// Phase 5: per-binary metricsserver on cfg.MetricsAddr exposes
+	// /metrics + /healthz from the shared metrics.Registry(). One
+	// worker process = one /metrics endpoint, irrespective of the
+	// channel — every worker binary's metrics carry the channel as
+	// a label on the relevant series.
+	metricsHTTP := metricsserver.New(cfg.MetricsAddr, metrics.Registry(), nil)
+	metricsListenErr := make(chan error, 1)
+	go func() {
+		if err := metricsHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			metricsListenErr <- err
+		}
+		close(metricsListenErr)
+	}()
 
-	loopErr := Loop(ctx, Deps{
-		Store:    store.New(pool),
-		Consumer: consumer,
-		Provider: provider,
-		Limiter:  bucket,
-		Logger:   logger,
-		Channel:  channel,
-	})
+	// Phase 5: the per-record worker.handleRecord span is opened
+	// from this tracer; it's bound to the global tracer provider
+	// that observability.Init installs above so spans flow through
+	// the configured exporter (stdout in dev, OTLP/gRPC against
+	// jaeger when OTEL_EXPORTER_OTLP_ENDPOINT is set).
+	tracer := otel.Tracer(serviceName)
+
+	// Phase 5 §8.3: per-channel rate-limit token gauge sampler. Runs
+	// alongside Loop, scoped to the worker's --channel value. Every
+	// 5 s issues HGET rate:<channel> tokens against Redis and
+	// publishes onto rate_limit_tokens_available{channel}. Three
+	// worker binaries → three samplers → three (channel) time
+	// series.
+	go publishRateLimitTokens(ctx, bucket, channel, logger)
+
+	logger.Info("started", "mode", serviceName, "channel", channel, "metrics_addr", cfg.MetricsAddr)
+
+	loopDone := make(chan error, 1)
+	go func() {
+		loopDone <- Loop(ctx, Deps{
+			Store:    store.New(pool),
+			Consumer: consumer,
+			Provider: provider,
+			Limiter:  bucket,
+			Logger:   logger,
+			Channel:  channel,
+			Tracer:   tracer,
+		})
+	}()
+
+	var loopErr error
+	select {
+	case loopErr = <-loopDone:
+	case err := <-metricsListenErr:
+		if err != nil {
+			logger.Error("metrics listen failed", "err", err)
+		}
+		loopErr = <-loopDone
+	}
 
 	logger.Info("shutting down", "mode", serviceName, "channel", channel)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+	if err := metricsHTTP.Shutdown(shutdownCtx); err != nil {
+		logger.Error("metrics shutdown failed", "err", err)
+	}
 	if err := shutdownTelemetry(shutdownCtx); err != nil {
 		logger.Error("telemetry shutdown failed", "err", err)
 	}
 	return loopErr
+}
+
+// rateLimitSampleInterval is the cadence at which the rate-limit
+// token sampler ticker fires per docs/phases/05-observability.md
+// §8.3. 5 s matches the relay's outbox-lag sampler (§8.1) so the
+// two periodic gauges share an operator's mental model.
+const rateLimitSampleInterval = 5 * time.Second
+
+// publishRateLimitTokens samples the per-channel Redis token bucket
+// every rateLimitSampleInterval and publishes the count onto
+// metrics.RateLimitTokensAvailable{channel} per
+// docs/phases/05-observability.md §8.3.
+//
+// On Redis-down (bucket.Sample returns ratelimit.ErrRedisDown) the
+// gauge is left at its previous value — no log spam, no retry. The
+// hot-path Acquire's rate_limit_acquires_total{outcome="redis_error"}
+// counter already tells the outage story and the gauge will catch up
+// on the next successful Sample after Redis recovers.
+//
+// ctx cancellation (graceful shutdown) ends the loop without
+// publishing a final sample. The function blocks the calling
+// goroutine until ctx is done.
+func publishRateLimitTokens(ctx context.Context, bucket *ratelimit.Bucket, channel string, logger *slog.Logger) {
+	ticker := time.NewTicker(rateLimitSampleInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tokens, err := bucket.Sample(ctx, channel)
+			if err != nil {
+				if errors.Is(err, ratelimit.ErrRedisDown) {
+					// Leave gauge unchanged per spec §8.3 — Acquire's
+					// redis_error counter is the alertable signal.
+					continue
+				}
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
+				}
+				logger.Warn("worker: rate-limit token sampler failed",
+					"channel", channel,
+					"err", err,
+				)
+				continue
+			}
+			metrics.RateLimitTokensAvailable.WithLabelValues(channel).Set(tokens)
+		}
+	}
 }
 
 // consumerOpts returns the franz-go consumer settings locked by

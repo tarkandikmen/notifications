@@ -46,6 +46,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/tarkandikmen/notifications/internal/api"
 	"github.com/tarkandikmen/notifications/internal/dispatcher"
@@ -208,6 +209,7 @@ func startLagAwareStack(t *testing.T, fake *itestLagFake) *lagAwareTestEnv {
 			BatchSize:    200,
 			Channels:     []string{"sms"},
 			Lag:          fake,
+			Tracer:       noop.NewTracerProvider().Tracer("dispatcher"),
 		})
 	})
 
@@ -218,6 +220,7 @@ func startLagAwareStack(t *testing.T, fake *itestLagFake) *lagAwareTestEnv {
 			Logger:       logger,
 			PollInterval: 25 * time.Millisecond,
 			BatchSize:    500,
+			Tracer:       noop.NewTracerProvider().Tracer("relay"),
 		})
 	})
 
@@ -234,6 +237,7 @@ func startLagAwareStack(t *testing.T, fake *itestLagFake) *lagAwareTestEnv {
 			Logger:  logger,
 			Channel: "sms",
 			Clock:   time.Now,
+			Tracer:  noop.NewTracerProvider().Tracer("worker"),
 		})
 	})
 
@@ -256,6 +260,7 @@ func startLagAwareStack(t *testing.T, fake *itestLagFake) *lagAwareTestEnv {
 			MaxAttempts:    7,
 			Channels:       []string{"sms"},
 			Lag:            fake,
+			Tracer:         noop.NewTracerProvider().Tracer("reaper"),
 		})
 	})
 
@@ -291,6 +296,11 @@ func startLagAwareStack(t *testing.T, fake *itestLagFake) *lagAwareTestEnv {
 // boundary so failure output still makes the phase clear.
 func TestLagAware_DispatcherAndReaperRespectLag(t *testing.T) {
 	fake := &itestLagFake{}
+	// A zero-valued fake reports lag 0. If the stacks start before we
+	// SetLag(1500), the reaper can terminal-fail the stuck row during
+	// insertStuckDispatchedAtMaxAttempts — scenario (a) would flake.
+	// Arm high lag before any dispatcher/reaper tick runs.
+	fake.SetLag(1500, nil)
 	env := startLagAwareStack(t, fake)
 
 	// Pre-insert a stuck DISPATCHED row at attempt=max_attempts. The
@@ -311,7 +321,6 @@ func TestLagAware_DispatcherAndReaperRespectLag(t *testing.T) {
 	// DISPATCHED.
 	//
 	t.Log("scenario (a): lag = 1500 → dispatcher pauses, reaper skips")
-	fake.SetLag(1500, nil)
 
 	callsBefore := fake.Calls()
 

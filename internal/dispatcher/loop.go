@@ -8,6 +8,11 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
@@ -102,6 +107,16 @@ type Deps struct {
 	// inlined) so the integration test can drive the threshold-crossing
 	// branch deterministically.
 	LagThreshold int64
+
+	// Tracer is the OpenTelemetry tracer used to open the per-tick
+	// dispatcher.tick span. Required; applyDefaults panics when nil
+	// to mirror the Phase 3 lag-client convention. Production
+	// (cmd.go) injects otel.Tracer(serviceName) backed by the global
+	// tracer provider; tests inject a noop tracer or an in-memory
+	// recording tracer.
+	//
+	// docs/phases/05-observability.md §7.
+	Tracer trace.Tracer
 }
 
 // Loop drives the claim-and-publish cycle until ctx is cancelled. Returns
@@ -168,49 +183,129 @@ func Loop(ctx context.Context, deps Deps) error {
 //     claim. The api keeps accepting requests; pausing the dispatcher
 //     just delays the inevitable, and the outbox absorbs the backlog
 //     while the relay can't publish (per ARCHITECTURE_v3.md §6.9
-//     row "dispatcher" under Kafka outage).
+//     row "dispatcher" under Kafka outage). The tick counter still
+//     stamps `lag_query_error` so the outage shows up in metrics
+//     even though the dispatch behavior is "continue".
+//
+// Phase 5 layers per-tick observability:
+//   - One dispatcher.tick span per call, attributed with channel +
+//     row count + outcome (docs/phases/05-observability.md §7).
+//   - dispatcher_ticks_total{channel,outcome} counter on every
+//     branch (claimed, empty, lag_skip, lag_query_error, error).
+//   - dispatcher_claimed_rows_per_tick{channel} histogram on the
+//     successful-claim branches (claimed + empty).
+//   - dispatcher_tick_duration_seconds{channel} histogram on every
+//     branch including the early-return paths so tail latency stays
+//     visible under sustained lag (docs/phases/05-observability.md §1.1).
+//
+// Each tick records exactly one outcome on the tick counter. When the
+// lag-query path fail-opens, the outcome is `lag_query_error` (the
+// fact that the lag check failed) rather than the downstream claim
+// outcome — prevents double-counting and surfaces the lag-query
+// outage as an alertable counter.
 //
 // Exposed (lowercase) at the package level so loop_test.go can drive a
 // single, deterministic tick rather than racing the time.Ticker.
 func runOnce(ctx context.Context, deps Deps, channel string) error {
-	if skip := lagCheckSkip(ctx, deps, channel); skip {
+	start := time.Now()
+	ctx, span := deps.Tracer.Start(ctx, "dispatcher.tick",
+		trace.WithAttributes(attribute.String("channel", channel)),
+	)
+	outcome := "error" // overwritten before every non-panic return path
+	defer func() {
+		span.SetAttributes(attribute.String("outcome", outcome))
+		metrics.DispatcherTicks.WithLabelValues(channel, outcome).Inc()
+		metrics.DispatcherTickDuration.WithLabelValues(channel).Observe(time.Since(start).Seconds())
+		span.End()
+	}()
+
+	lagOutcome, skip := lagCheckSkip(ctx, deps, channel)
+	if skip {
+		outcome = lagOutcome
 		return nil
 	}
 
 	tx, err := deps.Store.Pool().Begin(ctx)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("dispatcher: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	rows, err := deps.Store.ClaimDispatchable(ctx, tx, channel, deps.BatchSize)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("dispatcher: claim dispatchable: %w", err)
 	}
 	if len(rows) == 0 {
 		// Empty claim: rollback (the deferred call) is fine; the tx
 		// performed no writes. Returning nil avoids a needless commit.
+		span.SetAttributes(attribute.Int("rows", 0))
+		metrics.DispatcherClaimedRowsPerTick.WithLabelValues(channel).Observe(0)
+		// Preserve a non-empty lagOutcome (lag_query_error) over the
+		// downstream "empty" outcome so a sustained lag outage stays
+		// visible even when the claim returns no rows.
+		if lagOutcome != "" {
+			outcome = lagOutcome
+		} else {
+			outcome = "empty"
+		}
 		return nil
 	}
 
 	for i := range rows {
 		row := &rows[i]
+		rowCtx, rowSpan := deps.Tracer.Start(ctx, "dispatcher.row",
+			trace.WithAttributes(
+				attribute.String("notification.id", row.ID.String()),
+				attribute.Int("notification.attempt", row.Attempt),
+				attribute.String("channel", row.Channel),
+			),
+		)
 		payload, err := buildSendPayload(row)
 		if err != nil {
+			rowSpan.RecordError(err)
+			rowSpan.End()
+			span.RecordError(err)
 			return fmt.Errorf("dispatcher: build payload for %s: %w", row.ID, err)
 		}
 		idStr := row.ID.String()
-		if err := deps.Store.InsertOutboxRow(ctx, tx, store.OutboxRow{
+		traceHeaders, herr := observability.TraceHeadersFromContext(rowCtx)
+		if herr != nil {
+			deps.Logger.Warn("dispatcher: trace headers from context failed",
+				"notification_id", row.ID,
+				"err", herr,
+			)
+		}
+		if err := deps.Store.InsertOutboxRow(rowCtx, tx, store.OutboxRow{
 			Topic:        "send." + row.Channel,
 			PartitionKey: &idStr,
+			Headers:      traceHeaders,
 			Payload:      payload,
 		}); err != nil {
+			rowSpan.RecordError(err)
+			rowSpan.End()
+			span.RecordError(err)
 			return fmt.Errorf("dispatcher: insert outbox row for %s: %w", row.ID, err)
 		}
+		rowSpan.End()
 	}
 
 	if err := tx.Commit(ctx); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("dispatcher: commit: %w", err)
+	}
+
+	span.SetAttributes(attribute.Int("rows", len(rows)))
+	metrics.DispatcherClaimedRowsPerTick.WithLabelValues(channel).Observe(float64(len(rows)))
+	if lagOutcome != "" {
+		// The lag-query outage masked an otherwise-successful claim;
+		// stamp the lag-query failure on the counter so the outage
+		// stays visible. The span and rows attributes capture the
+		// successful claim shape for tracing.
+		outcome = lagOutcome
+	} else {
+		outcome = "claimed"
 	}
 
 	deps.Logger.Debug("dispatcher tick committed",
@@ -257,16 +352,30 @@ func buildSendPayload(n *store.Notification) (json.RawMessage, error) {
 	return json.Marshal(p)
 }
 
-// lagCheckSkip returns true when the dispatcher's per-tick claim must
-// be skipped because consumer-group lag exceeds the configured
-// threshold. Returns false to continue with the claim, including on a
-// lag-query error (fail-open per
-// docs/design/02-state-machine.md §Lag-query failure semantics row T2).
+// lagCheckSkip returns the (outcome, skip) pair for the lag check:
+//
+//   - ("", false): lag query succeeded and lag is at or below the
+//     threshold; the caller proceeds with the claim and stamps
+//     "claimed" / "empty" depending on the downstream result.
+//   - ("lag_skip", true): lag is strictly above the threshold; the
+//     caller stamps "lag_skip" and returns nil.
+//   - ("lag_query_error", false): lag query failed; the caller fails
+//     open (per docs/design/02-state-machine.md §Lag-query failure
+//     semantics row T2) and proceeds with the claim, but the outcome
+//     stamped on the tick counter is "lag_query_error" so the outage
+//     stays visible in metrics even though dispatch behavior is
+//     "continue".
+//
+// On a successful query the result is also published to the
+// kafka_consumer_lag gauge via metrics.PublishLagSample. On error
+// the helper leaves the gauge untouched (per the helper's
+// "error → leave previous value" semantic in
+// docs/phases/05-observability.md §1.4).
 //
 // The lag query wraps deps.LagTimeout around the parent ctx — the
 // resulting deadline is the earlier of the two, so a graceful-shutdown
 // cancellation on the parent still propagates into the admin call.
-func lagCheckSkip(ctx context.Context, deps Deps, channel string) bool {
+func lagCheckSkip(ctx context.Context, deps Deps, channel string) (string, bool) {
 	group := "worker." + channel
 	topic := "send." + channel
 
@@ -274,6 +383,7 @@ func lagCheckSkip(ctx context.Context, deps Deps, channel string) bool {
 	defer cancel()
 
 	lag, err := deps.Lag.MaxLag(lagCtx, group, topic)
+	metrics.PublishLagSample(group, topic, lag, err)
 	if err != nil {
 		deps.Logger.Warn("dispatcher: lag query failed; failing open and continuing tick",
 			"channel", channel,
@@ -282,7 +392,7 @@ func lagCheckSkip(ctx context.Context, deps Deps, channel string) bool {
 			"threshold", deps.LagThreshold,
 			"err", err,
 		)
-		return false
+		return "lag_query_error", false
 	}
 	if lag > deps.LagThreshold {
 		deps.Logger.Info("dispatcher: lag above threshold; skipping tick",
@@ -292,21 +402,23 @@ func lagCheckSkip(ctx context.Context, deps Deps, channel string) bool {
 			"lag", lag,
 			"threshold", deps.LagThreshold,
 		)
-		return true
+		return "lag_skip", true
 	}
-	return false
+	return "", false
 }
 
 // applyDefaults fills in zero-valued Deps fields with the locked Phase 2 /
 // Phase 3 defaults so callers (cmd.go in production, loop_test.go in
 // tests) only need to set what they're customizing.
 //
-// Lag is required: a nil Lag panics here so production wiring (cmd.go)
-// and tests that exercise runOnce must inject one. The interface keeps
-// the loop independently testable; an alternative (treat nil as
-// "lag check disabled") would silently regress the §7 behavior under a
-// future cmd.go that forgets to wire the admin client, and the spec
-// explicitly forbids that disposition.
+// Lag and Tracer are required: a nil value for either panics here so
+// production wiring (cmd.go) and tests that exercise runOnce must
+// inject both. The Lag interface keeps the loop independently
+// testable; the Tracer is similarly satisfied by trace.Tracer
+// implementations from go.opentelemetry.io/otel/trace/noop or an
+// in-memory tracetest provider. An alternative (treat nil Tracer as
+// "no spans") would silently regress the §7 trace behavior under a
+// future cmd.go that forgets to wire the global tracer provider.
 func applyDefaults(d Deps) Deps {
 	if d.PollInterval <= 0 {
 		d.PollInterval = defaultPollInterval
@@ -328,6 +440,9 @@ func applyDefaults(d Deps) Deps {
 	}
 	if d.Lag == nil {
 		panic("dispatcher: Deps.Lag is required (kafkaadmin.LagClient or fake)")
+	}
+	if d.Tracer == nil {
+		panic("dispatcher: Deps.Tracer is required (otel.Tracer or noop)")
 	}
 	return d
 }

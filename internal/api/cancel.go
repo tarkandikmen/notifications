@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
@@ -32,6 +34,7 @@ func handleGetBatch(deps Deps) http.HandlerFunc {
 			writeNotFound(w)
 			return
 		}
+		observability.SetSpanBatchID(r.Context(), batchID)
 
 		rows, err := deps.Store.GetBatch(r.Context(), batchID)
 		if err != nil {
@@ -83,22 +86,40 @@ func handleGetBatch(deps Deps) http.HandlerFunc {
 // attempt; the realized state surfaces via a subsequent GET. See
 // docs/phases/04-api-completeness.md §7 Concurrency note and
 // docs/design/02-state-machine.md §Cancellation race.
+//
+// docs/phases/05-observability.md §1.1 (api_cancellations_total row)
+// adds the per-branch counter increment so a missing increment
+// surfaces as a counter-shape regression in cancel_test.go. Branch
+// label values match the locked vocabulary: t3_pending,
+// t11_dispatched, idempotent_no_op (success branches; the store's
+// CancelTransition return discriminates them since the wire shape is
+// identical), terminal_state, not_found.
 func handleCancel(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := uuid.Parse(r.PathValue("id"))
 		if err != nil {
+			metrics.APICancellations.WithLabelValues("not_found").Inc()
 			writeNotFound(w)
 			return
 		}
+		observability.SetSpanNotificationID(r.Context(), id)
 
-		n, err := deps.Store.CancelNotification(r.Context(), id)
+		traceHeaders, terr := observability.TraceHeadersFromContext(r.Context())
+		if terr != nil {
+			deps.Logger.Warn("api: trace headers from context failed", "err", terr)
+			traceHeaders = nil
+		}
+
+		n, transition, err := deps.Store.CancelNotification(r.Context(), id, traceHeaders)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
+				metrics.APICancellations.WithLabelValues("not_found").Inc()
 				writeNotFound(w)
 				return
 			}
 			var terr *store.TerminalStateError
 			if errors.As(err, &terr) {
+				metrics.APICancellations.WithLabelValues("terminal_state").Inc()
 				writeTerminalState(w, terr.CurrentStatus)
 				return
 			}
@@ -107,6 +128,7 @@ func handleCancel(deps Deps) http.HandlerFunc {
 			return
 		}
 
+		metrics.APICancellations.WithLabelValues(string(transition)).Inc()
 		writeJSON(w, http.StatusOK, renderNotificationWithoutAttempts(n))
 	}
 }

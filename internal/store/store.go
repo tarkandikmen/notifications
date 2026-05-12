@@ -110,3 +110,31 @@ type TerminalStateError struct {
 func (e *TerminalStateError) Error() string {
 	return "store: notification in terminal state: " + e.CurrentStatus
 }
+
+// CancelTransition discriminates the three cancel success branches so
+// the api handler can label the api_cancellations_total counter
+// without re-deriving the BEFORE-state heuristically. The string
+// values match the metric label vocabulary locked by
+// docs/phases/05-observability.md §1.1 (api_cancellations_total row).
+type CancelTransition string
+
+const (
+	// CancelTransitionT3Pending is returned by CancelNotification on a
+	// successful PENDING → CANCELLED transition (T3 in
+	// docs/design/02-state-machine.md). The events.notification outbox
+	// row is emitted as part of the same transaction.
+	CancelTransitionT3Pending CancelTransition = "t3_pending"
+
+	// CancelTransitionT11Dispatched is returned on a successful
+	// DISPATCHED → CANCELLED transition (T11). No events.notification
+	// emit (per docs/design/04-kafka.md §2 — the realized state, if
+	// any, is communicated by T4–T8 when the worker resolves the
+	// in-flight attempt).
+	CancelTransitionT11Dispatched CancelTransition = "t11_dispatched"
+
+	// CancelTransitionIdempotentNoOp is returned when the row was
+	// already CANCELLED before the call. No UPDATE, no outbox emit.
+	// Lets the api layer surface the same 200 wire shape as a
+	// transitioning cancel without double-counting the metric.
+	CancelTransitionIdempotentNoOp CancelTransition = "idempotent_no_op"
+)

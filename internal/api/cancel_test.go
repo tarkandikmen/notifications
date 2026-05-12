@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
@@ -63,7 +65,7 @@ func postNoBody(t *testing.T, url string) *http.Response {
 // truth for status transitions; the handler trusts the returned row.
 func TestHandleCancel_PendingPath_200(t *testing.T) {
 	row := cancelledRow(t, "01890000-0000-7000-8000-000000000c01")
-	fs := &fakeStore{cancelRow: row}
+	fs := &fakeStore{cancelRow: row, cancelTransition: store.CancelTransitionT3Pending}
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+row.ID.String()+"/cancel")
@@ -90,7 +92,7 @@ func TestHandleCancel_PendingPath_200(t *testing.T) {
 func TestHandleCancel_DispatchedPath_200(t *testing.T) {
 	row := cancelledRow(t, "01890000-0000-7000-8000-000000000c02")
 	row.Attempt = 1
-	fs := &fakeStore{cancelRow: row}
+	fs := &fakeStore{cancelRow: row, cancelTransition: store.CancelTransitionT11Dispatched}
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+row.ID.String()+"/cancel")
@@ -110,7 +112,7 @@ func TestHandleCancel_DispatchedPath_200(t *testing.T) {
 // the handler reports no error.
 func TestHandleCancel_AlreadyCancelled_200_Idempotent(t *testing.T) {
 	row := cancelledRow(t, "01890000-0000-7000-8000-000000000c03")
-	fs := &fakeStore{cancelRow: row}
+	fs := &fakeStore{cancelRow: row, cancelTransition: store.CancelTransitionIdempotentNoOp}
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+row.ID.String()+"/cancel")
@@ -129,7 +131,7 @@ func TestHandleCancel_AlreadyCancelled_200_Idempotent(t *testing.T) {
 // renders attempts.
 func TestHandleCancel_AttemptsOmitted(t *testing.T) {
 	row := cancelledRow(t, "01890000-0000-7000-8000-000000000c04")
-	fs := &fakeStore{cancelRow: row}
+	fs := &fakeStore{cancelRow: row, cancelTransition: store.CancelTransitionT3Pending}
 	srv := newTestServer(t, fs)
 
 	resp := postNoBody(t, srv.URL+"/v1/notifications/"+row.ID.String()+"/cancel")
@@ -237,7 +239,7 @@ func TestHandleCancel_StoreError_500(t *testing.T) {
 // Content-Type-less POST with no body must succeed.
 func TestHandleCancel_EmptyBodyAccepted(t *testing.T) {
 	row := cancelledRow(t, "01890000-0000-7000-8000-000000000c09")
-	fs := &fakeStore{cancelRow: row}
+	fs := &fakeStore{cancelRow: row, cancelTransition: store.CancelTransitionT3Pending}
 	srv := newTestServer(t, fs)
 
 	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/notifications/"+row.ID.String()+"/cancel", strings.NewReader(""))
@@ -259,4 +261,100 @@ func decodeTerminalStateDetail(t *testing.T, raw any) TerminalStateDetail {
 	var d TerminalStateDetail
 	require.NoError(t, json.Unmarshal(bs, &d))
 	return d
+}
+
+// TestHandleCancel_IncrementsTransitionCounter exercises every
+// branch of handleCancel and asserts the api_cancellations_total
+// counter for the matching transition label increments by 1. A
+// missing increment surfaces as a counter-shape regression here per
+// docs/phases/05-observability.md §11.
+//
+// Each subtest reads the BEFORE counter for its specific transition
+// label (the registry is process-shared), runs the request, and
+// asserts AFTER == BEFORE+1. Locked transition vocabulary:
+// t3_pending, t11_dispatched, idempotent_no_op, terminal_state,
+// not_found per docs/phases/05-observability.md §1.1.
+func TestHandleCancel_IncrementsTransitionCounter(t *testing.T) {
+	cases := []struct {
+		name       string
+		transition string
+		fs         *fakeStore
+		path       string
+	}{
+		{
+			name:       "t3_pending",
+			transition: "t3_pending",
+			fs: &fakeStore{
+				cancelRow:        cancelledRow(t, "01890000-0000-7000-8000-000000000d01"),
+				cancelTransition: store.CancelTransitionT3Pending,
+			},
+			path: "/v1/notifications/01890000-0000-7000-8000-000000000d01/cancel",
+		},
+		{
+			name:       "t11_dispatched",
+			transition: "t11_dispatched",
+			fs: &fakeStore{
+				cancelRow:        cancelledRow(t, "01890000-0000-7000-8000-000000000d02"),
+				cancelTransition: store.CancelTransitionT11Dispatched,
+			},
+			path: "/v1/notifications/01890000-0000-7000-8000-000000000d02/cancel",
+		},
+		{
+			name:       "idempotent_no_op",
+			transition: "idempotent_no_op",
+			fs: &fakeStore{
+				cancelRow:        cancelledRow(t, "01890000-0000-7000-8000-000000000d03"),
+				cancelTransition: store.CancelTransitionIdempotentNoOp,
+			},
+			path: "/v1/notifications/01890000-0000-7000-8000-000000000d03/cancel",
+		},
+		{
+			name:       "terminal_state",
+			transition: "terminal_state",
+			fs: &fakeStore{
+				cancelErr: &store.TerminalStateError{CurrentStatus: "DELIVERED"},
+			},
+			path: "/v1/notifications/01890000-0000-7000-8000-000000000d04/cancel",
+		},
+		{
+			name:       "not_found_missing_row",
+			transition: "not_found",
+			fs: &fakeStore{
+				cancelErr: store.ErrNotFound,
+			},
+			path: "/v1/notifications/01890000-0000-7000-8000-000000000d05/cancel",
+		},
+		{
+			name:       "not_found_malformed_id",
+			transition: "not_found",
+			fs:         &fakeStore{},
+			path:       "/v1/notifications/not-a-uuid/cancel",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := cancelCounterValue(t, tc.transition)
+
+			srv := newTestServer(t, tc.fs)
+			resp := postNoBody(t, srv.URL+tc.path)
+			resp.Body.Close()
+
+			after := cancelCounterValue(t, tc.transition)
+			assert.Equal(t, before+1, after, "api_cancellations_total{transition=%q} must increment by 1", tc.transition)
+		})
+	}
+}
+
+// cancelCounterValue extracts the current api_cancellations_total
+// counter value for a given transition label. Mirrors the helper
+// pattern in internal/metrics tests; kept local so the api tests
+// stay self-contained without pulling in prometheus/testutil.
+func cancelCounterValue(t *testing.T, transition string) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, metrics.APICancellations.WithLabelValues(transition).Write(&m))
+	require.NotNil(t, m.Counter)
+	require.NotNil(t, m.Counter.Value)
+	return *m.Counter.Value
 }

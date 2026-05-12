@@ -77,6 +77,10 @@ type UnprocessableInput struct {
 	// branch this is inserted verbatim into the outbox row's payload
 	// column.
 	EventPayload json.RawMessage
+
+	// TraceHeaders carries W3C Trace Context (JSON) for the outbox rows;
+	// zero value stores SQL NULL (docs/phases/05-observability.md §4).
+	TraceHeaders json.RawMessage
 }
 
 // dlqTopicForChannel renders the per-channel DLQ topic name per
@@ -124,6 +128,7 @@ type OutcomeInput struct {
 	NewEligibleAt    time.Time
 	NewFailureReason *string
 	EventPayload     json.RawMessage
+	TraceHeaders     json.RawMessage
 }
 
 // ListAttempts returns every delivery_attempts row for the given
@@ -258,11 +263,11 @@ func (s *Store) RecordOutcome(ctx context.Context, in OutcomeInput) error {
 	}
 
 	const insertOutboxSQL = `
-		INSERT INTO outbox (topic, partition_key, payload)
-		VALUES ('events.notification', $1::text, $2)
+		INSERT INTO outbox (topic, partition_key, headers, payload)
+		VALUES ('events.notification', $1::text, $2, $3)
 	`
 	if _, err := tx.Exec(ctx, insertOutboxSQL,
-		in.NotificationID, []byte(in.EventPayload),
+		in.NotificationID, jsonOrNil(in.TraceHeaders), []byte(in.EventPayload),
 	); err != nil {
 		return fmt.Errorf("store: record outcome: insert outbox: %w", err)
 	}
@@ -360,8 +365,8 @@ func (s *Store) RecordUnprocessable(ctx context.Context, in UnprocessableInput) 
 	// dlq_partitions=1).
 	dlqTopic := dlqTopicForChannel(in.Channel)
 	const insertDLQSQL = `
-		INSERT INTO outbox (topic, partition_key, payload)
-		VALUES ($1, $2, $3)
+		INSERT INTO outbox (topic, partition_key, headers, payload)
+		VALUES ($1, $2, $3, $4)
 	`
 	var dlqPartitionKey *string
 	if hasTarget {
@@ -369,7 +374,7 @@ func (s *Store) RecordUnprocessable(ctx context.Context, in UnprocessableInput) 
 		dlqPartitionKey = &s
 	}
 	if _, err := tx.Exec(ctx, insertDLQSQL,
-		dlqTopic, dlqPartitionKey, []byte(in.DLQPayload),
+		dlqTopic, dlqPartitionKey, jsonOrNil(in.TraceHeaders), []byte(in.DLQPayload),
 	); err != nil {
 		return fmt.Errorf("store: record unprocessable: insert dlq outbox: %w", err)
 	}
@@ -379,11 +384,11 @@ func (s *Store) RecordUnprocessable(ctx context.Context, in UnprocessableInput) 
 	// with).
 	if hasTarget {
 		const insertEventSQL = `
-			INSERT INTO outbox (topic, partition_key, payload)
-			VALUES ('events.notification', $1::text, $2)
+			INSERT INTO outbox (topic, partition_key, headers, payload)
+			VALUES ('events.notification', $1::text, $2, $3)
 		`
 		if _, err := tx.Exec(ctx, insertEventSQL,
-			*in.NotificationID, []byte(in.EventPayload),
+			*in.NotificationID, jsonOrNil(in.TraceHeaders), []byte(in.EventPayload),
 		); err != nil {
 			return fmt.Errorf("store: record unprocessable: insert events outbox: %w", err)
 		}

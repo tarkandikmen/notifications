@@ -22,9 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/tarkandikmen/notifications/internal/metrics"
 )
 
 //go:embed script.lua
@@ -133,11 +136,27 @@ func NewWithLimits(client *redis.Client, rate, capacity int, requestTimeout time
 // to [minSleep, maxSleep] and offset by 0..maxJitter uniform jitter)
 // and re-issues. The clamp + jitter live in Go rather than the script
 // so a future tuning change doesn't need a Redis-side script update.
+//
+// Phase 5 layers per-Acquire metric increments per
+// docs/phases/05-observability.md §1.1 (Rate limiter metrics row):
+//   - rate_limit_acquires_total{channel, outcome} counter on every
+//     terminal disposition. outcome ∈ {granted,
+//     throttled_then_granted, redis_error, ctx_canceled}.
+//   - rate_limit_wait_duration_seconds{channel} histogram observes
+//     the wall time spent in the wait loop (zero for first-try
+//     success).
 func (b *Bucket) Acquire(ctx context.Context, channel string) error {
 	key := keyPrefix + channel
+	var waitLoop time.Duration
+	throttled := false
+	observeWait := func() {
+		metrics.RateLimitWaitDuration.WithLabelValues(channel).Observe(waitLoop.Seconds())
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
+			metrics.RateLimitAcquires.WithLabelValues(channel, "ctx_canceled").Inc()
+			observeWait()
 			return err
 		}
 
@@ -155,21 +174,74 @@ func (b *Bucket) Acquire(ctx context.Context, channel string) error {
 			// Anything else (including the per-call deadline expiring,
 			// network errors, EVAL failures) is a Redis-side fault.
 			if parentErr := ctx.Err(); parentErr != nil {
+				metrics.RateLimitAcquires.WithLabelValues(channel, "ctx_canceled").Inc()
+				observeWait()
 				return parentErr
 			}
+			metrics.RateLimitAcquires.WithLabelValues(channel, "redis_error").Inc()
+			observeWait()
 			return fmt.Errorf("%w: %v", ErrRedisDown, err)
 		}
 
 		ok, waitMs, parseErr := parseScriptResult(res)
 		if parseErr != nil {
+			metrics.RateLimitAcquires.WithLabelValues(channel, "redis_error").Inc()
+			observeWait()
 			return fmt.Errorf("%w: %v", ErrRedisDown, parseErr)
 		}
 		if ok {
+			outcome := "granted"
+			if throttled {
+				outcome = "throttled_then_granted"
+			}
+			metrics.RateLimitAcquires.WithLabelValues(channel, outcome).Inc()
+			observeWait()
 			return nil
 		}
 
-		b.sleeper(throttledSleep(waitMs))
+		throttled = true
+		d := throttledSleep(waitMs)
+		waitLoop += d
+		b.sleeper(d)
 	}
+}
+
+// Sample reads the current token count from Redis without consuming a
+// token. Used by the worker's metrics goroutine to publish the
+// rate_limit_tokens_available gauge per channel per
+// docs/phases/05-observability.md §8.3.
+//
+// HGET against rate:<channel>'s tokens field returns the post-Acquire
+// token count (the Lua script writes it as a float). On a missing
+// key (the bucket has not been seeded yet — the next Acquire will
+// initialize it to capacity) returns capacity, 0 nil; the operator
+// reading the gauge sees a "full bucket" rather than a misleading 0.
+//
+// Returns ErrRedisDown on a Redis call failure (network error,
+// per-call timeout). The caller (worker.publishRateLimitTokens) leaves
+// the gauge at its previous value.
+func (b *Bucket) Sample(ctx context.Context, channel string) (float64, error) {
+	key := keyPrefix + channel
+
+	callCtx, cancel := context.WithTimeout(ctx, b.requestTimeout)
+	defer cancel()
+
+	res, err := b.client.HGet(callCtx, key, "tokens").Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return float64(b.capacity), nil
+		}
+		if parentErr := ctx.Err(); parentErr != nil {
+			return 0, parentErr
+		}
+		return 0, fmt.Errorf("%w: %v", ErrRedisDown, err)
+	}
+
+	tokens, parseErr := strconv.ParseFloat(res, 64)
+	if parseErr != nil {
+		return 0, fmt.Errorf("%w: parse tokens %q: %v", ErrRedisDown, res, parseErr)
+	}
+	return tokens, nil
 }
 
 // throttledSleep maps the Lua script's wait_ms (which can be negative

@@ -19,16 +19,22 @@ import (
 // fakeGuardReader stubs guardReader for the unit tests below. The
 // fields drive ReadStateForGuard's return; the captured args field lets
 // tests assert the function was invoked with the expected id.
+//
+// Phase 5 widened the return shape with createdAt; tests that don't
+// care supply the zero time.Time and the worker handles it
+// gracefully (the latency observation fires only on the GuardProceed
+// branch when CreatedAt is non-zero).
 type fakeGuardReader struct {
 	status     string
 	attempt    int
+	createdAt  time.Time
 	err        error
 	calledWith uuid.UUID
 }
 
-func (f *fakeGuardReader) ReadStateForGuard(_ context.Context, id uuid.UUID) (string, int, error) {
+func (f *fakeGuardReader) ReadStateForGuard(_ context.Context, id uuid.UUID) (string, int, time.Time, error) {
 	f.calledWith = id
-	return f.status, f.attempt, f.err
+	return f.status, f.attempt, f.createdAt, f.err
 }
 
 // TestCheckStateGuard_BranchTable exercises every row in the
@@ -105,9 +111,61 @@ func TestCheckStateGuard_BranchTable(t *testing.T) {
 			reader := tc.readerState
 			got, err := CheckStateGuard(context.Background(), &reader, id, tc.msgAttempt)
 			require.NoError(t, err)
-			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.want, got.Outcome)
 			assert.Equal(t, id, reader.calledWith,
 				"CheckStateGuard must call ReadStateForGuard with the message's notification id")
+		})
+	}
+}
+
+// TestCheckStateGuard_ProceedCarriesCreatedAt locks the Phase 5
+// widening: GuardProceed surfaces the row's created_at so the worker
+// can observe notification_delivery_latency_seconds without a second
+// round trip per docs/phases/05-observability.md §1.1 worker rows.
+// Non-Proceed outcomes leave CreatedAt as the zero time.Time; the
+// worker's latency observation guards on IsZero defensively.
+func TestCheckStateGuard_ProceedCarriesCreatedAt(t *testing.T) {
+	id := uuid.MustParse("01927000-0000-7000-8000-000000000005")
+	createdAt := time.Date(2026, 5, 11, 12, 34, 56, 0, time.UTC)
+	reader := &fakeGuardReader{
+		status:    "DISPATCHED",
+		attempt:   3,
+		createdAt: createdAt,
+	}
+
+	got, err := CheckStateGuard(context.Background(), reader, id, 3)
+	require.NoError(t, err)
+	assert.Equal(t, GuardProceed, got.Outcome)
+	assert.True(t, got.CreatedAt.Equal(createdAt),
+		"GuardProceed must carry the row's created_at for the latency observation")
+}
+
+// TestCheckStateGuard_SkipOutcomesHaveZeroCreatedAt locks the
+// invariant that non-Proceed outcomes leave CreatedAt as the zero
+// time.Time. The worker's notification_delivery_latency_seconds
+// observation is gated on the GuardProceed branch + IsZero check —
+// a non-Proceed outcome with a populated CreatedAt would be a
+// regression that pollutes the histogram with zero-bucket samples
+// for skipped records.
+func TestCheckStateGuard_SkipOutcomesHaveZeroCreatedAt(t *testing.T) {
+	id := uuid.MustParse("01927000-0000-7000-8000-000000000006")
+	createdAt := time.Date(2026, 5, 11, 12, 34, 56, 0, time.UTC)
+
+	cases := []struct {
+		name   string
+		reader fakeGuardReader
+	}{
+		{"SkipStale", fakeGuardReader{status: "DISPATCHED", attempt: 5, createdAt: createdAt}},
+		{"SkipTerminal", fakeGuardReader{status: "DELIVERED", attempt: 7, createdAt: createdAt}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := tc.reader
+			got, err := CheckStateGuard(context.Background(), &reader, id, 3)
+			require.NoError(t, err)
+			assert.NotEqual(t, GuardProceed, got.Outcome)
+			assert.True(t, got.CreatedAt.IsZero(),
+				"non-Proceed outcomes must leave CreatedAt zero so the worker's latency observation is defensively skipped")
 		})
 	}
 }
@@ -121,7 +179,7 @@ func TestCheckStateGuard_NotFound(t *testing.T) {
 
 	got, err := CheckStateGuard(context.Background(), reader, id, 1)
 	require.NoError(t, err, "ErrNotFound surfaces as GuardSkipMissing, not as an error")
-	assert.Equal(t, GuardSkipMissing, got)
+	assert.Equal(t, GuardSkipMissing, got.Outcome)
 }
 
 // TestCheckStateGuard_StoreError verifies that real Postgres errors
@@ -150,7 +208,7 @@ func TestCheckStateGuard_TerminalIgnoresAttempt(t *testing.T) {
 			reader := &fakeGuardReader{status: terminal, attempt: 3}
 			got, err := CheckStateGuard(context.Background(), reader, id, 3)
 			require.NoError(t, err)
-			assert.Equal(t, GuardSkipTerminal, got,
+			assert.Equal(t, GuardSkipTerminal, got.Outcome,
 				"matching attempt does not override terminal status")
 		})
 	}

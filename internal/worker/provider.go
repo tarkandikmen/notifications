@@ -8,6 +8,10 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // providerRequestTimeout caps a single provider HTTP call per
@@ -49,11 +53,50 @@ type Provider struct {
 // webhookURL is the absolute URL passed via cfg.WebhookURL; the
 // provider posts every SMS to this single URL (Phase 2 has no
 // per-recipient routing).
+//
+// Phase 5 wraps the transport with otelhttp.NewTransport so the
+// provider call automatically opens an `HTTP POST` span as a child of
+// the active span on the request's context. The worker's
+// `provider.Send(ctx, ...)` already passes ctx from handleRecord, so
+// the span chains under worker.handleRecord per
+// docs/phases/05-observability.md §6. No metric duplication — the
+// otelhttp span lives in the trace; the
+// worker_provider_request_duration_seconds histogram is what
+// dashboards graph.
+//
+// notificationSpanAttrRT sits inside otelhttp so each outbound span can
+// copy notification.id from context (set in Send) onto the HTTP client
+// span for Jaeger tag search.
 func NewProvider(webhookURL string) *Provider {
 	return &Provider{
-		client:     &http.Client{Timeout: providerRequestTimeout},
+		client: &http.Client{
+			Timeout: providerRequestTimeout,
+			Transport: otelhttp.NewTransport(&notificationSpanAttrRT{
+				base: http.DefaultTransport,
+			}),
+		},
 		webhookURL: webhookURL,
 	}
+}
+
+type providerNotifIDKey struct{}
+
+// notificationSpanAttrRT runs after otelhttp creates the client span;
+// r.Context() is the span context, so attributes apply to the HTTP POST span.
+type notificationSpanAttrRT struct {
+	base http.RoundTripper
+}
+
+func (t *notificationSpanAttrRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	if id, _ := r.Context().Value(providerNotifIDKey{}).(string); id != "" {
+		if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
+			span.SetAttributes(attribute.String("notification.id", id))
+		}
+	}
+	if t.base == nil {
+		t.base = http.DefaultTransport
+	}
+	return t.base.RoundTrip(r)
 }
 
 // NewProviderWithClient is the test seam — accepts an HTTPDoer so unit
@@ -84,7 +127,9 @@ type providerRequest struct {
 // Send never returns an error itself — every failure mode is encoded
 // in the returned ProviderResult so the caller's classify branch fires
 // uniformly regardless of HTTP-vs-network failure.
-func (p *Provider) Send(ctx context.Context, recipient, channel, content string) ProviderResult {
+func (p *Provider) Send(ctx context.Context, notificationID, recipient, channel, content string) ProviderResult {
+	ctx = context.WithValue(ctx, providerNotifIDKey{}, notificationID)
+
 	body, err := json.Marshal(providerRequest{
 		To:      recipient,
 		Channel: channel,

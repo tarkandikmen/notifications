@@ -2,14 +2,18 @@ package relay
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
@@ -40,12 +44,25 @@ type Producer interface {
 // than wrapping them — phase 2's only loop-level test (loop_test.go) is
 // the integration test that exercises both the real Postgres and Kafka
 // containers.
+//
+// Phase 5 adds Tracer for the per-tick relay.tick span; the field is
+// required and applyDefaults panics when nil to mirror the
+// dispatcher / reaper convention.
 type Deps struct {
 	Store        *store.Store
 	Producer     Producer
 	Logger       *slog.Logger
 	PollInterval time.Duration
 	BatchSize    int
+
+	// Tracer is the OpenTelemetry tracer used to open the per-tick
+	// relay.tick span. Required; applyDefaults panics when nil.
+	// Production (cmd.go) injects otel.Tracer(serviceName) backed
+	// by the global tracer provider; tests inject a noop tracer or
+	// an in-memory tracetest provider.
+	//
+	// docs/phases/05-observability.md §7.
+	Tracer trace.Tracer
 }
 
 // Loop drives the outbox-to-Kafka cycle until ctx is cancelled. Returns
@@ -97,37 +114,81 @@ func Loop(ctx context.Context, deps Deps) error {
 // docs/design/04-kafka.md §5; consumers handle dupes via the
 // (notification_id, attempt) ON CONFLICT in the worker's Tx B).
 //
+// Phase 5 layers per-tick observability:
+//   - One relay.tick span per call, attributed with row count + outcome
+//     (docs/phases/05-observability.md §7). Each claimed outbox row also
+//     opens a short relay.row child with kafka.topic, outbox.id, and
+//     notification.id when partition_key is a UUID, so Jaeger tag search
+//     finds the publish hop for a notification.
+//   - relay_ticks_total{outcome} counter on every branch (published,
+//     empty, error).
+//   - relay_published_rows_per_tick histogram on the successful-claim
+//     branches.
+//   - relay_tick_duration_seconds histogram on every branch.
+//   - relay_published_records_total{topic} counter incremented per
+//     topic by the size of that topic's slice in the batch.
+//
 // Exposed (lowercase) at the package level so loop_test.go can drive a
 // single, deterministic tick rather than racing the time.Ticker — same
 // pattern as internal/dispatcher/loop.go.
 func runOnce(ctx context.Context, deps Deps) error {
+	start := time.Now()
+	ctx, span := deps.Tracer.Start(ctx, "relay.tick")
+	outcome := "error" // overwritten before every non-panic return path
+	defer func() {
+		span.SetAttributes(attribute.String("outcome", outcome))
+		metrics.RelayTicks.WithLabelValues(outcome).Inc()
+		metrics.RelayTickDuration.Observe(time.Since(start).Seconds())
+		span.End()
+	}()
+
 	tx, err := deps.Store.Pool().Begin(ctx)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("relay: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	rows, err := deps.Store.ClaimUnpublishedOutbox(ctx, tx, deps.BatchSize)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("relay: claim unpublished: %w", err)
 	}
 	if len(rows) == 0 {
 		// Empty claim: rollback (the deferred call) is fine; the tx
 		// performed no writes. Returning nil avoids a needless commit.
+		span.SetAttributes(attribute.Int("rows", 0))
+		metrics.RelayPublishedRowsPerTick.Observe(0)
+		outcome = "empty"
 		return nil
 	}
 
 	records := make([]*kgo.Record, 0, len(rows))
 	ids := make([]int64, 0, len(rows))
+	perTopic := make(map[string]int, 4)
 	for i := range rows {
 		row := &rows[i]
+		_, rowSpan := deps.Tracer.Start(ctx, "relay.row",
+			trace.WithAttributes(
+				attribute.String("kafka.topic", row.Topic),
+				attribute.Int64("outbox.id", row.ID),
+			),
+		)
+		if row.PartitionKey != nil && *row.PartitionKey != "" {
+			if nid, err := uuid.Parse(*row.PartitionKey); err == nil {
+				rowSpan.SetAttributes(attribute.String("notification.id", nid.String()))
+			}
+		}
+		rowSpan.End()
+
 		records = append(records, &kgo.Record{
 			Topic:   row.Topic,
 			Key:     keyFrom(row.PartitionKey),
 			Value:   []byte(row.Payload),
-			Headers: hdrsFrom(row.Headers),
+			Headers: observability.KafkaHeadersFromOutboxHeaders(row.Headers),
 		})
 		ids = append(ids, row.ID)
+		perTopic[row.Topic]++
 	}
 
 	// Publish-then-mark ordering per docs/phases/02-walking-skeleton.md §8.
@@ -136,16 +197,26 @@ func runOnce(ctx context.Context, deps Deps) error {
 	// the whole batch — the deferred rollback fires and the rows stay
 	// unpublished for the next tick.
 	if err := deps.Producer.ProduceSync(ctx, records...).FirstErr(); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("relay: produce sync: %w", err)
 	}
 
 	if err := deps.Store.MarkOutboxPublished(ctx, tx, ids); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("relay: mark published: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("relay: commit: %w", err)
 	}
+
+	span.SetAttributes(attribute.Int("rows", len(rows)))
+	metrics.RelayPublishedRowsPerTick.Observe(float64(len(rows)))
+	for topic, n := range perTopic {
+		metrics.RelayPublishedRecords.WithLabelValues(topic).Add(float64(n))
+	}
+	outcome = "published"
 
 	deps.Logger.Debug("relay tick committed", "rows", len(rows))
 	return nil
@@ -163,34 +234,15 @@ func keyFrom(s *string) []byte {
 	return []byte(*s)
 }
 
-// hdrsFrom decodes the outbox row's headers JSONB into the franz-go
-// header slice. Phase 2 producers always leave headers null
-// (docs/design/04-kafka.md §4 — "Phase 5 fills it in"), so this returns
-// an empty slice for the common path. The decode is permissive: a
-// malformed header blob doesn't crash the relay; the message is
-// published without trace context and the next phase's contract test
-// catches the regression.
-func hdrsFrom(b json.RawMessage) []kgo.RecordHeader {
-	if len(b) == 0 {
-		return nil
-	}
-	var m map[string]string
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil
-	}
-	if len(m) == 0 {
-		return nil
-	}
-	out := make([]kgo.RecordHeader, 0, len(m))
-	for k, v := range m {
-		out = append(out, kgo.RecordHeader{Key: k, Value: []byte(v)})
-	}
-	return out
-}
-
-// applyDefaults fills in zero-valued Deps fields with the locked phase 2
+// applyDefaults fills in zero-valued Deps fields with the locked Phase 2
 // defaults so callers (cmd.go in production, loop_test.go in tests) only
 // need to set what they're customizing.
+//
+// Tracer is required: a nil Tracer panics here so production wiring
+// (cmd.go) and tests that exercise runOnce must inject one. An
+// alternative (treat nil as "no spans") would silently regress the
+// §7 trace behavior under a future cmd.go that forgets to wire the
+// global tracer provider.
 func applyDefaults(d Deps) Deps {
 	if d.PollInterval <= 0 {
 		d.PollInterval = defaultPollInterval
@@ -200,6 +252,9 @@ func applyDefaults(d Deps) Deps {
 	}
 	if d.Logger == nil {
 		d.Logger = slog.Default()
+	}
+	if d.Tracer == nil {
+		panic("relay: Deps.Tracer is required (otel.Tracer or noop)")
 	}
 	return d
 }

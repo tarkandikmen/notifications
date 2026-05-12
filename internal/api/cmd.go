@@ -19,6 +19,8 @@ import (
 
 	"github.com/tarkandikmen/notifications/internal/config"
 	"github.com/tarkandikmen/notifications/internal/db"
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/metricsserver"
 	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/server"
 	"github.com/tarkandikmen/notifications/internal/store"
@@ -57,7 +59,7 @@ func Run(cmd *cobra.Command, _ []string) error {
 	}
 	defer pool.Close()
 
-	registry := observability.NewRegistry()
+	registry := metrics.Registry()
 
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
@@ -65,11 +67,26 @@ func Run(cmd *cobra.Command, _ []string) error {
 		Registry: registry,
 		Logger:   logger,
 		Clock:    time.Now,
+		// Phase 5 §3: handleHealthz runs Pinger inside a 2 s
+		// per-request timeout. pgxpool.Pool.Ping returns nil on a
+		// successful round-trip and an error otherwise; the api
+		// surfaces the 503 path with the error message in the
+		// component map.
+		Pinger: pool.Ping,
 	})
 
 	httpServer := server.New(cfg, mux)
 
-	logger.Info("started", "mode", serviceName, "addr", cfg.HTTPAddr)
+	// Phase 5: every binary runs the uniform metricsserver on
+	// cfg.MetricsAddr (default :9090). The api binary's :8080
+	// already serves /metrics from the same registry (Phase 1 carry
+	// over via RegisterRoutes); the :9090 endpoint is additive so a
+	// Prometheus scrape config can target every binary on the same
+	// per-binary port. Both endpoints serve identical bodies because
+	// they share metrics.Registry().
+	metricsHTTP := metricsserver.New(cfg.MetricsAddr, registry, nil)
+
+	logger.Info("started", "mode", serviceName, "addr", cfg.HTTPAddr, "metrics_addr", cfg.MetricsAddr)
 
 	listenErr := make(chan error, 1)
 	go func() {
@@ -79,11 +96,23 @@ func Run(cmd *cobra.Command, _ []string) error {
 		close(listenErr)
 	}()
 
+	metricsListenErr := make(chan error, 1)
+	go func() {
+		if err := metricsHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			metricsListenErr <- err
+		}
+		close(metricsListenErr)
+	}()
+
 	select {
 	case <-ctx.Done():
 	case err := <-listenErr:
 		if err != nil {
 			return fmt.Errorf("api: http listen: %w", err)
+		}
+	case err := <-metricsListenErr:
+		if err != nil {
+			return fmt.Errorf("api: metrics listen: %w", err)
 		}
 	}
 
@@ -93,6 +122,9 @@ func Run(cmd *cobra.Command, _ []string) error {
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("http shutdown failed", "err", err)
+	}
+	if err := metricsHTTP.Shutdown(shutdownCtx); err != nil {
+		logger.Error("metrics shutdown failed", "err", err)
 	}
 	if err := shutdownTelemetry(shutdownCtx); err != nil {
 		logger.Error("telemetry shutdown failed", "err", err)

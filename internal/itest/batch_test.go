@@ -41,6 +41,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/tarkandikmen/notifications/internal/api"
 	"github.com/tarkandikmen/notifications/internal/dispatcher"
@@ -165,6 +166,7 @@ func TestBatchCreateAndGet_FiveItems_AllDelivered(t *testing.T) {
 			BatchSize:    200,
 			Channels:     []string{"sms", "email", "push"},
 			Lag:          lagClient,
+			Tracer:       noop.NewTracerProvider().Tracer("dispatcher"),
 		})
 	})
 
@@ -175,6 +177,7 @@ func TestBatchCreateAndGet_FiveItems_AllDelivered(t *testing.T) {
 			Logger:       logger,
 			PollInterval: 25 * time.Millisecond,
 			BatchSize:    500,
+			Tracer:       noop.NewTracerProvider().Tracer("relay"),
 		})
 	})
 
@@ -196,6 +199,7 @@ func TestBatchCreateAndGet_FiveItems_AllDelivered(t *testing.T) {
 				Logger:   logger,
 				Channel:  ch,
 				Clock:    time.Now,
+				Tracer:   noop.NewTracerProvider().Tracer("worker"),
 			})
 		})
 	}
@@ -209,6 +213,7 @@ func TestBatchCreateAndGet_FiveItems_AllDelivered(t *testing.T) {
 			MaxAttempts:    7,
 			Channels:       []string{"sms", "email", "push"},
 			Lag:            lagClient,
+			Tracer:         noop.NewTracerProvider().Tracer("reaper"),
 		})
 	})
 

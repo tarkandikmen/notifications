@@ -16,7 +16,9 @@ import (
 
 // Init bootstraps OpenTelemetry tracing. When endpoint is empty the SDK
 // writes spans to stdout (Phase 1 default); when set, spans are exported via
-// OTLP/gRPC. The W3C trace-context propagator is installed globally so
+// OTLP/gRPC. Production docker-compose sets OTEL_EXPORTER_OTLP_ENDPOINT to
+// jaeger:4317 (Jaeger all-in-one OTLP receiver) per
+// docs/phases/05-observability.md §9–§10. The W3C trace-context propagator is installed globally so
 // outgoing HTTP, Kafka, and DB spans link cleanly to incoming traces.
 //
 // The returned shutdown function flushes the exporter and must be deferred

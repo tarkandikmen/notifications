@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
@@ -236,6 +237,56 @@ func TestHandleList_StoreError_500(t *testing.T) {
 
 	env := decodeErrorEnvelope(t, resp.Body)
 	assert.Equal(t, "internal_error", env.Error.Code)
+}
+
+// TestHandleList_ObservesResultSize asserts the
+// api_list_result_size_items histogram observation rises by 1 per
+// list request, with the observed value matching the post-pagination
+// row count returned by the store. Per
+// docs/phases/05-observability.md §1.1 the observation reflects the
+// rendered result size, NOT the requested limit — so dashboards can
+// graph "page-fill ratio" against has_more=true tails.
+func TestHandleList_ObservesResultSize(t *testing.T) {
+	const endpoint = "GET /v1/notifications"
+	rows := []store.Notification{
+		fakeNotificationRow(t, "01890000-0000-7000-8000-000000000a01", "sms", "+905551234567", "row 1", "00000000-0000-4000-8000-000000000a01"),
+		fakeNotificationRow(t, "01890000-0000-7000-8000-000000000a02", "sms", "+905551234568", "row 2", "00000000-0000-4000-8000-000000000a02"),
+	}
+	fs := &fakeStore{listRows: rows, listHasMore: false}
+
+	before := histogramObservation(t, metrics.APIListResultSize.WithLabelValues(endpoint))
+
+	srv := newTestServer(t, fs)
+	resp, err := http.Get(srv.URL + "/v1/notifications")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	after := histogramObservation(t, metrics.APIListResultSize.WithLabelValues(endpoint))
+	assert.Equal(t, before.SampleCount+1, after.SampleCount, "histogram sample count must rise by 1 per list request")
+	assert.Equal(t, before.SampleSum+float64(len(rows)), after.SampleSum, "histogram sample sum must rise by the rendered row count")
+}
+
+// TestHandleList_EmptyResult_ObservesZero asserts the histogram is
+// observed with value 0 when the store returns no rows — the
+// observation reflects the rendered result size and an empty match
+// is still a successful query (200 with notifications: []), so
+// dashboards see "zero-result page" as a measurable event.
+func TestHandleList_EmptyResult_ObservesZero(t *testing.T) {
+	const endpoint = "GET /v1/notifications"
+	fs := &fakeStore{listRows: nil, listHasMore: false}
+
+	before := histogramObservation(t, metrics.APIListResultSize.WithLabelValues(endpoint))
+
+	srv := newTestServer(t, fs)
+	resp, err := http.Get(srv.URL + "/v1/notifications?status=DELIVERED")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	after := histogramObservation(t, metrics.APIListResultSize.WithLabelValues(endpoint))
+	assert.Equal(t, before.SampleCount+1, after.SampleCount, "even an empty match observes the histogram")
+	assert.Equal(t, before.SampleSum, after.SampleSum, "empty match's value-zero observation leaves the sum unchanged")
 }
 
 // TestHandleGetBatch_HappyPath asserts a populated batch response: the

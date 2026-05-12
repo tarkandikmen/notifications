@@ -52,6 +52,19 @@ services:
     ports:
       - "9092:9092"
 
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:16686/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   migrate:
     build: .
     restart: "no"
@@ -84,6 +97,7 @@ services:
     command: ["api"]
     ports:
       - "8080:8080"
+      - "9090:9090"
     volumes:
       - ./.env:/app/.env:ro
     depends_on:
@@ -91,10 +105,14 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      jaeger:
+        condition: service_healthy
 
   dispatcher:
     build: .
     command: ["dispatcher"]
+    ports:
+      - "9091:9090"
     volumes:
       - ./.env:/app/.env:ro
     depends_on:
@@ -106,10 +124,15 @@ services:
         condition: service_healthy
       kafka-bootstrap:
         condition: service_completed_successfully
+      jaeger:
+        condition: service_healthy
 
   worker-sms:
     build: .
     command: ["worker", "--channel=sms"]
+    ports:
+      # Host :9092 is the Kafka broker; scrape worker-sms at :9082/metrics.
+      - "9082:9090"
     volumes:
       - ./.env:/app/.env:ro
     depends_on:
@@ -122,11 +145,15 @@ services:
       kafka-bootstrap:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      jaeger:
         condition: service_healthy
 
   worker-email:
     build: .
     command: ["worker", "--channel=email"]
+    ports:
+      - "9093:9090"
     volumes:
       - ./.env:/app/.env:ro
     depends_on:
@@ -139,11 +166,15 @@ services:
       kafka-bootstrap:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      jaeger:
         condition: service_healthy
 
   worker-push:
     build: .
     command: ["worker", "--channel=push"]
+    ports:
+      - "9094:9090"
     volumes:
       - ./.env:/app/.env:ro
     depends_on:
@@ -157,10 +188,14 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_healthy
 
   relay:
     build: .
     command: ["relay"]
+    ports:
+      - "9095:9090"
     volumes:
       - ./.env:/app/.env:ro
     depends_on:
@@ -172,10 +207,14 @@ services:
         condition: service_healthy
       kafka-bootstrap:
         condition: service_completed_successfully
+      jaeger:
+        condition: service_healthy
 
   reaper:
     build: .
     command: ["reaper"]
+    ports:
+      - "9096:9090"
     volumes:
       - ./.env:/app/.env:ro
     depends_on:
@@ -187,3 +226,5 @@ services:
         condition: service_healthy
       kafka-bootstrap:
         condition: service_completed_successfully
+      jaeger:
+        condition: service_healthy

@@ -12,6 +12,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
@@ -34,28 +36,62 @@ type Store interface {
 	GetNotification(ctx context.Context, id uuid.UUID) (store.Notification, []store.DeliveryAttempt, error)
 	ListNotifications(ctx context.Context, filters store.ListFilters, offset, limit int) ([]store.Notification, bool, error)
 	GetBatch(ctx context.Context, batchID uuid.UUID) ([]store.Notification, error)
-	CancelNotification(ctx context.Context, id uuid.UUID) (store.Notification, error)
+	CancelNotification(ctx context.Context, id uuid.UUID, traceHeaders json.RawMessage) (store.Notification, store.CancelTransition, error)
 }
+
+// PingerFunc is the signature of a per-request liveness probe. The
+// supplied pinger is called inside a 2 s context timeout in
+// handleHealthz; any non-nil err produces a 503 with the failing
+// component's name in the body per docs/design/03-api.md
+// §`GET /healthz`.
+//
+// The 200 path returns the exact-byte body Phase 1's acceptance test 5
+// asserts (`{"status":"ok"}` with no trailing newline); the 503 path
+// returns the rich body locked in docs/design/03-api.md §`GET
+// /healthz` (`{"status":"unhealthy","components":{"<name>":"<error>"}}`).
+//
+// Wired by api/cmd.go to pgxpool.Pool.Ping in production. Tests
+// substitute a closure that returns a deterministic error to exercise
+// the 503 path.
+//
+// docs/phases/05-observability.md §3 locks the surface; only Postgres
+// is probed in Phase 5 (the api binary doesn't open Redis or Kafka
+// clients — Phase 7 polish if k8s readiness probes need them).
+type PingerFunc func(ctx context.Context) error
 
 // Deps is the api package's per-process dependency bundle. cmd.go
 // assembles it at startup and hands it to RegisterRoutes; tests build
 // it manually with fakes.
 //
-// docs/phases/02-walking-skeleton.md §6 locks the field set: storage,
-// metrics registry, logger, and an injectable clock for tests that need
-// to exercise scheduled_at boundaries deterministically.
+// docs/phases/02-walking-skeleton.md §6 locks the original field set;
+// docs/phases/05-observability.md §3 adds Pinger so handleHealthz can
+// run the per-request Postgres ping that distinguishes "process up"
+// (Phase 1 minimum) from "deps responding" (Phase 5 contract). A nil
+// Pinger preserves the Phase 1 behavior for tests that don't care
+// about the dep probe.
 type Deps struct {
 	Store    Store
 	Registry *prometheus.Registry
 	Logger   *slog.Logger
 	Clock    func() time.Time
+	Pinger   PingerFunc
 }
 
 // RegisterRoutes wires every endpoint in the api package onto mux.
 //
+// Each route is registered through metrics.Middleware so the
+// api_requests_total + api_request_duration_seconds vectors observe
+// every request reaching a registered route. Wrapping per-route (vs.
+// wrapping the whole mux) keeps r.Pattern populated by the time the
+// middleware reads it — wrapping the mux from the outside would land
+// before the mux populates Pattern and surface every request with
+// endpoint="".
+//
 // docs/phases/02-walking-skeleton.md §6 locked the original four routes;
 // docs/phases/04-api-completeness.md adds the list (Chunk 1), batch-get
-// (Chunk 1), batch-create (Chunk 2), and cancel (Chunk 3) endpoints.
+// (Chunk 1), batch-create (Chunk 2), and cancel (Chunk 3) endpoints;
+// docs/phases/05-observability.md §1.3 wires the metrics middleware
+// and §3 wires the rich healthz dep probe.
 func RegisterRoutes(mux *http.ServeMux, deps Deps) {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
@@ -64,23 +100,62 @@ func RegisterRoutes(mux *http.ServeMux, deps Deps) {
 		deps.Clock = time.Now
 	}
 
-	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.Handle("GET /metrics", promhttp.HandlerFor(deps.Registry, promhttp.HandlerOpts{}))
-	mux.Handle("POST /v1/notifications", handleCreate(deps))
-	mux.Handle("POST /v1/notifications/batch", handleBatchCreate(deps))
-	mux.Handle("GET /v1/notifications", handleList(deps))
-	mux.Handle("GET /v1/notifications/{id}", handleGet(deps))
-	mux.Handle("POST /v1/notifications/{id}/cancel", handleCancel(deps))
-	mux.Handle("GET /v1/batches/{id}", handleGetBatch(deps))
+	mux.Handle("GET /healthz", metrics.Middleware(handleHealthz(deps)))
+	mux.Handle("GET /metrics", metrics.Middleware(promhttp.HandlerFor(deps.Registry, promhttp.HandlerOpts{})))
+	mux.Handle("POST /v1/notifications", metrics.Middleware(handleCreate(deps)))
+	mux.Handle("POST /v1/notifications/batch", metrics.Middleware(handleBatchCreate(deps)))
+	mux.Handle("GET /v1/notifications", metrics.Middleware(handleList(deps)))
+	mux.Handle("GET /v1/notifications/{id}", metrics.Middleware(handleGet(deps)))
+	mux.Handle("POST /v1/notifications/{id}/cancel", metrics.Middleware(handleCancel(deps)))
+	mux.Handle("GET /v1/batches/{id}", metrics.Middleware(handleGetBatch(deps)))
 }
 
-// handleHealthz is the Phase-1-locked exact-byte healthz handler from
-// docs/design/03-api.md §`GET /healthz`. The body must NOT have a
-// trailing newline so json.Encode is intentionally avoided.
-func handleHealthz(w http.ResponseWriter, _ *http.Request) {
+// handleHealthz implements the per-request dep-probe contract from
+// docs/design/03-api.md §`GET /healthz`. When deps.Pinger is nil
+// (default for unit tests not exercising the probe) the handler
+// returns the Phase 1 byte-exact 200 body unconditionally, preserving
+// the Phase 1 acceptance contract. When deps.Pinger is set (the
+// production wiring is pgxpool.Pool.Ping) the handler runs it inside
+// a 2 s context timeout per request:
+//
+//   - nil err: 200 with the byte-exact `{"status":"ok"}` body (no
+//     trailing newline) so the Phase 1 acceptance test 5 stays green.
+//   - non-nil err: 503 with the rich body
+//     `{"status":"unhealthy","components":{"postgres":"<error>"}}`
+//     (json.Encode is fine here — no exact-byte contract on 503).
+//
+// Phase 5 wires only the Postgres probe; deeper probes (Redis, Kafka)
+// are Phase 7 polish per docs/phases/05-observability.md §Out of scope.
+func handleHealthz(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if deps.Pinger != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if err := deps.Pinger(ctx); err != nil {
+				writeUnhealthy(w, "postgres", err)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}
+}
+
+// writeUnhealthy writes the 503 body shape locked by
+// docs/design/03-api.md §`GET /healthz`. The component map carries
+// one entry per failing dep; Phase 5 only probes Postgres so the map
+// is always single-entry, but the shape generalizes for the
+// Phase 7 polish that adds Redis / Kafka probes.
+func writeUnhealthy(w http.ResponseWriter, component string, err error) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": "unhealthy",
+		"components": map[string]string{
+			component: err.Error(),
+		},
+	})
 }
 
 // handleCreate implements POST /v1/notifications. The six steps below
@@ -141,6 +216,7 @@ func handleCreate(deps Deps) http.HandlerFunc {
 		if err := deps.Store.InsertNotification(r.Context(), n); err != nil {
 			var conflict *store.IdempotencyConflictError
 			if errors.As(err, &conflict) {
+				observability.SetSpanNotificationID(r.Context(), conflict.ExistingID)
 				writeJSON(w, http.StatusConflict, ErrorEnvelope{
 					Error: ErrorBody{
 						Code:    "duplicate_idempotency_keys",
@@ -159,6 +235,7 @@ func handleCreate(deps Deps) http.HandlerFunc {
 			return
 		}
 
+		observability.SetSpanNotificationID(r.Context(), id)
 		writeJSON(w, http.StatusCreated, CreateResponse{ID: id.String()})
 	}
 }
@@ -174,6 +251,7 @@ func handleGet(deps Deps) http.HandlerFunc {
 			writeNotFound(w)
 			return
 		}
+		observability.SetSpanNotificationID(r.Context(), id)
 
 		n, attempts, err := deps.Store.GetNotification(r.Context(), id)
 		if err != nil {

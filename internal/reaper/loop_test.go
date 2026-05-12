@@ -12,9 +12,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/store"
 	"github.com/tarkandikmen/notifications/internal/testsupport"
 	"github.com/tarkandikmen/notifications/internal/worker"
@@ -118,6 +126,11 @@ func newTestDeps(t *testing.T) (Deps, *store.Store, *fakeLag) {
 		// Tests that need a deterministic clock for the post-pass
 		// jitter range override this field after construction.
 		Now: func() time.Time { return time.Now().UTC() },
+		// Phase 5: a noop tracer satisfies Deps.Tracer for unit tests
+		// so the per-cycle reaper.cycle span is opened (and ended)
+		// without any exporter wiring. Tests that need to assert on
+		// span shape build an in-memory tracetest provider in-line.
+		Tracer: noop.NewTracerProvider().Tracer("test"),
 	}, st, lag
 }
 
@@ -326,6 +339,51 @@ func TestRunOnce_ResetsAndTerminalFails(t *testing.T) {
 	assert.Equal(t, failed.ID.String(), *partitionKey)
 }
 
+// TestRunOnce_PopulatesT10OutboxHeaders documents Chunk 6: T10
+// events.notification rows carry the reaper.cycle span's W3C headers.
+func TestRunOnce_PopulatesT10OutboxHeaders(t *testing.T) {
+	deps, st, _ := newTestDeps(t)
+	disableUpdatedAtTrigger(t, st)
+
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exp)))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	deps.Tracer = tp.Tracer("reaper")
+
+	now := time.Now().UTC()
+	deps.Now = func() time.Time { return now }
+	pinTestRand(t, 42, 0)
+
+	failed := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000399")
+	forceStuck(t, st, failed.ID, 7)
+
+	require.NoError(t, runOnce(context.Background(), deps))
+
+	var hdr []byte
+	err := st.Pool().QueryRow(context.Background(),
+		`SELECT headers FROM outbox WHERE topic = 'events.notification' AND partition_key = $1`,
+		failed.ID.String(),
+	).Scan(&hdr)
+	require.NoError(t, err)
+	require.NotEmpty(t, hdr)
+	var m map[string]string
+	require.NoError(t, json.Unmarshal(hdr, &m))
+	assert.Contains(t, m, "traceparent")
+
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	var sawCycle bool
+	for _, sp := range exp.GetSpans() {
+		if sp.Name == "reaper.cycle" {
+			sawCycle = true
+		}
+	}
+	assert.True(t, sawCycle)
+}
+
 // TestRunOnce_FreshDispatched_NotTouched proves the stuck-threshold
 // guard: a row that is DISPATCHED but whose updated_at is current must
 // stay DISPATCHED. Without the guard, the reaper would burn one attempt
@@ -441,7 +499,7 @@ func TestRunOnce_PostPassJitter_RespectsPendingGuard(t *testing.T) {
 	row := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000420")
 	forceStuck(t, st, row.ID, 2)
 
-	reset, _, err := st.ReapStuck(context.Background(), 7, 120*time.Second, defaultReaperBackoffCap)
+	reset, _, err := st.ReapStuck(context.Background(), 7, 120*time.Second, defaultReaperBackoffCap, nil)
 	require.NoError(t, err)
 	require.Len(t, reset, 1)
 
@@ -670,7 +728,8 @@ func TestLoop_StopsOnContextCancel(t *testing.T) {
 // shape as internal/dispatcher/loop_test.go and
 // internal/relay/loop_test.go.
 func TestApplyDefaults(t *testing.T) {
-	d := applyDefaults(Deps{Lag: &fakeLag{}})
+	tr := noop.NewTracerProvider().Tracer("test")
+	d := applyDefaults(Deps{Lag: &fakeLag{}, Tracer: tr})
 	assert.Equal(t, defaultInterval, d.Interval)
 	assert.Equal(t, defaultStuckThreshold, d.StuckThreshold)
 	assert.Equal(t, defaultMaxAttempts, d.MaxAttempts)
@@ -680,6 +739,7 @@ func TestApplyDefaults(t *testing.T) {
 	assert.Equal(t, defaultLagThreshold, d.LagThreshold)
 	assert.Equal(t, []string{"sms", "email", "push"}, d.Channels)
 	require.NotNil(t, d.Now)
+	assert.NotNil(t, d.Tracer)
 	// Verify Now returns a recent time (sanity check on the default).
 	assert.WithinDuration(t, time.Now().UTC(), d.Now(), time.Second)
 
@@ -692,6 +752,7 @@ func TestApplyDefaults(t *testing.T) {
 		LagTimeout:       2 * time.Second,
 		LagThreshold:     42,
 		Channels:         []string{"sms"},
+		Tracer:           tr,
 	})
 	assert.Equal(t, 7*time.Second, custom.Interval)
 	assert.Equal(t, 13*time.Second, custom.StuckThreshold)
@@ -710,6 +771,234 @@ func TestApplyDefaults(t *testing.T) {
 func TestApplyDefaults_PanicsOnNilLag(t *testing.T) {
 	assert.PanicsWithValue(t,
 		"reaper: Deps.Lag is required (kafkaadmin.LagClient or fake)",
-		func() { _ = applyDefaults(Deps{}) },
+		func() {
+			_ = applyDefaults(Deps{Tracer: noop.NewTracerProvider().Tracer("test")})
+		},
 	)
+}
+
+// TestApplyDefaults_PanicsOnNilTracer mirrors the nil-lag panic for
+// the Phase 5 Tracer field per docs/phases/05-observability.md §7.
+// The interface keeps the loop testable; the panic ensures a future
+// cmd.go that forgets to wire otel.Tracer fails loudly at startup
+// rather than silently dropping every per-cycle span.
+func TestApplyDefaults_PanicsOnNilTracer(t *testing.T) {
+	assert.PanicsWithValue(t,
+		"reaper: Deps.Tracer is required (otel.Tracer or noop)",
+		func() { _ = applyDefaults(Deps{Lag: &fakeLag{}}) },
+	)
+}
+
+// counterValue extracts the current value of a Prometheus counter
+// child for testing, mirroring the helper in
+// internal/dispatcher/loop_test.go.
+func counterValue(t *testing.T, c interface {
+	Write(*dto.Metric) error
+}) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, c.Write(&m))
+	require.NotNil(t, m.Counter, "counter metric must carry a Counter payload")
+	require.NotNil(t, m.Counter.Value)
+	return *m.Counter.Value
+}
+
+// gaugeValue mirrors counterValue for Prometheus gauges (Chunk 5 §8.2).
+func gaugeValue(t *testing.T, g interface {
+	Write(*dto.Metric) error
+}) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, g.Write(&m))
+	require.NotNil(t, m.Gauge, "gauge metric must carry a Gauge payload")
+	require.NotNil(t, m.Gauge.Value)
+	return *m.Gauge.Value
+}
+
+// TestRunOnce_StampsCycleCounter_PerOutcome locks Phase 5 §1.1's
+// reaper_cycles_total counter shape: every runOnce branch must
+// stamp exactly one outcome on the counter. Three outcomes
+// {ran, lag_skip, lag_query_error} together exhaust the runOnce
+// return paths.
+//
+// Each sub-test exercises one branch via the existing fakeLag /
+// stuck-row fixtures.
+func TestRunOnce_StampsCycleCounter_PerOutcome(t *testing.T) {
+	t.Run("ran", func(t *testing.T) {
+		deps, st, _ := newTestDeps(t)
+		disableUpdatedAtTrigger(t, st)
+
+		stuck := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000800")
+		forceStuck(t, st, stuck.ID, 1)
+
+		before := counterValue(t, metrics.ReaperCycles.WithLabelValues("ran"))
+
+		require.NoError(t, runOnce(context.Background(), deps))
+
+		after := counterValue(t, metrics.ReaperCycles.WithLabelValues("ran"))
+		assert.Equal(t, float64(1), after-before, "ran branch must increment reaper_cycles_total{outcome=ran}")
+	})
+
+	t.Run("lag_skip", func(t *testing.T) {
+		deps, st, lag := newTestDeps(t)
+		disableUpdatedAtTrigger(t, st)
+		lag.Lag = 1500
+
+		stuck := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000801")
+		forceStuck(t, st, stuck.ID, 1)
+
+		before := counterValue(t, metrics.ReaperCycles.WithLabelValues("lag_skip"))
+
+		require.NoError(t, runOnce(context.Background(), deps))
+
+		after := counterValue(t, metrics.ReaperCycles.WithLabelValues("lag_skip"))
+		assert.Equal(t, float64(1), after-before, "lag_skip branch must increment reaper_cycles_total{outcome=lag_skip}")
+
+		const smsGroup = "worker.sms"
+		const smsTopic = "send.sms"
+		lagGauge := gaugeValue(t, metrics.KafkaConsumerLag.WithLabelValues(smsGroup, smsTopic))
+		assert.Equal(t, float64(1500), lagGauge,
+			"kafka_consumer_lag must publish on lag_skip so sustained backpressure still updates the gauge")
+		require.Len(t, lag.Calls(), 1, "lag oracle must run for each channel before skip")
+		assert.Equal(t, smsGroup, lag.Calls()[0].Group)
+		assert.Equal(t, smsTopic, lag.Calls()[0].Topic)
+	})
+
+	t.Run("lag_query_error", func(t *testing.T) {
+		deps, st, lag := newTestDeps(t)
+		disableUpdatedAtTrigger(t, st)
+		lag.Err = errors.New("kafka admin unreachable")
+		lag.Lag = -1
+
+		stuck := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000802")
+		forceStuck(t, st, stuck.ID, 1)
+
+		before := counterValue(t, metrics.ReaperCycles.WithLabelValues("lag_query_error"))
+
+		require.NoError(t, runOnce(context.Background(), deps))
+
+		after := counterValue(t, metrics.ReaperCycles.WithLabelValues("lag_query_error"))
+		assert.Equal(t, float64(1), after-before,
+			"lag_query_error branch must increment reaper_cycles_total{outcome=lag_query_error}")
+	})
+}
+
+// TestRunOnce_RowsCounters_AddPerCycle asserts the
+// reaper_rows_reset_total and reaper_rows_terminal_failed_total
+// counters Add'd by the per-cycle reset / failed counts. The fixture
+// is one stuck row at attempt < max_attempts (T9 reset) and one at
+// attempt == max_attempts (T10 terminal-fail), so each counter ticks
+// up by exactly one.
+func TestRunOnce_RowsCounters_AddPerCycle(t *testing.T) {
+	deps, st, _ := newTestDeps(t)
+	disableUpdatedAtTrigger(t, st)
+
+	resetRow := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000810")
+	forceStuck(t, st, resetRow.ID, 1)
+
+	failedRow := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000811")
+	forceStuck(t, st, failedRow.ID, 7)
+
+	beforeReset := counterValue(t, metrics.ReaperRowsReset)
+	beforeFailed := counterValue(t, metrics.ReaperRowsTerminalFailed)
+
+	require.NoError(t, runOnce(context.Background(), deps))
+
+	afterReset := counterValue(t, metrics.ReaperRowsReset)
+	afterFailed := counterValue(t, metrics.ReaperRowsTerminalFailed)
+	assert.Equal(t, float64(1), afterReset-beforeReset, "one T9 reset → +1 on reaper_rows_reset_total")
+	assert.Equal(t, float64(1), afterFailed-beforeFailed, "one T10 terminal-fail → +1 on reaper_rows_terminal_failed_total")
+}
+
+// TestRunOnce_PostPassJitterFailure_IncrementsCounter locks the
+// reaper_post_pass_jitter_failures_total increment on the log-warn
+// branch when ApplyResetEligibleAt fails after a successful ReapStuck.
+func TestRunOnce_PostPassJitterFailure_IncrementsCounter(t *testing.T) {
+	deps, st, _ := newTestDeps(t)
+	disableUpdatedAtTrigger(t, st)
+
+	deps.ApplyResetEligibleAt = func(ctx context.Context, ids []uuid.UUID, eligibleAt []time.Time) error {
+		_ = ctx
+		_ = ids
+		_ = eligibleAt
+		return errors.New("injected post-pass failure")
+	}
+
+	stuck := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000812")
+	forceStuck(t, st, stuck.ID, 1)
+
+	before := counterValue(t, metrics.ReaperPostPassJitterFailures)
+
+	require.NoError(t, runOnce(context.Background(), deps))
+
+	after := counterValue(t, metrics.ReaperPostPassJitterFailures)
+	assert.Equal(t, float64(1), after-before,
+		"post-pass failure must increment reaper_post_pass_jitter_failures_total")
+}
+
+// TestRunOnce_OpensCycleSpan asserts the reaper.cycle span name +
+// outcome attribute per docs/phases/05-observability.md §7. Uses a
+// tracetest in-memory exporter so the span shape is inspectable
+// without a real OTLP pipeline.
+func TestRunOnce_OpensCycleSpan(t *testing.T) {
+	deps, st, _ := newTestDeps(t)
+	disableUpdatedAtTrigger(t, st)
+
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	deps.Tracer = tp.Tracer("reaper")
+
+	stuck := insertPendingSMS(t, st, "00000000-0000-4000-8000-000000000820")
+	forceStuck(t, st, stuck.ID, 1)
+
+	require.NoError(t, runOnce(context.Background(), deps))
+
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	spans := exp.GetSpans()
+	require.GreaterOrEqual(t, len(spans), 1)
+
+	var cycle *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "reaper.cycle" {
+			cycle = &spans[i]
+			break
+		}
+	}
+	require.NotNil(t, cycle)
+
+	attrs := attrMap(cycle.Attributes)
+	assert.Equal(t, "ran", attrs["outcome"], "successful cycle stamps outcome=ran")
+	assert.EqualValues(t, 1, attrs["reset_rows"], "reset_rows attribute reflects T9 count")
+	assert.EqualValues(t, 0, attrs["failed_rows"], "failed_rows attribute reflects T10 count")
+
+	var rows int
+	for i := range spans {
+		if spans[i].Name == "reaper.row" {
+			rows++
+		}
+	}
+	assert.Equal(t, 1, rows, "one T9 reset row → one reaper.row span")
+}
+
+// attrMap flattens a slice of trace.KeyValue attributes into a
+// map[string]any keyed on the attribute name. Mirrors
+// internal/dispatcher/loop_test.go's helper.
+func attrMap(kvs []attribute.KeyValue) map[string]any {
+	out := make(map[string]any, len(kvs))
+	for _, kv := range kvs {
+		switch kv.Value.Type() {
+		case attribute.STRING:
+			out[string(kv.Key)] = kv.Value.AsString()
+		case attribute.INT64:
+			out[string(kv.Key)] = kv.Value.AsInt64()
+		case attribute.BOOL:
+			out[string(kv.Key)] = kv.Value.AsBool()
+		case attribute.FLOAT64:
+			out[string(kv.Key)] = kv.Value.AsFloat64()
+		default:
+			out[string(kv.Key)] = kv.Value.Emit()
+		}
+	}
+	return out
 }

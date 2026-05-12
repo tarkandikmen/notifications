@@ -7,9 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/redisx"
 	"github.com/tarkandikmen/notifications/internal/testsupport"
 )
@@ -308,4 +312,211 @@ func TestBucket_BurstThenSustainedThroughput(t *testing.T) {
 	rate := float64(done.Load()) / elapsed.Seconds()
 	assert.InDelta(t, 20.0, rate, 6.0,
 		"steady-state drain should be ~20/s ± 30%%; got %.2f/s over %s", rate, elapsed)
+}
+
+// TestSample_ReadsCurrentTokens verifies the Phase 5 Sample helper
+// (added per docs/phases/05-observability.md §8.3): after the worker
+// drains N tokens via Acquire, Sample reports a count between
+// capacity-N and capacity (the Lua refill may produce a fractional
+// recovery during the test window).
+func TestSample_ReadsCurrentTokens(t *testing.T) {
+	const capacity = 10
+	const acquired = 4
+	bucket, ctx := newBucket(t, capacity, capacity)
+
+	// Use an idle channel scoped to this test so a parallel
+	// integration test draining "sms" doesn't perturb the read.
+	const channel = "sms-sample-test"
+
+	for i := 0; i < acquired; i++ {
+		require.NoError(t, bucket.Acquire(ctx, channel))
+	}
+
+	tokens, err := bucket.Sample(ctx, channel)
+	require.NoError(t, err)
+
+	assert.GreaterOrEqual(t, tokens, float64(capacity-acquired)-1.0,
+		"Sample after %d Acquires should report ≥ capacity-N (-1 absorbs Lua refill jitter); got %.4f",
+		acquired, tokens)
+	assert.LessOrEqual(t, tokens, float64(capacity),
+		"Sample must never exceed capacity; got %.4f", tokens)
+}
+
+// TestSample_MissingKey_ReturnsCapacity locks the spec contract from
+// docs/phases/05-observability.md §8.3: an uninitialized bucket key
+// (no Acquire has run yet for that channel) is treated as full
+// capacity so the operator's gauge reads "no contention" rather than
+// a misleading 0.
+func TestSample_MissingKey_ReturnsCapacity(t *testing.T) {
+	const capacity = 10
+	bucket, ctx := newBucket(t, capacity, capacity)
+
+	tokens, err := bucket.Sample(ctx, "untouched-channel")
+	require.NoError(t, err)
+	assert.Equal(t, float64(capacity), tokens,
+		"missing key must surface as full capacity, not 0 (spec §8.3)")
+}
+
+// TestSample_RedisDown_SurfacesAsErrRedisDown closes the underlying
+// client, then verifies Sample returns ErrRedisDown (mirrors
+// Acquire's ErrRedisDown contract). The worker's
+// publishRateLimitTokens goroutine relies on this disposition to
+// leave the gauge at its previous value rather than reset to 0.
+func TestSample_RedisDown_SurfacesAsErrRedisDown(t *testing.T) {
+	url := testsupport.StartRedis(t)
+
+	ctx := context.Background()
+	client, err := redisx.Open(ctx, url)
+	require.NoError(t, err)
+
+	bucket := NewWithLimits(client, 10, 10, defaultRequestTimeout)
+
+	require.NoError(t, client.Close(), "close client to simulate redis-down")
+
+	_, err = bucket.Sample(ctx, "sms")
+	assert.ErrorIs(t, err, ErrRedisDown,
+		"closed client must surface as ErrRedisDown, not as a raw redis error")
+}
+
+// TestAcquire_IncrementsRateLimitAcquires_Granted verifies the Phase
+// 5 hot-path counter increment for the first-call-success branch per
+// docs/phases/05-observability.md §1.1 rate-limiter row's locked enum
+// (granted = first-call-success; throttled_then_granted = after at
+// least one wait_ms cycle).
+func TestAcquire_IncrementsRateLimitAcquires_Granted(t *testing.T) {
+	bucket, ctx := newBucket(t, 10, 10)
+	const channel = "sms-acquire-granted"
+
+	// One Acquire against a fresh bucket: first-call success.
+	require.NoError(t, bucket.Acquire(ctx, channel))
+
+	got := testutil.ToFloat64(metrics.RateLimitAcquires.WithLabelValues(channel, "granted"))
+	assert.GreaterOrEqual(t, got, float64(1),
+		"granted counter must increment on a first-call-success Acquire")
+}
+
+// TestAcquire_IncrementsRateLimitAcquires_ThrottledThenGranted
+// verifies the second branch of the locked outcome enum: after the
+// burst is drained, the next Acquire goes through the wait loop at
+// least once and surfaces as throttled_then_granted on success.
+func TestAcquire_IncrementsRateLimitAcquires_ThrottledThenGranted(t *testing.T) {
+	bucket, ctx := newBucket(t, 10, 10)
+	const channel = "sms-acquire-throttled"
+
+	for i := 0; i < 10; i++ {
+		require.NoError(t, bucket.Acquire(ctx, channel))
+	}
+	// 11th Acquire: bucket exhausted → at least one throttled cycle
+	// before the next refill grants a token.
+	require.NoError(t, bucket.Acquire(ctx, channel))
+
+	got := testutil.ToFloat64(metrics.RateLimitAcquires.WithLabelValues(channel, "throttled_then_granted"))
+	assert.GreaterOrEqual(t, got, float64(1),
+		"throttled_then_granted counter must increment on a post-burst Acquire that waited at least once")
+}
+
+// TestAcquire_IncrementsRateLimitAcquires_RedisError verifies the
+// third branch of the locked outcome enum: a closed client surfaces
+// as redis_error in the counter (paired with ErrRedisDown's return
+// value).
+func TestAcquire_IncrementsRateLimitAcquires_RedisError(t *testing.T) {
+	url := testsupport.StartRedis(t)
+
+	ctx := context.Background()
+	client, err := redisx.Open(ctx, url)
+	require.NoError(t, err)
+
+	bucket := NewWithLimits(client, 10, 10, defaultRequestTimeout)
+
+	require.NoError(t, client.Close())
+
+	const channel = "sms-acquire-redis-error"
+	err = bucket.Acquire(ctx, channel)
+	require.ErrorIs(t, err, ErrRedisDown)
+
+	got := testutil.ToFloat64(metrics.RateLimitAcquires.WithLabelValues(channel, "redis_error"))
+	assert.GreaterOrEqual(t, got, float64(1),
+		"redis_error counter must increment on a closed-client Acquire")
+}
+
+// TestAcquire_IncrementsRateLimitAcquires_CtxCanceled verifies the
+// fourth branch of the locked outcome enum: a pre-cancelled ctx
+// surfaces as ctx_canceled (paired with context.Canceled's return
+// value).
+func TestAcquire_IncrementsRateLimitAcquires_CtxCanceled(t *testing.T) {
+	bucket, ctx := newBucket(t, 10, 10)
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	const channel = "sms-acquire-ctx-canceled"
+	err := bucket.Acquire(cancelCtx, channel)
+	require.ErrorIs(t, err, context.Canceled)
+
+	got := testutil.ToFloat64(metrics.RateLimitAcquires.WithLabelValues(channel, "ctx_canceled"))
+	assert.GreaterOrEqual(t, got, float64(1),
+		"ctx_canceled counter must increment on a pre-cancelled Acquire")
+}
+
+// TestAcquire_WaitDuration_FirstSuccess_ObservesZero locks §1.1: the
+// wait-duration histogram measures throttle sleep only; first-call
+// success observes zero seconds (one sample at 0).
+func TestAcquire_WaitDuration_FirstSuccess_ObservesZero(t *testing.T) {
+	bucket, ctx := newBucket(t, 10, 10)
+	const channel = "sms-wait-first-zero"
+
+	before := snapshotRLWaitDuration(t, channel)
+
+	require.NoError(t, bucket.Acquire(ctx, channel))
+
+	after := snapshotRLWaitDuration(t, channel)
+	assert.Equal(t, before.SampleCount+1, after.SampleCount,
+		"granted path must observe rate_limit_wait_duration_seconds once")
+	assert.InDelta(t, before.SampleSum, after.SampleSum, 1e-9,
+		"no throttle sleep → histogram sum must stay at 0")
+}
+
+// TestAcquire_WaitDuration_Throttled_AddsSleepTime locks §1.1: after
+// at least one deny→sleep cycle, the observation includes
+// accumulated sleep duration (not Redis/Lua latency on the grant call).
+func TestAcquire_WaitDuration_Throttled_AddsSleepTime(t *testing.T) {
+	bucket, ctx := newBucket(t, 10, 10)
+	const channel = "sms-wait-throttled-hist"
+
+	for i := 0; i < 10; i++ {
+		require.NoError(t, bucket.Acquire(ctx, channel))
+	}
+
+	before := snapshotRLWaitDuration(t, channel)
+
+	// 11th Acquire exhausts burst → at least one throttled sleep before grant.
+	require.NoError(t, bucket.Acquire(ctx, channel))
+
+	after := snapshotRLWaitDuration(t, channel)
+	assert.Equal(t, before.SampleCount+1, after.SampleCount,
+		"throttled_then_granted must add one wait-duration observation")
+	minSleepSeconds := minSleep.Seconds()
+	assert.GreaterOrEqual(t, after.SampleSum-before.SampleSum, minSleepSeconds,
+		"accumulated sleep must be at least minSleep (clamped wait_ms path)")
+}
+
+type rlWaitHistValues struct {
+	SampleCount uint64
+	SampleSum   float64
+}
+
+func snapshotRLWaitDuration(t *testing.T, channel string) rlWaitHistValues {
+	t.Helper()
+	h := metrics.RateLimitWaitDuration.WithLabelValues(channel)
+	c, ok := h.(prometheus.Metric)
+	require.True(t, ok, "histogram child must implement prometheus.Metric")
+	var m dto.Metric
+	require.NoError(t, c.Write(&m))
+	require.NotNil(t, m.Histogram)
+	require.NotNil(t, m.Histogram.SampleCount)
+	require.NotNil(t, m.Histogram.SampleSum)
+	return rlWaitHistValues{
+		SampleCount: *m.Histogram.SampleCount,
+		SampleSum:   *m.Histogram.SampleSum,
+	}
 }

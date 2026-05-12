@@ -9,10 +9,17 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/store"
 	"github.com/tarkandikmen/notifications/internal/testsupport"
 )
@@ -42,6 +49,11 @@ func newTestEnv(t *testing.T) (Deps, *store.Store, []string) {
 		Logger:       logger,
 		PollInterval: 25 * time.Millisecond,
 		BatchSize:    500,
+		// Phase 5: a noop tracer satisfies Deps.Tracer for unit tests
+		// so the per-tick relay.tick span is opened (and ended)
+		// without any exporter wiring. Tests that need to assert on
+		// span shape build an in-memory tracetest provider in-line.
+		Tracer: noop.NewTracerProvider().Tracer("test"),
 	}
 	return deps, st, brokers
 }
@@ -138,6 +150,34 @@ func TestRunOnce_PublishesAndMarksPublished(t *testing.T) {
 		"phase 2 leaves outbox headers null; published record carries no Kafka headers")
 }
 
+// TestRunOnce_ForwardsHeadersToKafka locks Chunk 6: non-null outbox
+// headers become Kafka record headers verbatim.
+func TestRunOnce_ForwardsHeadersToKafka(t *testing.T) {
+	deps, st, brokers := newTestEnv(t)
+	payload := []byte(`{"version":1}`)
+	const partitionKey = "01927000-0000-7000-8000-000000000099"
+	headers := json.RawMessage(`{"traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}`)
+	require.NoError(t, st.InsertOutboxRow(context.Background(), st.Pool(), store.OutboxRow{
+		Topic:        "send.sms",
+		PartitionKey: strPtr(partitionKey),
+		Headers:      headers,
+		Payload:      payload,
+	}))
+
+	require.NoError(t, runOnce(context.Background(), deps))
+
+	rec := drainOneRecord(t, brokers, "send.sms", 15*time.Second)
+	var tp string
+	for _, h := range rec.Headers {
+		if h.Key == "traceparent" {
+			tp = string(h.Value)
+		}
+	}
+	assert.Equal(t, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", tp)
+}
+
+func strPtr(s string) *string { return &s }
+
 // TestRunOnce_NoUnpublishedRows_NoOp covers the early-return branch
 // when ClaimUnpublishedOutbox returns zero rows. The deferred rollback
 // must leave the broker untouched and the function must return nil.
@@ -216,6 +256,7 @@ func TestRunOnce_ProduceErrorRollsBack(t *testing.T) {
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		PollInterval: 25 * time.Millisecond,
 		BatchSize:    500,
+		Tracer:       noop.NewTracerProvider().Tracer("test"),
 	}
 
 	err := runOnce(context.Background(), deps)
@@ -278,29 +319,42 @@ func TestLoop_StopsOnContextCancel(t *testing.T) {
 // unit test (no testcontainer) — runs on every `go test ./...` so the
 // defaults are pinned even when integration tests are disabled.
 func TestApplyDefaults(t *testing.T) {
-	d := applyDefaults(Deps{})
+	tr := noop.NewTracerProvider().Tracer("test")
+	d := applyDefaults(Deps{Tracer: tr})
 	assert.Equal(t, defaultPollInterval, d.PollInterval)
 	assert.Equal(t, defaultBatchSize, d.BatchSize)
 	assert.NotNil(t, d.Logger)
+	assert.NotNil(t, d.Tracer)
 
 	custom := applyDefaults(Deps{
 		PollInterval: 7 * time.Second,
 		BatchSize:    13,
+		Tracer:       tr,
 	})
 	assert.Equal(t, 7*time.Second, custom.PollInterval)
 	assert.Equal(t, 13, custom.BatchSize)
 }
 
-// TestHdrsFrom_NullAndPopulated locks the headers JSONB → []kgo.RecordHeader
-// translation. Phase 2 always passes nil; Phase 5 will populate W3C
+// TestApplyDefaults_PanicsOnNilTracer locks the documented behavior
+// that applyDefaults panics when Deps.Tracer is nil. Same shape as
+// internal/dispatcher/loop_test.go's TestApplyDefaults_PanicsOnNilTracer.
+func TestApplyDefaults_PanicsOnNilTracer(t *testing.T) {
+	assert.PanicsWithValue(t,
+		"relay: Deps.Tracer is required (otel.Tracer or noop)",
+		func() { _ = applyDefaults(Deps{}) },
+	)
+}
+
+// TestKafkaHeadersFromOutboxHeaders_NullAndPopulated locks the headers JSONB → []kgo.RecordHeader
+// translation. Phase 2 always passes nil; Phase 5 populates W3C
 // Trace Context headers, and this test catches a regression in the
 // decoder that would silently drop them.
-func TestHdrsFrom_NullAndPopulated(t *testing.T) {
-	assert.Nil(t, hdrsFrom(nil), "null headers → empty slice")
-	assert.Nil(t, hdrsFrom(json.RawMessage(`{}`)), "empty object → empty slice")
-	assert.Nil(t, hdrsFrom(json.RawMessage(`not json`)), "malformed JSON is non-fatal")
+func TestKafkaHeadersFromOutboxHeaders_NullAndPopulated(t *testing.T) {
+	assert.Nil(t, observability.KafkaHeadersFromOutboxHeaders(nil), "null headers → empty slice")
+	assert.Nil(t, observability.KafkaHeadersFromOutboxHeaders(json.RawMessage(`{}`)), "empty object → empty slice")
+	assert.Nil(t, observability.KafkaHeadersFromOutboxHeaders(json.RawMessage(`not json`)), "malformed JSON is non-fatal")
 
-	got := hdrsFrom(json.RawMessage(`{"traceparent":"00-abc-def-01"}`))
+	got := observability.KafkaHeadersFromOutboxHeaders(json.RawMessage(`{"traceparent":"00-abc-def-01"}`))
 	require.Len(t, got, 1)
 	assert.Equal(t, "traceparent", got[0].Key)
 	assert.Equal(t, "00-abc-def-01", string(got[0].Value))
@@ -329,4 +383,158 @@ func (e *errProducer) ProduceSync(_ context.Context, rs ...*kgo.Record) kgo.Prod
 		})
 	}
 	return results
+}
+
+// counterValue extracts the current value of a Prometheus counter
+// child for testing, mirroring the helper in
+// internal/dispatcher/loop_test.go.
+func counterValue(t *testing.T, c interface {
+	Write(*dto.Metric) error
+}) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, c.Write(&m))
+	require.NotNil(t, m.Counter, "counter metric must carry a Counter payload")
+	require.NotNil(t, m.Counter.Value)
+	return *m.Counter.Value
+}
+
+// TestRunOnce_StampsTickCounter_PerOutcome locks Phase 5 §1.1's
+// relay_ticks_total counter shape: every runOnce branch must stamp
+// exactly one outcome on the counter. Three outcomes
+// {published, empty, error} together exhaust the runOnce return
+// paths.
+//
+// The "published" sub-test reuses the Kafka testcontainer fixture;
+// "empty" and "error" use only Postgres so they're cheaper.
+func TestRunOnce_StampsTickCounter_PerOutcome(t *testing.T) {
+	t.Run("published", func(t *testing.T) {
+		deps, st, _ := newTestEnv(t)
+		before := counterValue(t, metrics.RelayTicks.WithLabelValues("published"))
+
+		insertOutboxRow(t, st, "send.sms", "tick-counter-published", []byte(`{"version":1,"id":"a"}`))
+		require.NoError(t, runOnce(context.Background(), deps))
+
+		after := counterValue(t, metrics.RelayTicks.WithLabelValues("published"))
+		assert.Equal(t, float64(1), after-before, "published branch must increment relay_ticks_total{outcome=published}")
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		deps, _, _ := newTestEnv(t)
+		before := counterValue(t, metrics.RelayTicks.WithLabelValues("empty"))
+
+		require.NoError(t, runOnce(context.Background(), deps))
+
+		after := counterValue(t, metrics.RelayTicks.WithLabelValues("empty"))
+		assert.Equal(t, float64(1), after-before, "empty branch must increment relay_ticks_total{outcome=empty}")
+	})
+
+	t.Run("error", func(t *testing.T) {
+		pool, _ := testsupport.StartPostgres(t)
+		st := store.New(pool)
+		insertOutboxRow(t, st, "send.sms", "tick-counter-err", []byte(`{"version":1}`))
+
+		stub := &errProducer{err: assert.AnError}
+		deps := Deps{
+			Store:        st,
+			Producer:     stub,
+			Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+			PollInterval: 25 * time.Millisecond,
+			BatchSize:    500,
+			Tracer:       noop.NewTracerProvider().Tracer("test"),
+		}
+
+		before := counterValue(t, metrics.RelayTicks.WithLabelValues("error"))
+
+		err := runOnce(context.Background(), deps)
+		require.Error(t, err)
+
+		after := counterValue(t, metrics.RelayTicks.WithLabelValues("error"))
+		assert.Equal(t, float64(1), after-before, "error branch must increment relay_ticks_total{outcome=error}")
+	})
+}
+
+// TestRunOnce_PublishedRecordsCounter_PerTopic asserts the
+// relay_published_records_total{topic} counter increments by the
+// per-topic count from the batch (not the batch total). A two-topic
+// batch increments both counters by the right delta.
+func TestRunOnce_PublishedRecordsCounter_PerTopic(t *testing.T) {
+	deps, st, _ := newTestEnv(t)
+
+	beforeSMS := counterValue(t, metrics.RelayPublishedRecords.WithLabelValues("send.sms"))
+	beforeEmail := counterValue(t, metrics.RelayPublishedRecords.WithLabelValues("send.email"))
+
+	insertOutboxRow(t, st, "send.sms", "rec-counter-sms-1", []byte(`{"version":1,"id":"a"}`))
+	insertOutboxRow(t, st, "send.sms", "rec-counter-sms-2", []byte(`{"version":1,"id":"b"}`))
+	insertOutboxRow(t, st, "send.email", "rec-counter-email", []byte(`{"version":1,"id":"c"}`))
+
+	require.NoError(t, runOnce(context.Background(), deps))
+
+	afterSMS := counterValue(t, metrics.RelayPublishedRecords.WithLabelValues("send.sms"))
+	afterEmail := counterValue(t, metrics.RelayPublishedRecords.WithLabelValues("send.email"))
+	assert.Equal(t, float64(2), afterSMS-beforeSMS, "two SMS records → +2 on send.sms counter")
+	assert.Equal(t, float64(1), afterEmail-beforeEmail, "one email record → +1 on send.email counter")
+}
+
+// TestRunOnce_OpensTickSpan asserts the relay.tick span name +
+// outcome attribute per docs/phases/05-observability.md §7. Uses a
+// tracetest in-memory exporter so the span shape is inspectable
+// without a real OTLP pipeline.
+func TestRunOnce_OpensTickSpan(t *testing.T) {
+	deps, st, _ := newTestEnv(t)
+
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	deps.Tracer = tp.Tracer("relay")
+
+	insertOutboxRow(t, st, "send.sms", "span-key", []byte(`{"version":1,"id":"a"}`))
+	require.NoError(t, runOnce(context.Background(), deps))
+
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	spans := exp.GetSpans()
+	require.GreaterOrEqual(t, len(spans), 1, "at least relay.tick span")
+
+	var tick *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "relay.tick" {
+			tick = &spans[i]
+			break
+		}
+	}
+	require.NotNil(t, tick, "relay.tick span missing")
+
+	attrs := attrMap(tick.Attributes)
+	assert.Equal(t, "published", attrs["outcome"])
+	assert.EqualValues(t, 1, attrs["rows"])
+
+	var rows int
+	for i := range spans {
+		if spans[i].Name == "relay.row" {
+			rows++
+		}
+	}
+	assert.Equal(t, 1, rows, "one claimed outbox row → one relay.row span")
+}
+
+// attrMap flattens a slice of trace.KeyValue attributes into a
+// map[string]any keyed on the attribute name. Mirrors
+// internal/dispatcher/loop_test.go's helper.
+func attrMap(kvs []attribute.KeyValue) map[string]any {
+	out := make(map[string]any, len(kvs))
+	for _, kv := range kvs {
+		switch kv.Value.Type() {
+		case attribute.STRING:
+			out[string(kv.Key)] = kv.Value.AsString()
+		case attribute.INT64:
+			out[string(kv.Key)] = kv.Value.AsInt64()
+		case attribute.BOOL:
+			out[string(kv.Key)] = kv.Value.AsBool()
+		case attribute.FLOAT64:
+			out[string(kv.Key)] = kv.Value.AsFloat64()
+		default:
+			out[string(kv.Key)] = kv.Value.Emit()
+		}
+	}
+	return out
 }

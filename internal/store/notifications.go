@@ -222,28 +222,35 @@ func (s *Store) InsertBatch(ctx context.Context, ns []Notification, batchID uuid
 	return &BatchIdempotencyConflictError{Entries: entries}
 }
 
-// ReadStateForGuard returns the (status, attempt) pair the worker's
-// Layer 1 idempotency guard inspects per docs/design/06-idempotency.md
-// §Layer 1. The read is a single-row SELECT against the pool — no
-// transaction, no FOR UPDATE — because the guard's job is to short-circuit
-// stale / terminal messages before any state-mutating work runs; a stale
-// read is safe (Layer 2's `ON CONFLICT DO NOTHING` and Layer 3's
-// attempt-guarded UPDATE are the actual race-safety mechanisms).
+// ReadStateForGuard returns the (status, attempt, createdAt) tuple the
+// worker's Layer 1 idempotency guard inspects per
+// docs/design/06-idempotency.md §Layer 1. The read is a single-row
+// SELECT against the pool — no transaction, no FOR UPDATE — because the
+// guard's job is to short-circuit stale / terminal messages before any
+// state-mutating work runs; a stale read is safe (Layer 2's
+// `ON CONFLICT DO NOTHING` and Layer 3's attempt-guarded UPDATE are the
+// actual race-safety mechanisms).
 //
 // Returns ErrNotFound when no row matches; the worker treats that as
 // ack + skip (notifications are not deleted at this scope, so the case
 // only arises in pathological replay scenarios).
 //
+// Phase 5 widened the return shape with `createdAt` so the worker can
+// compute the end-to-end delivery latency
+// (notification_delivery_latency_seconds histogram) after a successful
+// T4 without a second round trip per
+// docs/phases/05-observability.md §1.1 (Worker metrics row).
+//
 // docs/phases/03-resilience.md §2.1.
-func (s *Store) ReadStateForGuard(ctx context.Context, id uuid.UUID) (status string, attempt int, err error) {
-	const sql = `SELECT status, attempt FROM notifications WHERE id = $1`
-	if err := s.pool.QueryRow(ctx, sql, id).Scan(&status, &attempt); err != nil {
+func (s *Store) ReadStateForGuard(ctx context.Context, id uuid.UUID) (status string, attempt int, createdAt time.Time, err error) {
+	const sql = `SELECT status, attempt, created_at FROM notifications WHERE id = $1`
+	if err := s.pool.QueryRow(ctx, sql, id).Scan(&status, &attempt, &createdAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return "", 0, ErrNotFound
+			return "", 0, time.Time{}, ErrNotFound
 		}
-		return "", 0, fmt.Errorf("store: read state for guard: %w", err)
+		return "", 0, time.Time{}, fmt.Errorf("store: read state for guard: %w", err)
 	}
-	return status, attempt, nil
+	return status, attempt, createdAt, nil
 }
 
 // GetNotification fetches one notification plus every delivery_attempts row
@@ -422,11 +429,23 @@ func (s *Store) GetBatch(ctx context.Context, batchID uuid.UUID) ([]Notification
 // a documented end state per docs/phases/04-api-completeness.md §7
 // Concurrency note.
 //
-// docs/phases/04-api-completeness.md §1.4.
-func (s *Store) CancelNotification(ctx context.Context, id uuid.UUID) (Notification, error) {
+// The returned CancelTransition discriminates the three success
+// branches so the api handler can label the api_cancellations_total
+// counter without re-deriving the BEFORE-state heuristically (the
+// returned Notification's Status is always "CANCELLED" for success
+// branches; only the transition value tells T3 from T11 from
+// idempotent). On error returns the transition value is the zero
+// CancelTransition ("") and should be ignored by callers.
+//
+// docs/phases/04-api-completeness.md §1.4 +
+// docs/phases/05-observability.md §1.1 (api_cancellations_total row).
+//
+// traceHeaders is written into the T3 events.notification outbox row;
+// empty or nil stores SQL NULL (no upstream span).
+func (s *Store) CancelNotification(ctx context.Context, id uuid.UUID, traceHeaders json.RawMessage) (Notification, CancelTransition, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Notification{}, fmt.Errorf("store: cancel: begin: %w", err)
+		return Notification{}, "", fmt.Errorf("store: cancel: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -434,25 +453,33 @@ func (s *Store) CancelNotification(ctx context.Context, id uuid.UUID) (Notificat
 	row := tx.QueryRow(ctx, notificationSelectSQL+` WHERE id = $1 FOR UPDATE`, id)
 	if err := scanNotification(row, &n); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return Notification{}, ErrNotFound
+			return Notification{}, "", ErrNotFound
 		}
-		return Notification{}, fmt.Errorf("store: cancel: select: %w", err)
+		return Notification{}, "", fmt.Errorf("store: cancel: select: %w", err)
 	}
 
 	switch n.Status {
 	case "DELIVERED", "FAILED":
-		return Notification{}, &TerminalStateError{CurrentStatus: n.Status}
+		return Notification{}, "", &TerminalStateError{CurrentStatus: n.Status}
 	case "CANCELLED":
 		if err := tx.Commit(ctx); err != nil {
-			return Notification{}, fmt.Errorf("store: cancel: commit idempotent: %w", err)
+			return Notification{}, "", fmt.Errorf("store: cancel: commit idempotent: %w", err)
 		}
-		return n, nil
+		return n, CancelTransitionIdempotentNoOp, nil
 	case "PENDING":
-		return s.applyCancelPending(ctx, tx, id)
+		n, err := s.applyCancelPending(ctx, tx, id, traceHeaders)
+		if err != nil {
+			return Notification{}, "", err
+		}
+		return n, CancelTransitionT3Pending, nil
 	case "DISPATCHED":
-		return s.applyCancelDispatched(ctx, tx, id)
+		n, err := s.applyCancelDispatched(ctx, tx, id)
+		if err != nil {
+			return Notification{}, "", err
+		}
+		return n, CancelTransitionT11Dispatched, nil
 	default:
-		return Notification{}, fmt.Errorf("store: cancel: unexpected status %q", n.Status)
+		return Notification{}, "", fmt.Errorf("store: cancel: unexpected status %q", n.Status)
 	}
 }
 
@@ -471,7 +498,7 @@ func (s *Store) CancelNotification(ctx context.Context, id uuid.UUID) (Notificat
 // (cancel is a clean transition, not a worker outcome).
 //
 // docs/phases/04-api-completeness.md §1.4.
-func (s *Store) applyCancelPending(ctx context.Context, tx pgx.Tx, id uuid.UUID) (Notification, error) {
+func (s *Store) applyCancelPending(ctx context.Context, tx pgx.Tx, id uuid.UUID, traceHeaders json.RawMessage) (Notification, error) {
 	const sql = `
 		WITH updated AS (
 			UPDATE notifications
@@ -479,8 +506,8 @@ func (s *Store) applyCancelPending(ctx context.Context, tx pgx.Tx, id uuid.UUID)
 			 WHERE id = $1
 			RETURNING ` + notificationColumns + `
 		), emitted AS (
-			INSERT INTO outbox (topic, partition_key, payload)
-			SELECT 'events.notification', id::text, jsonb_build_object(
+			INSERT INTO outbox (topic, partition_key, headers, payload)
+			SELECT 'events.notification', id::text, $2, jsonb_build_object(
 				'version',         1,
 				'id',              id,
 				'batch_id',        batch_id,
@@ -498,7 +525,7 @@ func (s *Store) applyCancelPending(ctx context.Context, tx pgx.Tx, id uuid.UUID)
 		SELECT ` + notificationColumns + ` FROM updated
 	`
 	var n Notification
-	if err := scanNotification(tx.QueryRow(ctx, sql, id), &n); err != nil {
+	if err := scanNotification(tx.QueryRow(ctx, sql, id, jsonOrNil(traceHeaders)), &n); err != nil {
 		return Notification{}, fmt.Errorf("store: cancel pending: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -606,8 +633,8 @@ type ResetReturn struct {
 // Returns the (id, attempt) of each row the reset statement touched
 // (so the caller can compute equal-jitter eligible_at values per row
 // and run the post-pass UPDATE) plus the count of rows affected by the
-// terminal-fail statement.
-func (s *Store) ReapStuck(ctx context.Context, maxAttempts int, stuck time.Duration, reaperBackoffCap int) (reset []ResetReturn, failed int, err error) {
+// terminal-fail statement plus traceHeaders for each T10 outbox row.
+func (s *Store) ReapStuck(ctx context.Context, maxAttempts int, stuck time.Duration, reaperBackoffCap int, traceHeaders json.RawMessage) (reset []ResetReturn, failed int, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: reap stuck: begin: %w", err)
@@ -661,8 +688,8 @@ func (s *Store) ReapStuck(ctx context.Context, maxAttempts int, stuck time.Durat
 			   AND attempt    >= $2
 			RETURNING id, batch_id, channel, attempt
 		)
-		INSERT INTO outbox (topic, partition_key, payload)
-		SELECT 'events.notification', id::text, jsonb_build_object(
+		INSERT INTO outbox (topic, partition_key, headers, payload)
+		SELECT 'events.notification', id::text, $3, jsonb_build_object(
 			'version',         1,
 			'id',              id,
 			'batch_id',        batch_id,
@@ -676,7 +703,7 @@ func (s *Store) ReapStuck(ctx context.Context, maxAttempts int, stuck time.Durat
 		)
 		FROM terminated
 	`
-	tag, err := tx.Exec(ctx, failSQL, stuck.Seconds(), maxAttempts)
+	tag, err := tx.Exec(ctx, failSQL, stuck.Seconds(), maxAttempts, jsonOrNil(traceHeaders))
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: reap stuck: terminal-fail: %w", err)
 	}

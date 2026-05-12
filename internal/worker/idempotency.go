@@ -87,14 +87,30 @@ func (g GuardOutcome) String() string {
 // branch with a fake — no Postgres testcontainer required for the
 // branch table per docs/phases/03-resilience.md §Chunk 2 (Files to
 // create — internal/worker/idempotency_test.go).
+//
+// Phase 5 widened the return shape with `createdAt` so the worker can
+// compute the end-to-end delivery latency without a second round
+// trip after T4. Tests that don't care about the latency observation
+// supply the zero time.Time and the worker handles it gracefully.
 type guardReader interface {
-	ReadStateForGuard(ctx context.Context, id uuid.UUID) (status string, attempt int, err error)
+	ReadStateForGuard(ctx context.Context, id uuid.UUID) (status string, attempt int, createdAt time.Time, err error)
+}
+
+// GuardResult bundles the GuardOutcome with the created_at timestamp
+// the worker needs for the end-to-end delivery latency observation
+// (notification_delivery_latency_seconds histogram per
+// docs/phases/05-observability.md §1.1). CreatedAt is the zero
+// time.Time on every non-Proceed outcome (the latency observation
+// fires only on T4); the worker checks for the zero value defensively.
+type GuardResult struct {
+	Outcome   GuardOutcome
+	CreatedAt time.Time
 }
 
 // CheckStateGuard runs the Layer 1 state guard for a single Kafka
 // record per docs/design/06-idempotency.md §Layer 1. Reads the
-// (status, attempt) pair via st.ReadStateForGuard and maps the result
-// to a GuardOutcome per the locked table in
+// (status, attempt, createdAt) tuple via st.ReadStateForGuard and
+// maps the result to a GuardOutcome per the locked table in
 // docs/phases/03-resilience.md §2.1.
 //
 // Returns a non-nil error only on a Postgres call failure — the
@@ -104,13 +120,13 @@ type guardReader interface {
 // errors.Is check.
 //
 // docs/phases/03-resilience.md §2.1.
-func CheckStateGuard(ctx context.Context, st guardReader, id uuid.UUID, msgAttempt int) (GuardOutcome, error) {
-	status, attempt, err := st.ReadStateForGuard(ctx, id)
+func CheckStateGuard(ctx context.Context, st guardReader, id uuid.UUID, msgAttempt int) (GuardResult, error) {
+	status, attempt, createdAt, err := st.ReadStateForGuard(ctx, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return GuardSkipMissing, nil
+			return GuardResult{Outcome: GuardSkipMissing}, nil
 		}
-		return 0, err
+		return GuardResult{}, err
 	}
 
 	switch status {
@@ -118,25 +134,25 @@ func CheckStateGuard(ctx context.Context, st guardReader, id uuid.UUID, msgAttem
 		// Terminal states pre-empt the worker regardless of attempt
 		// (an earlier worker delivered, max_attempts terminal-failed,
 		// or a future cancel API fired between dispatch and now).
-		return GuardSkipTerminal, nil
+		return GuardResult{Outcome: GuardSkipTerminal}, nil
 	case statusDispatched:
 		if attempt == msgAttempt {
-			return GuardProceed, nil
+			return GuardResult{Outcome: GuardProceed, CreatedAt: createdAt}, nil
 		}
-		return GuardSkipStale, nil
+		return GuardResult{Outcome: GuardSkipStale}, nil
 	case statusPending:
 		// The reaper reset the row but the dispatcher has not yet
 		// re-claimed (or the message we're holding is from before
 		// the reset). The new claim will produce a new Kafka
 		// message; this one is stale.
-		return GuardSkipStale, nil
+		return GuardResult{Outcome: GuardSkipStale}, nil
 	default:
 		// Unknown status — the schema constraint covers PENDING /
 		// DISPATCHED / DELIVERED / FAILED / CANCELLED so this branch
 		// is unreachable in practice. Defensive ack + skip rather
 		// than panicking: a single weird row should not block the
 		// partition.
-		return GuardSkipStale, nil
+		return GuardResult{Outcome: GuardSkipStale}, nil
 	}
 }
 

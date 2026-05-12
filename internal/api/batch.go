@@ -8,7 +8,11 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/store"
 )
 
@@ -47,6 +51,14 @@ func handleBatchCreate(deps Deps) http.HandlerFunc {
 			writeValidationFailed(w, issues)
 			return
 		}
+
+		// docs/phases/05-observability.md §1.1 (api_batch_size_items
+		// row): observe only after ValidateBatchCreate returns clean
+		// so oversized / malformed batches don't pollute the
+		// histogram. r.Pattern is populated by the api mux (Go 1.22+
+		// ServeMux) — see metrics.Middleware comment for the wrapping
+		// order rationale.
+		metrics.APIBatchSize.WithLabelValues(r.Pattern).Observe(float64(len(req.Notifications)))
 
 		batchID, err := store.NewID()
 		if err != nil {
@@ -97,6 +109,13 @@ func handleBatchCreate(deps Deps) http.HandlerFunc {
 		if err := deps.Store.InsertBatch(r.Context(), ns, batchID); err != nil {
 			var conflict *store.BatchIdempotencyConflictError
 			if errors.As(err, &conflict) {
+				if sp := trace.SpanFromContext(r.Context()); sp.IsRecording() && len(conflict.Entries) > 0 {
+					existing := make([]string, 0, len(conflict.Entries))
+					for _, e := range conflict.Entries {
+						existing = append(existing, e.ExistingID.String())
+					}
+					sp.SetAttributes(attribute.StringSlice("notification.ids", existing))
+				}
 				details := make([]any, 0, len(conflict.Entries))
 				for _, e := range conflict.Entries {
 					details = append(details, IdempotencyConflictDetail{
@@ -119,6 +138,18 @@ func handleBatchCreate(deps Deps) http.HandlerFunc {
 			return
 		}
 
+		observability.SetSpanBatchID(r.Context(), batchID)
+		if sp := trace.SpanFromContext(r.Context()); sp.IsRecording() && len(ids) > 0 {
+			const maxIDsOnSpan = 100
+			if len(ids) <= maxIDsOnSpan {
+				sp.SetAttributes(attribute.StringSlice("notification.ids", ids))
+			} else {
+				sp.SetAttributes(
+					attribute.StringSlice("notification.ids", ids[:maxIDsOnSpan]),
+					attribute.Int("notification.ids.more", len(ids)-maxIDsOnSpan),
+				)
+			}
+		}
 		writeJSON(w, http.StatusCreated, BatchCreateResponse{
 			BatchID: batchID.String(),
 			IDs:     ids,

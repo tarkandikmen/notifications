@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,13 +32,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/tarkandikmen/notifications/internal/api"
 	"github.com/tarkandikmen/notifications/internal/dispatcher"
 	"github.com/tarkandikmen/notifications/internal/kafkaadmin"
+	"github.com/tarkandikmen/notifications/internal/metrics"
 	"github.com/tarkandikmen/notifications/internal/reaper"
 	"github.com/tarkandikmen/notifications/internal/relay"
 	"github.com/tarkandikmen/notifications/internal/store"
@@ -131,6 +135,11 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry(), promhttp.HandlerOpts{}))
+	metricsServer := httptest.NewServer(metricsMux)
+	t.Cleanup(metricsServer.Close)
+
 	var wg sync.WaitGroup
 	loopErrs := make(chan error, 4)
 
@@ -159,6 +168,7 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 			BatchSize:    200,
 			Channels:     []string{"sms"},
 			Lag:          lagClient,
+			Tracer:       noop.NewTracerProvider().Tracer("dispatcher"),
 		})
 	})
 	startLoop("relay", func() error {
@@ -168,6 +178,7 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 			Logger:       logger,
 			PollInterval: 25 * time.Millisecond,
 			BatchSize:    500,
+			Tracer:       noop.NewTracerProvider().Tracer("relay"),
 		})
 	})
 	startLoop("worker", func() error {
@@ -186,6 +197,7 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 			Logger:  logger,
 			Channel: "sms",
 			Clock:   time.Now,
+			Tracer:  noop.NewTracerProvider().Tracer("worker"),
 		})
 	})
 	startLoop("reaper", func() error {
@@ -202,8 +214,11 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 			// client itself is shared with the dispatcher.
 			Channels: []string{"sms"},
 			Lag:      lagClient,
+			Tracer:   noop.NewTracerProvider().Tracer("reaper"),
 		})
 	})
+
+	go relay.PublishOutboxLag(ctx, st, logger)
 
 	notifID := postNotification(t, apiServer.URL, `{
 		"channel": "sms",
@@ -231,6 +246,11 @@ func TestEndToEnd_HappyPath_Delivered(t *testing.T) {
 	assert.Equal(t, "+905551234567", resp.Recipient)
 	assert.Equal(t, 1, resp.Attempt, "notifications.attempt is the dispatcher's bumped value")
 	assert.Nil(t, resp.FailureReason, "DELIVERED row has no failure_reason")
+
+	// Phase 5 Chunk 5: outbox backlog gauge reaches steady state (no
+	// unpublished send.sms rows) — scraped from a /metrics handler backed
+	// by metrics.Registry(), same body as the relay binary's listener.
+	awaitOutboxUnpublishedSteady(t, metricsServer.URL, "send.sms", 20*time.Second)
 
 	// Assertion 2: exactly one events.notification outbox row.
 	awaitOutboxCount(t, pool, "events.notification", 1, 5*time.Second)
@@ -409,6 +429,44 @@ func awaitNotificationStatus(t *testing.T, baseURL string, id uuid.UUID, wantSta
 		return body.Status == wantStatus
 	}, timeout, 200*time.Millisecond, "notification %s never reached %s", id, wantStatus)
 	return got
+}
+
+// awaitOutboxUnpublishedSteady polls the Prometheus exposition endpoint
+// until outbox_unpublished_rows for topic is absent (backlog cleared and
+// relay sampler removed the label) or reports 0.0.
+func awaitOutboxUnpublishedSteady(t *testing.T, metricsBaseURL, topic string, timeout time.Duration) {
+	t.Helper()
+	prefix := `outbox_unpublished_rows{topic="` + topic + `"} `
+	require.Eventually(t, func() bool {
+		resp, err := http.Get(metricsBaseURL + "/metrics")
+		if err != nil {
+			return false
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return false
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return false
+		}
+		return outboxUnpublishedSteadyState(string(body), prefix)
+	}, timeout, 200*time.Millisecond,
+		`outbox_unpublished_rows{topic=%q} never reached steady state (absent or 0) on /metrics`, topic)
+}
+
+func outboxUnpublishedSteadyState(body, linePrefix string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, linePrefix) {
+			rest := strings.TrimSpace(strings.TrimPrefix(line, linePrefix))
+			v, err := strconv.ParseFloat(rest, 64)
+			if err != nil {
+				return false
+			}
+			return v == 0
+		}
+	}
+	return true
 }
 
 // awaitOutboxCount blocks until exactly `want` outbox rows exist on

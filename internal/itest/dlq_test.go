@@ -47,6 +47,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/tarkandikmen/notifications/internal/api"
 	"github.com/tarkandikmen/notifications/internal/dispatcher"
@@ -171,6 +172,7 @@ func startDLQTestStack(t *testing.T) *dlqTestEnv {
 			BatchSize:    200,
 			Channels:     []string{"sms"},
 			Lag:          lagClient,
+			Tracer:       noop.NewTracerProvider().Tracer("dispatcher"),
 		})
 	})
 	startLoop("relay", func() error {
@@ -180,6 +182,7 @@ func startDLQTestStack(t *testing.T) *dlqTestEnv {
 			Logger:       logger,
 			PollInterval: 25 * time.Millisecond,
 			BatchSize:    500,
+			Tracer:       noop.NewTracerProvider().Tracer("relay"),
 		})
 	})
 	startLoop("worker", func() error {
@@ -191,6 +194,7 @@ func startDLQTestStack(t *testing.T) *dlqTestEnv {
 			Logger:   logger,
 			Channel:  "sms",
 			Clock:    time.Now,
+			Tracer:   noop.NewTracerProvider().Tracer("worker"),
 		})
 	})
 	startLoop("reaper", func() error {
@@ -207,6 +211,7 @@ func startDLQTestStack(t *testing.T) *dlqTestEnv {
 			// client itself is shared with the dispatcher.
 			Channels: []string{"sms"},
 			Lag:      lagClient,
+			Tracer:   noop.NewTracerProvider().Tracer("reaper"),
 		})
 	})
 

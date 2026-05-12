@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+
+	"github.com/tarkandikmen/notifications/internal/metrics"
 )
 
 // handleList implements GET /v1/notifications per
@@ -33,6 +35,14 @@ func handleList(deps Deps) http.HandlerFunc {
 			writeInternalError(w)
 			return
 		}
+
+		// docs/phases/05-observability.md §1.1
+		// (api_list_result_size_items row): observe the
+		// post-pagination result size, NOT the requested limit. The
+		// observation reflects what the handler actually rendered, so
+		// dashboards can graph "page-fill ratio" against
+		// has_more=true tails.
+		metrics.APIListResultSize.WithLabelValues(r.Pattern).Observe(float64(len(rows)))
 
 		out := ListResponse{
 			Notifications: make([]NotificationResponse, 0, len(rows)),

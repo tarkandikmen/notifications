@@ -8,7 +8,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/store"
 	"github.com/tarkandikmen/notifications/internal/worker"
 )
@@ -89,8 +93,15 @@ type LagQuery interface {
 // failure semantics, and so the post-pass equal-jitter UPDATE has the
 // same cap the SQL used.
 type Deps struct {
-	Store          *store.Store
-	Logger         *slog.Logger
+	Store  *store.Store
+	Logger *slog.Logger
+
+	// ApplyResetEligibleAt runs the post–T9 jitter UPDATE (same
+	// contract as store.Store.ApplyResetEligibleAt). Nil means
+	// Store.ApplyResetEligibleAt is used. Tests may inject a stub
+	// that returns an error to exercise reaper_post_pass_jitter_failures_total.
+	ApplyResetEligibleAt func(ctx context.Context, ids []uuid.UUID, eligibleAt []time.Time) error
+
 	Interval       time.Duration
 	StuckThreshold time.Duration
 	MaxAttempts    int
@@ -135,6 +146,16 @@ type Deps struct {
 	// value for deterministic assertions on the jittered eligible_at
 	// range without having to also pin the reaper's tick rate.
 	Now func() time.Time
+
+	// Tracer is the OpenTelemetry tracer used to open the per-cycle
+	// reaper.cycle span. Required; applyDefaults panics when nil
+	// to mirror the Phase 3 lag-client convention. Production
+	// (cmd.go) injects otel.Tracer(serviceName) backed by the global
+	// tracer provider; tests inject a noop tracer or an in-memory
+	// tracetest provider.
+	//
+	// docs/phases/05-observability.md §7.
+	Tracer trace.Tracer
 }
 
 // Loop drives the stuck-row recovery cycle until ctx is cancelled.
@@ -208,20 +229,73 @@ func Loop(ctx context.Context, deps Deps) error {
 // avoid coupling the test surface to Postgres's PRNG. Per
 // docs/phases/03-resilience.md §6.
 //
+// Phase 5 layers per-cycle observability:
+//   - One reaper.cycle span per call, attributed with reset / failed
+//     counts + outcome (docs/phases/05-observability.md §7).
+//   - reaper_cycles_total{outcome} counter on every branch
+//     (ran, lag_skip, lag_query_error).
+//   - reaper_rows_reset_total / reaper_rows_terminal_failed_total
+//     counters Add'd by the per-cycle reset / failed counts.
+//   - reaper_cycle_duration_seconds histogram on every branch.
+//   - reaper_post_pass_jitter_failures_total counter incremented on
+//     the existing log-warn-and-continue branch.
+//
+// The reaper does NOT stamp an "error" outcome on the cycle counter
+// (the spec locks the three outcomes {ran, lag_skip, lag_query_error}
+// in docs/phases/05-observability.md §1.1). When ReapStuck or any
+// inner SQL call errors, the runOnce return path surfaces the error
+// to Loop's per-tick log-warn — but the cycle counter increment for
+// "ran" still fires under the deferred outcome-stamp, since the cycle
+// was attempted (lag check passed). Operators see the SQL error in
+// the warn log, not the metric vocabulary.
+//
 // Exposed (lowercase) at the package level so loop_test.go can drive a
 // single, deterministic cycle rather than racing the time.Ticker — same
 // pattern as internal/dispatcher/loop.go and internal/relay/loop.go.
 //
 // docs/phases/02-walking-skeleton.md §11 + docs/phases/03-resilience.md §6 + §8.
 func runOnce(ctx context.Context, deps Deps) error {
-	if skip := lagCheckSkip(ctx, deps); skip {
+	start := time.Now()
+	ctx, span := deps.Tracer.Start(ctx, "reaper.cycle")
+	outcome := "ran" // overwritten by lag-check skip branches; default for the proceed path
+	defer func() {
+		span.SetAttributes(attribute.String("outcome", outcome))
+		metrics.ReaperCycles.WithLabelValues(outcome).Inc()
+		metrics.ReaperCycleDuration.Observe(time.Since(start).Seconds())
+		span.End()
+	}()
+
+	skipOutcome, skip := lagCheckSkip(ctx, deps)
+	if skip {
+		outcome = skipOutcome
 		return nil
 	}
 
-	reset, failed, err := deps.Store.ReapStuck(ctx, deps.MaxAttempts, deps.StuckThreshold, deps.ReaperBackoffCap)
+	traceHeaders, terr := observability.TraceHeadersFromContext(ctx)
+	if terr != nil {
+		deps.Logger.Warn("reaper: trace headers from context failed", "err", terr)
+	}
+	reset, failed, err := deps.Store.ReapStuck(ctx, deps.MaxAttempts, deps.StuckThreshold, deps.ReaperBackoffCap, traceHeaders)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("reaper: reap stuck: %w", err)
 	}
+
+	span.SetAttributes(
+		attribute.Int("reset_rows", len(reset)),
+		attribute.Int("failed_rows", failed),
+	)
+	for _, r := range reset {
+		_, rowSpan := deps.Tracer.Start(ctx, "reaper.row",
+			trace.WithAttributes(
+				attribute.String("notification.id", r.ID.String()),
+				attribute.Int("notification.attempt", r.Attempt),
+			),
+		)
+		rowSpan.End()
+	}
+	metrics.ReaperRowsReset.Add(float64(len(reset)))
+	metrics.ReaperRowsTerminalFailed.Add(float64(failed))
 
 	if err := applyJitterPostPass(ctx, deps, reset); err != nil {
 		// The reset itself committed; the post-pass jitter is best-effort
@@ -230,7 +304,10 @@ func runOnce(ctx context.Context, deps Deps) error {
 		// rows as PENDING with the deterministic value, and the
 		// dispatcher will claim them correctly. Log at warn so a
 		// persistent failure surfaces without throwing away the reset
-		// work.
+		// work. Increment the dedicated counter so operators can alert
+		// on the rate of post-pass failures.
+		metrics.ReaperPostPassJitterFailures.Inc()
+		span.RecordError(err)
 		deps.Logger.Warn("reaper: post-pass jitter failed; deterministic eligible_at remains in place",
 			"reset_count", len(reset),
 			"err", err,
@@ -251,11 +328,18 @@ func runOnce(ctx context.Context, deps Deps) error {
 	return nil
 }
 
-// lagCheckSkip returns true when the reaper's per-cycle reap must be
-// skipped because consumer-group lag exceeds the configured threshold
-// on any channel, OR because any channel's lag query errored
-// (fail-closed per docs/design/02-state-machine.md §Lag-query failure
-// semantics rows T9 / T10).
+// lagCheckSkip returns the (outcome, skip) pair for the per-cycle
+// lag check. Three branches:
+//
+//   - ("", false): every channel's lag query succeeded and lag is at
+//     or below the threshold; the caller proceeds with the reap and
+//     stamps "ran" on the cycle counter.
+//   - ("lag_skip", true): some channel reported lag > threshold; the
+//     caller stamps "lag_skip" and returns nil.
+//   - ("lag_query_error", true): some channel's lag query errored;
+//     the caller fails closed (per docs/design/02-state-machine.md
+//     §Lag-query failure semantics rows T9 / T10) and stamps
+//     "lag_query_error" on the cycle counter.
 //
 // The check iterates every channel in deps.Channels in order; the
 // first channel that crosses the threshold or errors short-circuits
@@ -264,7 +348,14 @@ func runOnce(ctx context.Context, deps Deps) error {
 // so a hung admin call surfaces as ctx.DeadlineExceeded — the
 // fail-closed disposition still skips the cycle, and the next tick
 // retries.
-func lagCheckSkip(ctx context.Context, deps Deps) bool {
+//
+// Each successful query is also published to the
+// kafka_consumer_lag{group,topic} gauge via metrics.PublishLagSample,
+// matching the dispatcher's per-tick publishing. The reaper writes
+// to the same gauge series as the dispatcher; Prometheus
+// distinguishes the producers via the per-binary `instance` label
+// added at scrape time.
+func lagCheckSkip(ctx context.Context, deps Deps) (string, bool) {
 	for _, channel := range deps.Channels {
 		group := "worker." + channel
 		topic := "send." + channel
@@ -272,6 +363,7 @@ func lagCheckSkip(ctx context.Context, deps Deps) bool {
 		lagCtx, cancel := context.WithTimeout(ctx, deps.LagTimeout)
 		lag, err := deps.Lag.MaxLag(lagCtx, group, topic)
 		cancel()
+		metrics.PublishLagSample(group, topic, lag, err)
 
 		if err != nil {
 			// Fail-closed per docs/design/02-state-machine.md §Lag-query
@@ -286,7 +378,7 @@ func lagCheckSkip(ctx context.Context, deps Deps) bool {
 				"threshold", deps.LagThreshold,
 				"err", err,
 			)
-			return true
+			return "lag_query_error", true
 		}
 		if lag > deps.LagThreshold {
 			deps.Logger.Info("reaper: lag above threshold; skipping cycle",
@@ -296,10 +388,10 @@ func lagCheckSkip(ctx context.Context, deps Deps) bool {
 				"lag", lag,
 				"threshold", deps.LagThreshold,
 			)
-			return true
+			return "lag_skip", true
 		}
 	}
-	return false
+	return "", false
 }
 
 // applyJitterPostPass computes worker.ReaperBackoff(attempt) for each
@@ -323,7 +415,11 @@ func applyJitterPostPass(ctx context.Context, deps Deps, reset []store.ResetRetu
 		ids[i] = r.ID
 		eligibleAt[i] = now.Add(worker.ReaperBackoff(r.Attempt))
 	}
-	return deps.Store.ApplyResetEligibleAt(ctx, ids, eligibleAt)
+	fn := deps.ApplyResetEligibleAt
+	if fn == nil {
+		fn = deps.Store.ApplyResetEligibleAt
+	}
+	return fn(ctx, ids, eligibleAt)
 }
 
 // applyDefaults fills in zero-valued Deps fields with the locked Phase 2 /
@@ -331,11 +427,14 @@ func applyJitterPostPass(ctx context.Context, deps Deps, reset []store.ResetRetu
 // tests) only need to set what they're customizing. Same shape as
 // internal/dispatcher and internal/relay.
 //
-// Lag is required: a nil Lag panics here so production wiring (cmd.go)
-// and tests that exercise runOnce must inject one. An alternative
-// (treat nil as "lag check disabled") would silently regress the §8
-// behavior under a future cmd.go that forgets to wire the admin
-// client, and the spec explicitly forbids that disposition.
+// Lag and Tracer are required: nil values for either panic here so
+// production wiring (cmd.go) and tests that exercise runOnce must
+// inject both. The Lag interface keeps the loop independently
+// testable; the Tracer is similarly satisfied by trace.Tracer
+// implementations from go.opentelemetry.io/otel/trace/noop or an
+// in-memory tracetest provider. An alternative (treat nil as "no
+// spans" / "no lag check") would silently regress the §7 / §8
+// behavior under a future cmd.go that forgets to wire them.
 func applyDefaults(d Deps) Deps {
 	if d.Interval <= 0 {
 		d.Interval = defaultInterval
@@ -366,6 +465,9 @@ func applyDefaults(d Deps) Deps {
 	}
 	if d.Lag == nil {
 		panic("reaper: Deps.Lag is required (kafkaadmin.LagClient or fake)")
+	}
+	if d.Tracer == nil {
+		panic("reaper: Deps.Tracer is required (otel.Tracer or noop)")
 	}
 	return d
 }

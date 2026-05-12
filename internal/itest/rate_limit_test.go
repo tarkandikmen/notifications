@@ -38,6 +38,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/tarkandikmen/notifications/internal/api"
 	"github.com/tarkandikmen/notifications/internal/dispatcher"
@@ -177,6 +178,7 @@ func TestRateLimit_BucketHoldsCap(t *testing.T) {
 			BatchSize:    200,
 			Channels:     []string{"sms"},
 			Lag:          lagClient,
+			Tracer:       noop.NewTracerProvider().Tracer("dispatcher"),
 		})
 	})
 
@@ -187,6 +189,7 @@ func TestRateLimit_BucketHoldsCap(t *testing.T) {
 			Logger:       logger,
 			PollInterval: 25 * time.Millisecond,
 			BatchSize:    500,
+			Tracer:       noop.NewTracerProvider().Tracer("relay"),
 		})
 	})
 
@@ -199,6 +202,7 @@ func TestRateLimit_BucketHoldsCap(t *testing.T) {
 			Logger:   logger,
 			Channel:  "sms",
 			Clock:    time.Now,
+			Tracer:   noop.NewTracerProvider().Tracer("worker"),
 		})
 	})
 
@@ -211,6 +215,7 @@ func TestRateLimit_BucketHoldsCap(t *testing.T) {
 			MaxAttempts:    7,
 			Channels:       []string{"sms"},
 			Lag:            lagClient,
+			Tracer:         noop.NewTracerProvider().Tracer("reaper"),
 		})
 	})
 

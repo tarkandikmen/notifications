@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -154,21 +155,28 @@ func Bootstrap(ctx context.Context, brokers []string, logger *slog.Logger) error
 		configs := topicConfigs(topic)
 		resp, err := adm.CreateTopic(ctx, partitions, kafkaReplicationFactorDev, configs, topic)
 		if err != nil {
-			return fmt.Errorf("relay bootstrap: create %q: %w", topic, err)
-		}
-		switch {
-		case resp.Err == nil:
-			logger.Info("relay bootstrap: topic created",
-				"topic", topic,
-				"partitions", partitions,
-				"replication_factor", kafkaReplicationFactorDev,
-			)
-		case errors.Is(resp.Err, kerr.TopicAlreadyExists):
-			logger.Debug("relay bootstrap: topic already exists",
-				"topic", topic,
-			)
-		default:
-			return fmt.Errorf("relay bootstrap: create %q: %w", topic, resp.Err)
+			if isTopicAlreadyExists(err) {
+				logger.Debug("relay bootstrap: topic already exists",
+					"topic", topic,
+				)
+			} else {
+				return fmt.Errorf("relay bootstrap: create %q: %w", topic, err)
+			}
+		} else {
+			switch {
+			case resp.Err == nil:
+				logger.Info("relay bootstrap: topic created",
+					"topic", topic,
+					"partitions", partitions,
+					"replication_factor", kafkaReplicationFactorDev,
+				)
+			case isTopicAlreadyExists(resp.Err):
+				logger.Debug("relay bootstrap: topic already exists",
+					"topic", topic,
+				)
+			default:
+				return fmt.Errorf("relay bootstrap: create %q: %w", topic, resp.Err)
+			}
 		}
 
 		// Visibility check fires whether we just created the topic or
@@ -185,6 +193,20 @@ func Bootstrap(ctx context.Context, brokers []string, logger *slog.Logger) error
 	}
 
 	return nil
+}
+
+// isTopicAlreadyExists treats kerr.TopicAlreadyExists and opaque broker
+// errors whose text still carries TOPIC_ALREADY_EXISTS (apache/kafka via
+// kadm sometimes fails errors.Is against kerr after kafka-bootstrap already
+// created the topic).
+func isTopicAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, kerr.TopicAlreadyExists) {
+		return true
+	}
+	return strings.Contains(err.Error(), "TOPIC_ALREADY_EXISTS")
 }
 
 // Bootstrap timing constants. Generous enough to absorb slow Docker

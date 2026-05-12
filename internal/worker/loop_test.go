@@ -13,11 +13,21 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/tarkandikmen/notifications/internal/metrics"
+	"github.com/tarkandikmen/notifications/internal/observability"
 	"github.com/tarkandikmen/notifications/internal/ratelimit"
 	"github.com/tarkandikmen/notifications/internal/relay"
 	"github.com/tarkandikmen/notifications/internal/store"
@@ -151,6 +161,12 @@ func newTestEnvForChannel(t *testing.T, channel string, handler http.HandlerFunc
 			Logger:   logger,
 			Channel:  channel,
 			Clock:    time.Now,
+			// Phase 5: a noop tracer satisfies Deps.Tracer for unit
+			// tests so the per-record worker.handleRecord span is
+			// opened (and ended) without any exporter wiring. Tests
+			// that need to assert on span shape build an in-memory
+			// tracetest provider in-line.
+			Tracer: noop.NewTracerProvider().Tracer("test"),
 		},
 	}
 }
@@ -185,6 +201,26 @@ func produceSendForChannel(t *testing.T, brokers []string, channel, key string, 
 	}
 	require.NoError(t, producer.ProduceSync(context.Background(), rec).FirstErr(),
 		"produce send.%s record", channel)
+}
+
+func produceSendForChannelWithHeaders(t *testing.T, brokers []string, channel, key string, payload []byte, headers []kgo.RecordHeader) {
+	t.Helper()
+
+	producer, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+	)
+	require.NoError(t, err, "build test producer for channel %q", channel)
+	defer producer.Close()
+
+	rec := &kgo.Record{
+		Topic:   "send." + channel,
+		Key:     []byte(key),
+		Value:   payload,
+		Headers: headers,
+	}
+	require.NoError(t, producer.ProduceSync(context.Background(), rec).FirstErr(),
+		"produce send.%s record with headers", channel)
 }
 
 // insertDispatched persists one notification in DISPATCHED state at
@@ -394,6 +430,19 @@ func awaitDeliveryAttemptsCount(t *testing.T, st *store.Store, id uuid.UUID, wan
 	}, timeout, 50*time.Millisecond, "delivery_attempts for %s never reached count=%d", id, want)
 }
 
+func notificationLatencyHistSnap(t *testing.T, channel string) (count uint64, sum float64) {
+	t.Helper()
+	h := metrics.NotificationDeliveryLatency.WithLabelValues(channel)
+	c, ok := h.(prometheus.Metric)
+	require.True(t, ok)
+	var m dto.Metric
+	require.NoError(t, c.Write(&m))
+	require.NotNil(t, m.Histogram)
+	require.NotNil(t, m.Histogram.SampleCount)
+	require.NotNil(t, m.Histogram.SampleSum)
+	return *m.Histogram.SampleCount, *m.Histogram.SampleSum
+}
+
 // TestLoop_HappyPath_Delivered is the primary integration test
 // required by docs/phases/02-walking-skeleton.md §Chunk 5: one
 // DISPATCHED row + one send.sms message + an httptest webhook
@@ -420,6 +469,9 @@ func TestLoop_HappyPath_Delivered(t *testing.T) {
 	row := insertDispatched(t, env.st, "00000000-0000-4000-8000-000000000200", 1)
 	produceSendSMS(t, env.brokers, row.ID.String(),
 		sendPayloadJSON(t, row.ID, 1, "phase 2 happy path"))
+
+	beforeDelivered := testutil.ToFloat64(metrics.WorkerRecordsProcessed.WithLabelValues("sms", "delivered"))
+	beforeLatCount, beforeLatSum := notificationLatencyHistSnap(t, "sms")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -452,6 +504,16 @@ func TestLoop_HappyPath_Delivered(t *testing.T) {
 	// Webhook was hit exactly once — no provider duplicates from a
 	// stray Kafka redelivery before commit.
 	assert.Equal(t, int32(1), env.requests.Load())
+
+	afterDelivered := testutil.ToFloat64(metrics.WorkerRecordsProcessed.WithLabelValues("sms", "delivered"))
+	assert.Equal(t, beforeDelivered+1, afterDelivered,
+		"T4 must increment worker_records_processed_total{outcome=delivered}")
+
+	afterLatCount, afterLatSum := notificationLatencyHistSnap(t, "sms")
+	assert.Equal(t, beforeLatCount+1, afterLatCount,
+		"T4 must observe notification_delivery_latency_seconds once")
+	assert.Greater(t, afterLatSum-beforeLatSum, 0.0,
+		"delivery latency sample must be positive wall time")
 
 	cancel()
 	requireLoopReturns(t, loopDone, 5*time.Second)
@@ -1146,4 +1208,155 @@ func assertEventOutboxForChannel(t *testing.T, st *store.Store, id uuid.UUID, ch
 
 	_, err := time.Parse(time.RFC3339, got.OccurredAt)
 	assert.NoError(t, err, "occurred_at must be RFC 3339: %q", got.OccurredAt)
+}
+
+func newIntegrationTracerProvider(t *testing.T) (*tracetest.InMemoryExporter, *sdktrace.TracerProvider) {
+	t.Helper()
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exp)))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	return exp, tp
+}
+
+// TestLoop_EventOutboxCarriesTraceHeadersTxB asserts Chunk 6: Tx B writes
+// worker.handleRecord trace context into events.notification outbox headers.
+func TestLoop_EventOutboxCarriesTraceHeadersTxB(t *testing.T) {
+	env := newTestEnv(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"messageId":"trace-tx-b","status":"accepted","timestamp":"2026-05-11T12:00:00.000Z"}`))
+	})
+	_, tp := newIntegrationTracerProvider(t)
+	env.deps.Tracer = tp.Tracer("worker")
+
+	dctx, dspan := tp.Tracer("dispatcher").Start(context.Background(), "dispatcher.row")
+	raw, err := observability.TraceHeadersFromContext(dctx)
+	require.NoError(t, err)
+	kh := observability.KafkaHeadersFromOutboxHeaders(raw)
+	dspan.End()
+
+	row := insertDispatched(t, env.st, "00000000-0000-4000-8000-000000000940", 1)
+	produceSendForChannelWithHeaders(t, env.brokers, "sms", row.ID.String(), sendPayloadJSON(t, row.ID, 1, "trace tx b"), kh)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loopDone := runLoopAsync(ctx, env.deps)
+
+	_ = awaitStatus(t, env.st, row.ID, "DELIVERED", 30*time.Second)
+	awaitOutboxCount(t, env.st, topicEventsNotification, 1, 5*time.Second)
+
+	var hdr []byte
+	qerr := env.st.Pool().QueryRow(context.Background(),
+		`SELECT headers FROM outbox WHERE topic = 'events.notification' AND partition_key = $1`,
+		row.ID.String(),
+	).Scan(&hdr)
+	require.NoError(t, qerr)
+	require.NotEmpty(t, hdr)
+	var hm map[string]string
+	require.NoError(t, json.Unmarshal(hdr, &hm))
+	assert.Contains(t, hm, "traceparent")
+
+	cancel()
+	requireLoopReturns(t, loopDone, 5*time.Second)
+}
+
+// TestLoop_RebuildsContextFromKafkaHeaders asserts the worker links
+// worker.handleRecord under the propagated dispatcher.row span.
+func TestLoop_RebuildsContextFromKafkaHeaders(t *testing.T) {
+	env := newTestEnv(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"messageId":"trace-parent","status":"accepted","timestamp":"2026-05-11T12:00:00.000Z"}`))
+	})
+	exp, tp := newIntegrationTracerProvider(t)
+	env.deps.Tracer = tp.Tracer("worker")
+
+	dctx, dspan := tp.Tracer("dispatcher").Start(context.Background(), "dispatcher.row")
+	parentSpanID := dspan.SpanContext().SpanID()
+	raw, err := observability.TraceHeadersFromContext(dctx)
+	require.NoError(t, err)
+	kh := observability.KafkaHeadersFromOutboxHeaders(raw)
+	dspan.End()
+
+	row := insertDispatched(t, env.st, "00000000-0000-4000-8000-000000000941", 1)
+	produceSendForChannelWithHeaders(t, env.brokers, "sms", row.ID.String(), sendPayloadJSON(t, row.ID, 1, "trace parent id"), kh)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loopDone := runLoopAsync(ctx, env.deps)
+
+	_ = awaitStatus(t, env.st, row.ID, "DELIVERED", 30*time.Second)
+
+	require.NoError(t, tp.ForceFlush(context.Background()))
+	var handle *tracetest.SpanStub
+	for _, s := range exp.GetSpans() {
+		if s.Name == "worker.handleRecord" {
+			cp := s
+			handle = &cp
+			break
+		}
+	}
+	require.NotNil(t, handle)
+	assert.True(t, handle.Parent.SpanID().IsValid())
+	assert.Equal(t, parentSpanID, handle.Parent.SpanID())
+
+	cancel()
+	requireLoopReturns(t, loopDone, 5*time.Second)
+}
+
+// TestLoop_Unprocessable_EventOutboxCarriesTraceHeadersT8 asserts T8
+// events.notification + DLQ outbox rows carry W3C trace headers.
+func TestLoop_Unprocessable_EventOutboxCarriesTraceHeadersT8(t *testing.T) {
+	env := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("provider must not be called (got %s %s)", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	_, tp := newIntegrationTracerProvider(t)
+	env.deps.Tracer = tp.Tracer("worker")
+
+	row := insertDispatched(t, env.st, "00000000-0000-4000-8000-000000000950", 2)
+	body := map[string]any{
+		"version":   1,
+		"id":        row.ID.String(),
+		"attempt":   2,
+		"channel":   "sms",
+		"recipient": "",
+		"content":   "t8 headers",
+		"priority":  1,
+	}
+	payload, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	produceSendSMS(t, env.brokers, row.ID.String(), payload)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loopDone := runLoopAsync(ctx, env.deps)
+
+	_ = awaitStatus(t, env.st, row.ID, "FAILED", 30*time.Second)
+	awaitOutboxCount(t, env.st, topicEventsNotification, 1, 5*time.Second)
+
+	var evHdr, dlqHdr []byte
+	require.NoError(t, env.st.Pool().QueryRow(context.Background(),
+		`SELECT headers FROM outbox WHERE topic = 'events.notification' AND partition_key = $1`,
+		row.ID.String(),
+	).Scan(&evHdr))
+	require.NoError(t, env.st.Pool().QueryRow(context.Background(),
+		`SELECT headers FROM outbox WHERE topic = $1 AND partition_key = $2`,
+		topicSendSMSDLQ, row.ID.String(),
+	).Scan(&dlqHdr))
+	require.NotEmpty(t, evHdr)
+	require.NotEmpty(t, dlqHdr)
+	for _, raw := range [][]byte{evHdr, dlqHdr} {
+		var hm map[string]string
+		require.NoError(t, json.Unmarshal(raw, &hm))
+		assert.Contains(t, hm, "traceparent")
+	}
+
+	cancel()
+	requireLoopReturns(t, loopDone, 5*time.Second)
 }
